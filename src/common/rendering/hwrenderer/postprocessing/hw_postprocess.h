@@ -387,6 +387,49 @@ struct BlurUniforms
 	}
 };
 
+struct BloomFusedUniforms
+{
+	float SampleWeights[8];
+	FVector2 TargetSize;
+	int Mode;
+	int Padding;
+
+	static std::vector<UniformFieldDesc> Desc()
+	{
+		return
+		{
+			{ "SampleWeights0", UniformType::Float, offsetof(BloomFusedUniforms, SampleWeights[0]) },
+			{ "SampleWeights1", UniformType::Float, offsetof(BloomFusedUniforms, SampleWeights[1]) },
+			{ "SampleWeights2", UniformType::Float, offsetof(BloomFusedUniforms, SampleWeights[2]) },
+			{ "SampleWeights3", UniformType::Float, offsetof(BloomFusedUniforms, SampleWeights[3]) },
+			{ "SampleWeights4", UniformType::Float, offsetof(BloomFusedUniforms, SampleWeights[4]) },
+			{ "SampleWeights5", UniformType::Float, offsetof(BloomFusedUniforms, SampleWeights[5]) },
+			{ "SampleWeights6", UniformType::Float, offsetof(BloomFusedUniforms, SampleWeights[6]) },
+			{ "SampleWeights7", UniformType::Float, offsetof(BloomFusedUniforms, SampleWeights[7]) },
+			{ "TargetSize", UniformType::Vec2, offsetof(BloomFusedUniforms, TargetSize) },
+			{ "Mode", UniformType::Int, offsetof(BloomFusedUniforms, Mode) },
+			{ "Padding", UniformType::Int, offsetof(BloomFusedUniforms, Padding) },
+		};
+	}
+};
+
+struct ExposureFusedUniforms
+{
+	int Depth;
+	int Padding[3];
+
+	static std::vector<UniformFieldDesc> Desc()
+	{
+		return
+		{
+			{ "Depth", UniformType::Int, offsetof(ExposureFusedUniforms, Depth) },
+			{ "Channel", UniformType::Int, offsetof(ExposureFusedUniforms, Padding[0]) },
+			{ "Padding1", UniformType::Int, offsetof(ExposureFusedUniforms, Padding[1]) },
+			{ "Padding2", UniformType::Int, offsetof(ExposureFusedUniforms, Padding[2]) },
+		};
+	}
+};
+
 enum { NumBloomLevels = 4 };
 
 class PPBlurLevel
@@ -401,6 +444,11 @@ class PPBloom
 {
 public:
 	void RenderBloom(PPRenderState *renderstate, int sceneWidth, int sceneHeight, int fixedcm);
+	bool WillRender(int sceneWidth, int sceneHeight, int fixedcm) const;
+	bool FromScene = false;
+	bool AddInFXAA = false;
+	bool SharedExtract = false;
+	PPTexture &Level0() { return levels[0].VTexture; }
 	void RenderBlur(PPRenderState *renderstate, int sceneWidth, int sceneHeight, float gameinfobluramount);
 
 private:
@@ -418,6 +466,11 @@ private:
 	PPShader BloomExtract = { "shaders/pp/bloomextract.fp", "", ExtractUniforms::Desc() };
 	PPShader BlurVertical = { "shaders/pp/blur.fp", "#define BLUR_VERTICAL\n", BlurUniforms::Desc() };
 	PPShader BlurHorizontal = { "shaders/pp/blur.fp", "#define BLUR_HORIZONTAL\n", BlurUniforms::Desc() };
+	PPShader BloomFused = { "shaders/pp/bloomfused.fp", "", BloomFusedUniforms::Desc() };
+	PPShader BloomCopy = { "shaders/pp/bloomcopy.fp", "", {} };
+	PPShader BloomExtractLuma = { "shaders/pp/bloomextract.fp", "#define LUMA_ALPHA\n", ExtractUniforms::Desc() };
+
+	void FusedStep(PPRenderState *renderstate, const BlurUniforms &blurUniforms, PPTexture &input, PPTexture &output, PPViewport viewport, int mode);
 };
 
 /////////////////////////////////////////////////////////////////////////////
@@ -476,12 +529,15 @@ class PPFXAA
 public:
 	void Render(PPRenderState *renderstate);
 
+	bool FromScene = false;
+
 private:
 	void CreateShaders();
 	int GetMaxVersion();
 	FString GetDefines();
 
 	PPShader FXAALuma;
+	PPShader FXAALumaBloom;
 	PPShader FXAA;
 	int LastQuality = -1;
 };
@@ -533,6 +589,9 @@ class PPCameraExposure
 {
 public:
 	void Render(PPRenderState *renderstate, int sceneWidth, int sceneHeight);
+	void RenderFromBloom(PPRenderState *renderstate, PPTexture &source, const PPViewport &viewport);
+	bool HasExposure() const { return !FirstExposureFrame; }
+	bool FromScene = false;
 
 	PPTexture CameraTexture = { 1, 1, PixelFormat::R32f };
 
@@ -540,11 +599,14 @@ private:
 	void UpdateTextures(int width, int height);
 
 	std::vector<PPExposureLevel> ExposureLevels;
+	std::vector<PPExposureLevel> SharedLevels;
 	bool FirstExposureFrame = true;
+	void Combine(PPRenderState *renderstate, PPTexture &last);
 
 	PPShader ExposureExtract = { "shaders/pp/exposureextract.fp", "", ExposureExtractUniforms::Desc() };
 	PPShader ExposureAverage = { "shaders/pp/exposureaverage.fp", "", {}, 400 };
 	PPShader ExposureCombine = { "shaders/pp/exposurecombine.fp", "", ExposureCombineUniforms::Desc() };
+	PPShader ExposureFused = { "shaders/pp/exposurefused.fp", "", ExposureFusedUniforms::Desc() };
 };
 
 /////////////////////////////////////////////////////////////////////////////
@@ -568,6 +630,7 @@ class PPColormap
 {
 public:
 	void Render(PPRenderState *renderstate, int fixedcm, float flash);
+	static bool WillRender(int fixedcm, float flash);
 
 private:
 	PPShader Colormap = { "shaders/pp/colormap.fp", "", ColormapUniforms::Desc() };
@@ -580,6 +643,7 @@ class PPTonemap
 public:
 	void SetTonemapMode(ETonemapMode tm) { level_tonemap = tm; }
 	void Render(PPRenderState *renderstate);
+	bool WillRender() const;
 	void ClearTonemapPalette() { PaletteTexture = {}; }
 
 private:
@@ -738,6 +802,7 @@ private:
 	PPShader BlurHorizontal;
 	PPShader Combine;
 	PPShader CombineMS;
+	PPShader CombineNormalMS;
 
 	PPTexture LinearDepthTexture;
 	PPTexture Ambient0;
@@ -860,6 +925,7 @@ class PPCustomShaders
 public:
 	void Run(PPRenderState *renderstate, FString target);
 	void UpdateLastInputTexture(PPRenderState *renderstate);
+	bool HasTarget(const char *target) const;
 
 private:
 	void CreateShaders();

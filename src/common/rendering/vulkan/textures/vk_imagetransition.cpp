@@ -112,9 +112,10 @@ void VkTextureImage::GenerateMipmaps(VulkanCommandBuffer *cmdbuffer)
 	int i;
 	for (i = 1; mipWidth > 1 || mipHeight > 1; i++)
 	{
+		// [Karto] The destination layout transition must publish to the blit write, independently of the source mip read.
 		PipelineBarrier()
 			.AddImage(Image.get(), Layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_ASPECT_COLOR_BIT, i - 1)
-			.AddImage(Image.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_ASPECT_COLOR_BIT, i)
+			.AddImage(Image.get(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_ASPECT_COLOR_BIT, i)
 			.Execute(cmdbuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 		Layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 
@@ -144,8 +145,9 @@ void VkTextureImage::GenerateMipmaps(VulkanCommandBuffer *cmdbuffer)
 		mipHeight = nextHeight;
 	}
 
+	// [Karto] The last mip was written by copy/blit; sampling needs that write made visible even when no mip loop ran.
 	PipelineBarrier()
-		.AddImage(Image.get(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_ASPECT_COLOR_BIT, i - 1)
+		.AddImage(Image.get(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_ASPECT_COLOR_BIT, i - 1)
 		.Execute(cmdbuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 
 	Layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;

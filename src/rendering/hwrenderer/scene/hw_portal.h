@@ -90,6 +90,7 @@ class HWPortal
 public:
 	FPortalSceneState * mState;
 	TArray<HWWall> lines;
+	TArray<unsigned int> mSkyPrims;
 	BoundingRect boundingBox;
 	int planesused = 0;
 	float zshift = 1.0f;	// HWPlaneMirrorPortal::DrawPortalStencil() z-fights with flats even at a distance of 32000 map units unless zshift >= 1.0
@@ -116,6 +117,23 @@ public:
 	virtual void DrawPortalStencil(FRenderState &state, int pass);
 	void SetupStencil(HWDrawInfo *di, FRenderState &state, bool usestencil);
 	void RemoveStencil(HWDrawInfo *di, FRenderState &state, bool usestencil);
+	enum ELateSkyStep { LSS_Depth, LSS_Mark, LSS_Reset };
+	void DrawLateSkySurfaces(HWDrawInfo *di, FRenderState &state, ELateSkyStep step);
+
+	unsigned LineCount() const { return lines.Size() + mSkyPrims.Size() / 2; }
+
+	void AddSkyPrim(unsigned int vertindex, unsigned int vertcount, const HWWall& l)
+	{
+		AddSkyPrim(vertindex, vertcount, l.glseg.x1, l.glseg.y1, l.glseg.x2, l.glseg.y2);
+	}
+
+	void AddSkyPrim(unsigned int vertindex, unsigned int vertcount, float x1, float y1, float x2, float y2)
+	{
+		mSkyPrims.Push(vertindex);
+		mSkyPrims.Push(vertcount);
+		boundingBox.addVertex(x1, y1);
+		boundingBox.addVertex(x2, y2);
+	}
 
 	void AddLine(HWWall * l)
 	{
@@ -158,6 +176,8 @@ struct FPortalSceneState
 
 	void StartFrame();
 	bool RenderFirstSkyPortal(int recursion, HWDrawInfo *outer_di, FRenderState &state);
+	HWPortal *LateSky = nullptr;
+	void RenderLateSky(HWDrawInfo *outer_di, FRenderState &state);
 	void EndFrame(HWDrawInfo *outer_di, FRenderState &state);
 	void RenderPortal(HWPortal *p, FRenderState &state, bool usestencil, HWDrawInfo *outer_di);
 };

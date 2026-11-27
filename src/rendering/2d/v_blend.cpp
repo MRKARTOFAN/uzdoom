@@ -212,8 +212,12 @@ void V_AddPlayerBlend (player_t *CPlayer, float blend[4], float maxinvalpha, int
 //
 //==========================================================================
 
+player_t* WorldModeRenderPlayer(int pnum);
+
 FVector4 V_CalcBlend(sector_t* viewsector, PalEntry* modulateColor)
 {
+	// [Karto] Flashes come from the published player copy, not play's live player, which may be a tic ahead.
+	player_t& console = *WorldModeRenderPlayer(consoleplayer);
 	float blend[4] = { 0,0,0,0 };
 	PalEntry blendv = 0;
 	float extra_red;
@@ -224,9 +228,9 @@ FVector4 V_CalcBlend(sector_t* viewsector, PalEntry* modulateColor)
 
 	if (modulateColor) *modulateColor = 0xffffffff;
 
-	if (players[consoleplayer].camera != nullptr)
+	if (console.camera != nullptr)
 	{
-		player = players[consoleplayer].camera->player;
+		player = console.camera->player;
 		if (player)
 			fullbright = (player->fixedcolormap != NOFIXEDCOLORMAP || player->extralight == INT_MIN || player->fixedlightlevel != -1 || player->bForceFullbright);
 	}
@@ -336,10 +340,10 @@ FVector4 V_CalcBlend(sector_t* viewsector, PalEntry* modulateColor)
 		V_AddPlayerBlend(player, blend, 0.5, 175);
 	}
 
-	if (players[consoleplayer].camera != NULL)
+	if (console.camera != NULL)
 	{
 		// except for fadeto effects
-		player_t* player = (players[consoleplayer].camera->player != NULL) ? players[consoleplayer].camera->player : &players[consoleplayer];
+		player_t* player = (console.camera->player != NULL) ? console.camera->player : &console;
 		V_AddBlend(player->BlendR, player->BlendG, player->BlendB, player->BlendA, blend);
 	}
 

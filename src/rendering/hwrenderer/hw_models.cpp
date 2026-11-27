@@ -35,6 +35,7 @@
 #include "actor.h"
 
 CVAR(Bool, gl_light_models, true, CVAR_ARCHIVE)
+CVAR(Bool, r_model_instances, true, 0)
 
 VSMatrix FHWModelRenderer::GetViewToWorldMatrix()
 {
@@ -54,7 +55,9 @@ void FHWModelRenderer::BeginDrawModel(FRenderStyle style, int smf_flags, const V
 	if ((smf_flags & MDL_FORCECULLBACKFACES) || (!(style == DefaultRenderStyle()) && !(smf_flags & MDL_DONTCULLBACKFACES)))
 	{
 		state.SetCulling((mirrored ^ portalState.isMirrored()) ? Cull_CCW : Cull_CW);
+		census.Culled = true;
 	}
+	census.Mirrored = mirrored ^ portalState.isMirrored();
 
 	state.mModelMatrix = objectToWorldMatrix;
 	state.EnableModelMatrix(true);
@@ -73,6 +76,7 @@ void FHWModelRenderer::BeginDrawHUDModel(FRenderStyle style, const VSMatrix &obj
 {
 	state.SetDepthFunc(DF_LEqual);
 	state.SetDepthClamp(true);
+	census.Hud = true;
 
 	// [BB] In case the model should be rendered translucent, do back face culling.
 	// This solves a few of the problems caused by the lack of depth sorting.
@@ -110,16 +114,21 @@ void FHWModelRenderer::SetMaterial(FGameTexture *skin, bool clampNoFilter, FTran
 {
 	state.SetMaterial(skin, UF_Skin, 0, clampNoFilter ? CLAMP_NOFILTER : CLAMP_NONE, translation, -1, act->GetClass());
 	state.SetLightIndex(modellightindex);
+	census.Skin = skin;
+	census.Translation = translation.index();
 }
 
 void FHWModelRenderer::DrawArrays(int start, int count)
 {
+	if (ModelCensusArmed) ModelCensusDraw(census, false, start, count);
 	state.Draw(DT_Triangles, start, count);
 }
 
 void FHWModelRenderer::DrawElements(int numIndices, size_t offset)
 {
-	state.DrawIndexed(DT_Triangles, int(offset / sizeof(unsigned int)), numIndices);
+	if (ModelCensusArmed) ModelCensusDraw(census, true, offset / sizeof(unsigned int), numIndices);
+	if (r_model_instances && !census.Hud && census.Bone < 0) state.DrawModelIndexed(int(offset / sizeof(unsigned int)), numIndices);
+	else state.DrawIndexed(DT_Triangles, int(offset / sizeof(unsigned int)), numIndices);
 }
 
 //===========================================================================
@@ -133,6 +142,11 @@ void FHWModelRenderer::SetupFrame(FModel *model, unsigned int frame1, unsigned i
 	auto mdbuff = static_cast<FModelVertexBuffer*>(model->GetVertexBuffer(GetType()));
 	//boneIndexBase = boneStartIndex;//boneStartIndex >= 0 ? boneStartIndex : screen->mBones->UploadBones(bones);
 	state.SetBoneIndexBase(boneStartIndex);
+	census.Model = model;
+	census.Buffer = mdbuff;
+	census.Frame1 = frame1;
+	census.Frame2 = frame2;
+	census.Bone = boneStartIndex;
 	if (mdbuff)
 	{
 		state.SetVertexBuffer(mdbuff->vertexBuffer(), frame1, frame2);

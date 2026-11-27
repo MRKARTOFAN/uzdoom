@@ -172,6 +172,8 @@ public:
 
 	static PClassActor *StaticFindStateOwner (const FState *state);
 	static PClassActor *StaticFindStateOwner (const FState *state, PClassActor *info);
+	static void StaticBuildStateOwnerTable();
+	static void StaticClearStateOwnerTable();
 	static FString StaticGetStateName(const FState *state, PClassActor *info = nullptr);
 	static FRandom pr_statetics;
 	static FCRandom pr_csstatetics;

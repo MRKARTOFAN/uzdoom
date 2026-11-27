@@ -54,22 +54,32 @@ BoneBuffer::BoneBuffer(int pipelineNbr) : mPipelineNbr(pipelineNbr)
 
 BoneBuffer::~BoneBuffer()
 {
-	delete mBuffer;
+	for (int n = 0; n < mPipelineNbr; n++) delete mBufferPipeline[n];
 }
 
 void BoneBuffer::Clear()
 {
 	mIndex = 0;
 
-	mPipelinePos++;
-	mPipelinePos %= mPipelineNbr;
+	// [Karto] A frame-slot backend must land on the copy the parked frame is not reading, even if Clear runs twice.
+	if (screen->mPipelineFrameSlot >= 0) mPipelinePos = screen->mPipelineFrameSlot % mPipelineNbr;
+	else
+	{
+		mPipelinePos++;
+		mPipelinePos %= mPipelineNbr;
+	}
 
 	mBuffer = mBufferPipeline[mPipelinePos];
 }
 
 int BoneBuffer::UploadBones(const TArray<VSMatrix>& bones)
 {
-	int totalsize = bones.Size();
+	return UploadMatrices(bones.Data(), bones.Size());
+}
+
+int BoneBuffer::UploadMatrices(const VSMatrix* matrices, int count)
+{
+	int totalsize = count;
 	if (totalsize > (int)mMaxUploadSize)
 	{
 		totalsize = mMaxUploadSize;
@@ -84,7 +94,7 @@ int BoneBuffer::UploadBones(const TArray<VSMatrix>& bones)
 
 	if (thisindex + totalsize <= mBufferSize)
 	{
-		memcpy(mBufferPointer + thisindex * BONE_SIZE, bones.Data(), totalsize * BONE_SIZE);
+		memcpy(mBufferPointer + thisindex * BONE_SIZE, matrices, totalsize * BONE_SIZE);
 		return thisindex;
 	}
 	else

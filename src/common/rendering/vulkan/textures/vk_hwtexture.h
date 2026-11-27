@@ -88,6 +88,7 @@ public:
 	~VkMaterial();
 
 	VulkanDescriptorSet* GetDescriptorSet(const FMaterialState& state);
+	bool GetGpuWorldTextures(const FMaterialState& state, uint32_t ids[4]);
 
 	void DeleteDescriptors() override;
 
@@ -109,5 +110,13 @@ private:
 		}
 	};
 
+	struct GpuTextureEntry
+	{
+		int ClampMode;
+		intptr_t Translation;
+		uint64_t Epoch;
+		uint32_t IDs[4];
+	};
+	std::vector<GpuTextureEntry> mGpuTextures;
 	std::vector<DescriptorEntry> mDescriptorSets;
 };

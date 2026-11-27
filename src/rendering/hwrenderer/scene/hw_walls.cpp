@@ -31,6 +31,7 @@
 #include "hw_material.h"
 #include "hw_cvars.h"
 #include "hw_clock.h"
+#include "flatvertices.h"
 #include "hw_lighting.h"
 #include "hwrenderer/scene/hw_drawinfo.h"
 #include "hwrenderer/scene/hw_drawstructs.h"
@@ -40,6 +41,51 @@
 #include "hw_skydome.h"
 #include "hw_walldispatcher.h"
 #include "m_round.h"
+#include "hw_vertexbuilder.h"
+#include <array>
+#include <set>
+#include <unordered_map>
+
+struct HWPreparedWall
+{
+	std::array<FFlatVertex, 4> Vertices;
+	FVector3 Normal;
+	IVertexBuffer* Buffer = nullptr;
+	unsigned Index = 0;
+	unsigned LightingSlot = ~0u;
+	unsigned OwnedLightingSlot = ~0u;
+	uint64_t OwnedLightingVersion = 0;
+	uint64_t OwnedLightingContext = 0;
+};
+
+CVAR(Bool, gl_wallcache, false, 0)
+CVAR(Bool, gl_wallcache_verify, false, 0)
+CVAR(Int, vk_retainedworld, 0, 0)
+CVAR(Bool, vk_retainedworld_verify, false, 0)
+CVAR(Bool, vk_retainedworld_directkey, false, 0)
+CVAR(Bool, vk_sectorlayout, false, 0)
+CVAR(Bool, vk_worldruns, false, 0)
+CVAR(Bool, vk_drawownership, false, 0)
+CVAR(Bool, vk_ownedstate, false, 0)
+CVAR(Bool, vk_snapshot_fast, false, 0)
+CVAR(Bool, vk_gpu_driven_persistent, false, 0)
+CVAR(Bool, vk_gpu_driven_staticmaterial, false, 0)
+EXTERN_CVAR(Bool, vk_gpu_driven_resident)
+EXTERN_CVAR(Bool, vk_gpu_driven_candidate)
+EXTERN_CVAR(Bool, vk_gpu_driven_geometry)
+EXTERN_CVAR(Bool, vk_gpu_driven_indexed)
+EXTERN_CVAR(Bool, vk_gpu_driven_bindless)
+EXTERN_CVAR(Bool, vk_gpu_driven_draw)
+EXTERN_CVAR(Bool, vk_gpu_driven_bake)
+EXTERN_CVAR(Bool, vk_gpu_driven_debug)
+EXTERN_CVAR(Int, r_distance_cull_type)
+EXTERN_CVAR(Bool, vk_sharedappearance)
+EXTERN_CVAR(Bool, gl_texture)
+EXTERN_CVAR(Bool, r_skipmats)
+EXTERN_CVAR(Bool, gl_seamless)
+EXTERN_CVAR(Int, r_fakecontrast)
+
+static void CapturePreparedWall(HWWallDispatcher* di, HWWall* wall);
 
 
 void SetGlowPlanes(FRenderState &state, const secplane_t& top, const secplane_t& bottom)
@@ -77,7 +123,9 @@ void SetSplitPlanes(FRenderState& state, const secplane_t& top, const secplane_t
 //
 //==========================================================================
 
-void HWWall::RenderWall(FRenderState &state, int textured)
+static void CaptureGpuOwnerStaticMaterial(HWWall* wall, FRenderState& state);
+
+void HWWall::RenderWall(FRenderState &state, int textured, uint32_t gpuSlot)
 {
 	bool ditherT = false;
 	if (seg->sidedef != nullptr)
@@ -90,10 +138,40 @@ void HWWall::RenderWall(FRenderState &state, int textured)
 	{
 		state.SetEffect(EFF_DITHERTRANS);
 	}
-	assert(vertcount > 0);
 	state.SetLightIndex(dynlightindex);
-	state.Draw(DT_TriangleFan, vertindex, vertcount);
-	vertexcount += vertcount;
+	if (vk_gpu_driven_staticmaterial && GpuOwnerSlot >= 0) CaptureGpuOwnerStaticMaterial(this, state);
+	const bool gpuDrawn = gpuSlot != UINT32_MAX && state.DrawGpuDrivenWall(gpuSlot, GpuBakeRow);
+	if (!gpuDrawn && gpuSlot != UINT32_MAX && !vertcount) MakeVertices(false);
+	bool baked = gpuDrawn;
+	assert(gpuDrawn || vertcount > 0);
+	if (!baked && vk_gpu_driven_draw && vertcount == 4 && CanCacheVertices(true))
+	{
+		FFlatVertex current[4];
+		FFlatVertex* cursor = current;
+		CreateVertices(cursor, false);
+		uint32_t iboOffset = 0, indexCount = 0;
+		if (GPUBakeLookupWall(seg, type, current, &iboOffset, &indexCount))
+		{
+			baked = state.DrawBakedPrimitive(iboOffset, indexCount);
+			if (baked && vk_gpu_driven_debug)
+			{
+				static std::set<uint64_t> logged;
+				const uint64_t key = (uint64_t(reinterpret_cast<uintptr_t>(seg)) << 8) ^ uint64_t(type & 0xff);
+				if (logged.insert(key).second)
+					Printf("G1DRAW seg=%p type=%d off=%u cnt=%u\n", (void*)seg, type, iboOffset, indexCount);
+			}
+		}
+	}
+	if (!baked)
+	{
+		if (Prepared && (textured & RWF_BATCH) && vk_retainedworld == 2 && vertcount == 4)
+			state.DrawRetainedQuad(vertindex);
+		else if ((textured & RWF_BATCH) && vertcount == 4)
+			state.DrawOpaqueQuad(vertindex);
+		else
+			state.Draw(DT_TriangleFan, vertindex, vertcount);
+	}
+	vertexcount += gpuDrawn ? 4 : vertcount;
 	if (ditherT)
 	{
 		state.SetEffect(EFF_NONE);
@@ -202,7 +280,7 @@ static const uint8_t renderwalltotier[] =
 CVAR(Bool, hw_npottest, false, 0)
 #endif
 
-void HWWall::RenderTexturedWall(HWWallDispatcher*di, FRenderState &state, int rflags)
+void HWWall::RenderTexturedWall(HWWallDispatcher*di, FRenderState &state, int rflags, uint32_t gpuSlot)
 {
 	int tmode = state.GetTextureMode();
 	int rel = rellight + getExtraLight();
@@ -286,9 +364,51 @@ void HWWall::RenderTexturedWall(HWWallDispatcher*di, FRenderState &state, int rf
 	float absalpha = fabsf(alpha);
 	if (lightlist == nullptr)
 	{
-		if (type != RENDERWALL_M2SNF) SetFog(state, di->Level, di->lightmode, lightlevel, rel, di->isFullbrightScene(), &Colormap, RenderStyle == STYLE_Add);
-		SetColor(state, di->Level, di->lightmode, lightlevel, rel, di->isFullbrightScene(), Colormap, absalpha);
-		RenderWall(state, rflags);
+		bool appearanceDone = false;
+		if (vk_sharedappearance && !vk_retainedworld && type != RENDERWALL_M2SNF && di->di && !di->Level->HasDynamicLights)
+		{
+			FSharedAppearanceKey key = {};
+			key.LightMode = int(di->lightmode);
+			key.LightLevel = lightlevel;
+			key.RelativeLight = rel;
+			key.LightColor = Colormap.LightColor.d;
+			key.FadeColor = Colormap.FadeColor.d;
+			key.Desaturation = Colormap.Desaturation;
+			key.BlendFactor = Colormap.BlendFactor;
+			key.FogDensity = Colormap.FogDensity;
+			key.Alpha = absalpha;
+			key.Additive = RenderStyle == STYLE_Add;
+			key.Fullbright = di->isFullbrightScene();
+			key.SoftwareLighting = isSoftwareLighting(di->lightmode);
+			key.FogMode = gl_fogmode;
+			key.CullType = r_distance_cull_type;
+			key.LevelFlags = di->Level->flags;
+			key.CullDist = di->Level->culldist;
+			key.CullColor = di->Level->cullcolor.d;
+			key.OutsideFog = di->Level->info->outsidefog;
+			key.BrightFog = di->Level->brightfog;
+			key.InSkybox = portalState.inskybox;
+			key.Level = di->Level;
+			appearanceDone = state.SelectSharedAppearance(key);
+			if (!appearanceDone)
+			{
+				SetFog(state, di->Level, di->lightmode, lightlevel, rel, di->isFullbrightScene(), &Colormap, RenderStyle == STYLE_Add);
+				SetColor(state, di->Level, di->lightmode, lightlevel, rel, di->isFullbrightScene(), Colormap, absalpha);
+				state.StoreSharedAppearance(key);
+				appearanceDone = true;
+			}
+		}
+		if (!appearanceDone)
+		{
+			if (!Prepared || !vk_retainedworld || type == RENDERWALL_M2SNF ||
+				!ApplyRetainedWorldLighting(di->di, state, Prepared->LightingSlot,
+					lightlevel, rel, Colormap, absalpha, RenderStyle == STYLE_Add, true))
+			{
+				if (type != RENDERWALL_M2SNF) SetFog(state, di->Level, di->lightmode, lightlevel, rel, di->isFullbrightScene(), &Colormap, RenderStyle == STYLE_Add);
+				SetColor(state, di->Level, di->lightmode, lightlevel, rel, di->isFullbrightScene(), Colormap, absalpha);
+			}
+		}
+		RenderWall(state, rflags, gpuSlot);
 	}
 	else
 	{
@@ -361,21 +481,52 @@ void HWWall::RenderTranslucentWall(HWWallDispatcher*di, FRenderState &state)
 //
 //
 //==========================================================================
-void HWWall::DrawWall(HWWallDispatcher*di, FRenderState &state, bool translucent)
+void HWWall::DrawWall(HWWallDispatcher*di, FRenderState &state, bool translucent, uint32_t gpuSlot)
 {
+	if (SceneProfiling) ++GetSceneSurfaceProfile().DrawCalls;
+	IVertexBuffer *cachedBuffer = nullptr;
+	unsigned originalIndex = vertindex;
 	if (screen->BuffersArePersistent())
 	{
 		if (di->di && di->Level->HasDynamicLights && !di->isFullbrightScene() && texture != nullptr)
 		{
 			SetupLights(di->di, lightdata);
 		}
-		MakeVertices(!!(flags & HWWall::HWF_TRANSLUCENT));
+		if (Prepared && vk_retainedworld)
+		{
+			if (!Prepared->Buffer)
+			{
+				Prepared->Buffer = screen->mVertexData->RetainPreparedWallVertices(Prepared->Vertices.data(), Prepared->Index);
+			}
+			cachedBuffer = Prepared->Buffer;
+			if (cachedBuffer)
+			{
+				vertindex = Prepared->Index;
+				vertcount = 4;
+			}
+		}
+		else if ((gl_wallcache || SceneProfiling) && screen->IsVulkan() && CanCacheVertices())
+		{
+			if (SceneProfiling) ++GetSceneSurfaceProfile().CacheEligible;
+			if (gl_wallcache)
+			{
+				if (SceneProfiling) ++GetSceneSurfaceProfile().CacheRequests;
+				// [Karto] Compare the complete original vertex output so direct script writes and interpolation cannot bypass invalidation.
+				FFlatVertex vertices[4];
+				auto ptr = vertices;
+				CreateVertices(ptr, false);
+				cachedBuffer = screen->mVertexData->CacheWallVertices(seg->sidedef, type, vertices, vertindex, gl_wallcache_verify);
+				if (cachedBuffer) vertcount = 4;
+			}
+		}
+		if (!cachedBuffer && gpuSlot == UINT32_MAX) MakeVertices(!!(flags & HWWall::HWF_TRANSLUCENT));
 	}
 
-	state.SetNormal(glseg.Normal());
+	if (cachedBuffer) state.SetVertexBuffer(cachedBuffer, 0, 0);
+	state.SetNormal(Prepared ? Prepared->Normal : glseg.Normal());
 	if (!translucent)
 	{
-		RenderTexturedWall(di, state, HWWall::RWF_TEXTURED);
+		RenderTexturedWall(di, state, HWWall::RWF_TEXTURED | (cachedBuffer ? HWWall::RWF_BATCH : 0), gpuSlot);
 	}
 	else
 	{
@@ -394,6 +545,139 @@ void HWWall::DrawWall(HWWallDispatcher*di, FRenderState &state, bool translucent
 			break;
 		}
 	}
+	if (cachedBuffer)
+	{
+		// [Karto] Later draws and portal/decal helpers still use the original stream buffer and its indices.
+		state.SetVertexBuffer(screen->mVertexData);
+		vertindex = originalIndex;
+		vertcount = 0;
+	}
+}
+
+bool HWWall::CanDrawPersistentWall(unsigned* rejected) const
+{
+	if (!Prepared || vertcount || !texture || lightlist || lightmap ||
+		(type != RENDERWALL_TOP && type != RENDERWALL_M1S && type != RENDERWALL_BOTTOM) ||
+		(flags & (HWF_GLOW | HWF_TRANSLUCENT | HWF_SKYHACK)) || RenderStyle != STYLE_Normal || alpha != 1.f ||
+		texture->isMasked() || texture->GetTranslucency() ||
+		!seg || !seg->sidedef || seg->sidedef->AttachedDecals ||
+		(seg->sidedef->Flags & (WALLF_POLYOBJ | WALLF_DITHERTRANS_TOP | WALLF_DITHERTRANS_BOTTOM | WALLF_DITHERTRANS_MID)))
+	{
+		if (rejected)
+		{
+			*rejected |=
+				(!Prepared ? 1u : 0u) | (vertcount ? 2u : 0u) | (!texture ? 4u : 0u) |
+				(lightlist ? 8u : 0u) | (lightmap ? 16u : 0u) |
+				((type != RENDERWALL_TOP && type != RENDERWALL_M1S && type != RENDERWALL_BOTTOM) ? 32u : 0u) |
+				((flags & (HWF_GLOW | HWF_TRANSLUCENT | HWF_SKYHACK)) ? 64u : 0u) |
+				(RenderStyle != STYLE_Normal ? 128u : 0u) | (alpha != 1.f ? 256u : 0u) |
+				((texture && texture->isMasked()) ? 512u : 0u) | ((texture && texture->GetTranslucency()) ? 1024u : 0u) |
+				((!seg || !seg->sidedef) ? 2048u : 0u) |
+				((seg && seg->sidedef && seg->sidedef->AttachedDecals) ? 4096u : 0u) |
+				((seg && seg->sidedef && (seg->sidedef->Flags & WALLF_POLYOBJ)) ? 16384u : 0u) |
+				((seg && seg->sidedef && (seg->sidedef->Flags & (WALLF_DITHERTRANS_TOP | WALLF_DITHERTRANS_BOTTOM | WALLF_DITHERTRANS_MID))) ? 32768u : 0u);
+		}
+		return false;
+	}
+	if (seg->sidedef->Flags & WALLF_EXTCOLOR)
+	{
+		// [Karto] Map initialization also flags neutral walls; compare live tier inputs so direct script writes still leave the run immediately.
+		auto side = seg->sidedef;
+		const auto tier = renderwalltotier[type];
+		if (!frontsector || side->GetSpecialColor(tier, side_t::walltop, frontsector) != 0xffffffff ||
+			side->GetSpecialColor(tier, side_t::wallbottom, frontsector) != 0xffffffff ||
+			side->GetAdditiveColor(tier, frontsector) != 0 || side->textures[tier].TextureFx.AddColor.a != 0)
+		{
+			if (rejected) *rejected |= 8192u;
+			return false;
+		}
+	}
+#ifdef NPOT_EMULATION
+	if (hw_npottest) return false;
+#endif
+	return true;
+}
+
+bool HWWall::DrawPreparedWall(HWWallDispatcher* di, FRenderState& state, HWPreparedWallRun& run, uint64_t ownerVersion)
+{
+	auto reject = [](uint64_t& count)
+	{
+		if (SceneProfiling) ++count;
+		return false;
+	};
+	unsigned rejected = 0;
+	// [Karto] Sight-dependent dither flags can change after preparation; ownership cannot suppress their live fallback.
+	if (!CanDrawPersistentWall(SceneProfiling ? &rejected : nullptr))
+	{
+		if (SceneProfiling) SceneMainSurfaceProfile.PreparedDrawRejectedMask |= rejected;
+		return reject(SceneMainSurfaceProfile.PreparedDrawRejectedGeometry);
+	}
+	if (!run.Buffer && !state.CanBeginPreparedWallRun()) return reject(SceneMainSurfaceProfile.PreparedDrawRejectedState);
+	if (!Prepared->Buffer)
+		Prepared->Buffer = screen->mVertexData->RetainPreparedWallVertices(Prepared->Vertices.data(), Prepared->Index);
+	if (!Prepared->Buffer) return reject(SceneMainSurfaceProfile.PreparedDrawRejectedGeometry);
+	const int clampMode = flags & 3;
+	const bool newMaterial = run.Texture != texture || run.ClampMode != clampMode;
+	if (newMaterial) state.SetMaterial(texture, UF_Texture, 0, clampMode, NO_TRANSLATION, -1, nullptr);
+	if (!state.HasPreparedWallMaterial()) return reject(SceneMainSurfaceProfile.PreparedDrawRejectedMaterial);
+	const bool newBuffer = run.Buffer != Prepared->Buffer;
+	if (newBuffer) state.SetVertexBuffer(Prepared->Buffer, 0, 0);
+	state.SetNormal(Prepared->Normal);
+	const int relativeLight = rellight + getExtraLight();
+	const bool ownedState = vk_ownedstate && ownerVersion != 0;
+	auto& lightingSlot = ownedState ? Prepared->OwnedLightingSlot : Prepared->LightingSlot;
+	if (!ApplyRetainedWorldLighting(di->di, state, lightingSlot,
+		lightlevel, relativeLight, Colormap, fabsf(alpha), RenderStyle == STYLE_Add, true,
+		ownedState ? Prepared : nullptr, ownerVersion))
+	{
+		ownerVersion = 0;
+		SetFog(state, di->Level, di->lightmode, lightlevel, relativeLight, di->isFullbrightScene(), &Colormap, false);
+		SetColor(state, di->Level, di->lightmode, lightlevel, relativeLight, di->isFullbrightScene(), Colormap, fabsf(alpha));
+	}
+	state.SetLightIndex(dynlightindex);
+	state.PrepareRetainedWallRun(newMaterial || newBuffer, ownerVersion != 0);
+	if (ownerVersion) state.DrawOwnedRetainedQuad(Prepared->Index, ownerVersion);
+	else state.DrawRetainedQuad(Prepared->Index);
+	vertexcount += 4;
+	if (SceneProfiling)
+	{
+		++SceneMainSurfaceProfile.DrawCalls;
+		++SceneMainSurfaceProfile.PreparedDrawPackets;
+		if (newMaterial || newBuffer) ++SceneMainSurfaceProfile.PreparedDrawRuns;
+	}
+	run.Texture = texture;
+	run.Buffer = Prepared->Buffer;
+	run.ClampMode = clampMode;
+	return true;
+}
+
+bool HWWall::CanCacheVertices(bool allowGenerated) const
+{
+	if (type != RENDERWALL_TOP && type != RENDERWALL_M1S && type != RENDERWALL_BOTTOM) return false;
+	if ((vertcount && !allowGenerated) || gl_seamless || (flags & HWF_TRANSLUCENT) || RenderStyle != STYLE_Normal || alpha != 1.0f) return false;
+	if (!texture || texture->isMasked() || texture->GetTranslucency() || lightmap) return false;
+	if (!seg || !seg->sidedef || !seg->linedef || (seg->sidedef->Flags & WALLF_POLYOBJ) || seg->sidedef->AttachedDecals) return false;
+	if (seg->linedef->isVisualPortal() || seg->linedef->GetTransferredPortal()) return false;
+	if (frontsector != seg->frontsector || backsector != seg->backsector) return false;
+	auto ordinary = [](const sector_t *sector)
+	{
+		return !sector || (!sector->floorplane.isSlope() && !sector->ceilingplane.isSlope() &&
+			!sector->GetHeightSec() && sector->e->XFloor.ffloors.Size() == 0 && sector->e->XFloor.lightlist.Size() == 0);
+	};
+	return ordinary(frontsector) && ordinary(backsector);
+}
+
+bool HWWall::CanGpuDriveWall(bool allowGenerated) const
+{
+	if (!CanCacheVertices(allowGenerated)) return false;
+	if (!texture || texture->GetShaderIndex() != 0 || texture->isHardwareCanvas() || texture->isFullbright()) return false;
+	if (RenderStyle != STYLE_Normal || alpha != 1.0f) return false;
+	if (!frontsector || !frontsector->Level || frontsector->Level->HasDynamicLights || sysCallbacks.PreBindTexture ||
+		(flags & (HWF_GLOW | HWF_TRANSLUCENT | HWF_SKYHACK))) return false;
+	if (seg->sidedef->Flags & (WALLF_DITHERTRANS_TOP | WALLF_DITHERTRANS_BOTTOM | WALLF_DITHERTRANS_MID)) return false;
+	TArray<FTexture*> layers;
+	texture->GetLayers(layers);
+	return layers.Size() >= 1 && layers.Size() <= 4;
 }
 
 //==========================================================================
@@ -558,6 +842,9 @@ const char HWWall::passflag[] = {
 //
 //
 //==========================================================================
+static void CaptureGpuPersistentWall(HWWall* wall);
+static void RejectGpuPersistentWall(HWWall* wall);
+
 void HWWall::PutWall(HWWallDispatcher *di, bool translucent)
 {
 	if (texture && texture->GetTranslucency() && passflag[type] == 2)
@@ -622,7 +909,27 @@ void HWWall::PutWall(HWWallDispatcher *di, bool translucent)
 	}
 
 
+	if (SceneProfiling && !di->SuppressSubmit)
+	{
+		auto &profile = GetSceneSurfaceProfile();
+		++profile.Submitted;
+		if (translucent) ++profile.Translucent;
+		if (texture && texture->isMasked()) ++profile.Masked;
+		if (seg->sidedef && seg->sidedef->AttachedDecals) ++profile.WithDecals;
+		if (!translucent && texture && !texture->isMasked() &&
+			(type == RENDERWALL_TOP || type == RENDERWALL_M1S || type == RENDERWALL_BOTTOM))
+		{
+			++profile.OpaqueRegular;
+			if (type == RENDERWALL_TOP) ++profile.OutOrdinaryTop;
+			else if (type == RENDERWALL_BOTTOM) ++profile.OutOrdinaryBottom;
+			else ++profile.OutOrdinaryM1S;
+		}
+		if (type == RENDERWALL_M2S || type == RENDERWALL_M2SNF) ++profile.OutM2S;
+	}
+	if (GpuOwnerCandidate) CaptureGpuPersistentWall(this);
+	CapturePreparedWall(di, this);
 	di->AddWall(this);
+	Prepared = nullptr;
 
 	lightlist = nullptr;
 	// make sure that following parts of the same linedef do not get this one's vertex and lighting info.
@@ -639,6 +946,8 @@ void HWWall::PutWall(HWWallDispatcher *di, bool translucent)
 
 void HWWall::PutPortal(HWWallDispatcher *di, int ptype, int plane)
 {
+	if (di->SuppressSubmit) return;
+	RejectGpuPersistentWall(this);
 	HWPortal * portal = nullptr;
 
 	auto ddi = di->di;
@@ -1140,6 +1449,7 @@ bool HWWall::SetWallCoordinates(seg_t * seg, FTexCoordInfo *tci, float textureto
 	else
 	{
 		// ceiling below floor - clip to the visible part of the wall
+		HeightValid = false;
 		float dch = topright - topleft;
 		float dfh = bottomright - bottomleft;
 		float inter_x = (bottomleft - topleft) / (dch - dfh);
@@ -1184,6 +1494,7 @@ bool HWWall::SetWallCoordinates(seg_t * seg, FTexCoordInfo *tci, float textureto
 	else
 	{
 		// ceiling below floor - clip to the visible part of the wall
+		HeightValid = false;
 		float dch = topright - topleft;
 		float dfh = bottomright - bottomleft;
 		float inter_x = (bottomleft - topleft) / (dch - dfh);
@@ -1349,6 +1660,9 @@ void HWWall::DoTexture(HWWallDispatcher *di, int _type,seg_t * seg, int peg,
 	FTexCoordInfo tci;
 
 	GetTexCoordInfo(texture, &tci, seg->sidedef, texpos);
+	HeightValid = HeightKnown = HeightArmed;
+	HeightArmed = false;
+	HeightVScale = tci.FloatToTexV(1.f);
 
 	type = _type;
 
@@ -1375,13 +1689,21 @@ void HWWall::DoTexture(HWWallDispatcher *di, int _type,seg_t * seg, int peg,
 	{
 
 		CheckTexturePosition(&tci);
+		// [Karto] Glow planes are baked into the row. A clamped tier stays on the records; world mode guards it on the CPU
+		// and re-produces it once a move takes its texture range out of [0, 1], where the producer would drop the clamp.
+		if (flags & HWF_GLOW) HeightValid = false;
 
 		// Add this wall to the render list
 		sector_t * sec = sub ? sub->sector : seg->frontsector;
 		if (sec->e->XFloor.lightlist.Size()==0 ||  di->isFullbrightScene()) PutWall(di, false);
-		else SplitWall(di, sec, false);
+		else
+		{
+			HeightValid = false;
+			SplitWall(di, sec, false);
+		}
 	}
 
+	HeightValid = HeightKnown = false;
 	glseg = glsave;
 	flags = savedflags;
 }
@@ -2097,33 +2419,762 @@ void HWWall::DoFFloorBlocks(HWWallDispatcher *di, seg_t * seg, sector_t * fronts
 	}
 }
 
-inline int CalcRelLight(int lightlevel, int orglightlevel, int rel)
-{
-	if (orglightlevel >= 253)			// with the software renderer fake contrast won't be visible above this.
-	{
-		return 0;
-	}
-	else if (lightlevel - rel > 256)	// the brighter part of fake contrast will be clamped so also clamp the darker part by the same amount for better looks
-	{
-		return 256 - lightlevel + rel;
-	}
-	else
-	{
-		return rel;
-	}
-}
-
 CVAR(Int, topskew, 0, 0)
 CVAR(Int, midskew, 0, 0)
 CVAR(Int, bottomskew, 0, 0)
 
-//==========================================================================
-//
-//
-//
-//==========================================================================
-void HWWall::Process(HWWallDispatcher *di, seg_t *seg, sector_t * frontsector, sector_t * backsector, bool isculled)
+#include "hw_retainedworld.h"
+
+static void CapturePreparedWall(HWWallDispatcher* di, HWWall* wall)
 {
+	if (!di->PreparedCapture || di->SuppressSubmit || wall->Prepared) return;
+	auto& geometry = RetainedWorld::Geometry.emplace_back();
+	geometry.Normal = wall->glseg.Normal();
+	auto ptr = geometry.Vertices.data();
+	if (wall->CreateVertices(ptr, false) != 4)
+	{
+		I_FatalError("Retained ordinary wall unexpectedly split");
+	}
+	wall->Prepared = &geometry;
+}
+
+bool CanOwnOpaqueWalls(HWDrawInfo* di)
+{
+	return vk_drawownership && vk_retainedworld == 2 && !vk_retainedworld_verify && gl_texture && !gl_seamless &&
+		!r_skipmats && screen->IsVulkan() && screen->BuffersArePersistent() &&
+		!di->outer && !di->mCurrentPortal && !di->mClipPortal && !di->Viewpoint.bDoOob && !di->Viewpoint.bDoOrtho &&
+		!di->Level->HasDynamicLights && !sysCallbacks.PreBindTexture && RetainedWorldShadersCompatible();
+}
+
+static bool SelectOwnedWall(HWWallDispatcher* di, HWWall& source, seg_t* seg, sector_t* front,
+	sector_t* back, RetainedWorld::Entry& entry, const RetainedWorld::SideInputs& inputs)
+{
+	HWSceneScopeTimer timer(GetSceneSurfaceProfile().OwnedSelectionNS);
+	const bool changed = RetainedWorld::CompactSectors ?
+		RetainedWorld::UpdateEntryAppearanceStorage<true>(di, front, seg, seg->Subsector, entry, &inputs) :
+		RetainedWorld::UpdateEntryAppearanceStorage<false>(di, front, seg, seg->Subsector, entry, &inputs);
+	if (entry.Output.upper.Size() || entry.Output.lower.Size()) return false;
+	for (const auto& wall : entry.Output.list)
+		if (!wall.CanDrawPersistentWall()) return false;
+	if (!di->OwnedLightingReady)
+	{
+		di->OwnedLightingContext = RetainedWorld::ValidateLightingContext(di->Level);
+		di->OwnedExtraLight = getExtraLight();
+		di->OwnedLightingReady = true;
+	}
+	if (!entry.OwnerVersion || changed || entry.OwnedLightingContext != di->OwnedLightingContext ||
+		entry.OwnedLightMode != di->lightmode || entry.OwnedExtraLight != di->OwnedExtraLight)
+	{
+		// [Karto] Never recycle certificates when slots or level resources are reused.
+		if (RetainedWorld::NextOwnerVersion == UINT64_MAX) return false;
+		entry.OwnerVersion = ++RetainedWorld::NextOwnerVersion;
+		entry.OwnedLightingContext = di->OwnedLightingContext;
+		entry.OwnedLightMode = di->lightmode;
+		entry.OwnedExtraLight = di->OwnedExtraLight;
+	}
+	// [Karto] Run sky registration in this original wall job before selecting its ordinary outputs, preserving portal encounter order.
+	RetainedWorld::ReplayViewEffects(di, source, seg, front, back);
+	for (auto& wall : entry.Output.list)
+	{
+		di->di->drawlists[GLDL_PLAINWALLS].OwnedWalls.Push({ &wall, entry.OwnerVersion, di->SubmissionOrder, di->SubmissionPart++ });
+		if (SceneProfiling)
+		{
+			++GetSceneSurfaceProfile().Submitted;
+			++GetSceneSurfaceProfile().OpaqueRegular;
+		}
+	}
+	if (SceneProfiling)
+	{
+		auto& profile = GetSceneSurfaceProfile();
+		if (entry.Output.list.Size()) ++profile.OwnedSelections;
+		else ++profile.OwnedEmptySelections;
+		if (front->GetTexture(0) == skyflatnum || front->GetTexture(1) == skyflatnum ||
+			(back && (back->GetTexture(0) == skyflatnum || back->GetTexture(1) == skyflatnum)))
+		{
+			++profile.OwnedSkySelections;
+			profile.OwnedSkyRows += entry.Output.list.Size();
+		}
+	}
+	return true;
+}
+
+struct FGpuPersistentWallInputs
+{
+	FGameTexture* TextureTop = nullptr;
+	FGameTexture* TextureMid = nullptr;
+	FGameTexture* TextureBottom = nullptr;
+	std::array<float, 44> Values = {};
+	std::array<int, 12> Modes = {};
+	bool operator==(const FGpuPersistentWallInputs& other) const
+	{
+		return TextureTop == other.TextureTop && TextureMid == other.TextureMid && TextureBottom == other.TextureBottom &&
+			Modes == other.Modes && memcmp(Values.data(), other.Values.data(), sizeof(Values)) == 0;
+	}
+};
+
+struct FGpuResidentAppearanceInputs
+{
+	uint64_t LightingContext = 0;
+	uint64_t WallContext = 0;
+	std::array<int, 7> Modes = {};
+	FColormap Colormap = {};
+	std::array<uint32_t, 4> Colors = {};
+	TextureManipulation TextureFx = {};
+	std::array<float, 3> Material = {};
+	bool operator==(const FGpuResidentAppearanceInputs& other) const
+	{
+		return LightingContext == other.LightingContext && WallContext == other.WallContext && Modes == other.Modes &&
+			memcmp(&Colormap, &other.Colormap, sizeof(Colormap)) == 0 && Colors == other.Colors &&
+			memcmp(&TextureFx, &other.TextureFx, sizeof(TextureFx)) == 0 && Material == other.Material;
+	}
+};
+static uint64_t GpuResidentNextRevision = 0;
+
+// [Karto] A whole-seg bypass is safe only when every output fits the bounded opaque owner; partial capture must fall back.
+struct FGpuPersistentPart
+{
+	int Type = RENDERWALL_M1S;
+	HWWall Wall = {};
+	std::array<FFlatVertex, 4> Vertices = {};
+	uint32_t Row = UINT32_MAX;
+	uint32_t TextureId = 0;
+	uint32_t SectorIndex = 0;
+	int32_t SideIndex = -1;
+	FGpuStaticMaterial StaticMaterial = {};
+	FGpuResidentAppearanceInputs Appearance;
+	bool AppearanceValid = false;
+};
+
+struct FGpuPersistentWall
+{
+	FGpuPersistentWallInputs Inputs;
+	std::array<FGpuPersistentPart, 3> Parts = {};
+	int PartCount = 0;
+	uint64_t CheckedEpoch = UINT64_MAX;
+	uint64_t BorrowedView = 0;
+	bool Valid = false;
+	bool CaptureRejected = false;
+};
+
+static std::vector<int32_t> GpuPersistentSegOwner;
+static std::vector<FGpuPersistentWall> GpuPersistentOwners;
+static FLevelLocals* GpuPersistentOwnersLevel = nullptr;
+
+void GPUClearPersistentWalls()
+{
+	// [Karto] Map storage can reuse seg addresses/indices, so old owners must disappear before new bake identities are created.
+	GpuPersistentSegOwner.clear();
+	GpuPersistentOwners.clear();
+	GpuPersistentOwnersLevel = nullptr;
+}
+
+static void CaptureGpuOwnerStaticMaterial(HWWall* wall, FRenderState& state)
+{
+	if (wall->GpuOwnerSlot < 0 || wall->GpuOwnerSlot >= (int)GpuPersistentOwners.size()) return;
+	auto& owner = GpuPersistentOwners[wall->GpuOwnerSlot];
+	for (int p = 0; p < owner.PartCount; ++p)
+	{
+		if (owner.Parts[p].Type == wall->type)
+		{
+			state.CaptureGpuStaticMaterial(owner.Parts[p].StaticMaterial);
+			return;
+		}
+	}
+}
+
+static void RejectGpuPersistentWall(HWWall* wall)
+{
+	if (wall->GpuOwnerCandidate)
+	{
+		wall->GpuOwnerCandidate->CaptureRejected = true;
+		if (SceneProfiling) ++GetSceneSurfaceProfile().GpuOwnerCaptureRejected;
+	}
+}
+
+static void CaptureGpuPersistentWall(HWWall* wall)
+{
+	HWSceneScopeTimer captureTimer(GetSceneSurfaceProfile().GpuOwnerCaptureNS);
+	auto owner = wall->GpuOwnerCandidate;
+	if (!owner) return;
+	if (!wall->CanGpuDriveWall(true) || owner->PartCount >= (int)owner->Parts.size())
+	{
+		// [Karto] Ignoring one unsupported part would make a warm whole-seg replay omit live output.
+		owner->CaptureRejected = true;
+		if (SceneProfiling) ++GetSceneSurfaceProfile().GpuOwnerCaptureRejected;
+		return;
+	}
+	auto& part = owner->Parts[owner->PartCount];
+	part.Type = wall->type;
+	part.TextureId = wall->texture ? uint32_t(wall->texture->GetID().GetIndex()) : 0;
+	part.SectorIndex = uint32_t((wall->sub ? wall->sub->sector : wall->frontsector)->Index());
+	part.SideIndex = (wall->seg && wall->seg->sidedef) ? wall->seg->sidedef->Index() : -1;
+	part.Wall = *wall;
+	part.Wall.GpuOwnerCandidate = nullptr;
+	part.Wall.GpuAppearanceId = UINT32_MAX;
+	part.Wall.GpuAppearanceRevision = ++GpuResidentNextRevision;
+	part.AppearanceValid = false;
+	part.Wall.GpuResidentEpoch = 0;
+	part.Wall.GpuResidentRow = UINT32_MAX;
+	part.Wall.vertcount = 0;
+	part.Wall.vertindex = 0;
+	auto cursor = part.Vertices.data();
+	if (wall->CreateVertices(cursor, false) != 4)
+	{
+		owner->CaptureRejected = true;
+		if (SceneProfiling) ++GetSceneSurfaceProfile().GpuOwnerCaptureRejected;
+		return;
+	}
+	part.Row = UINT32_MAX;
+	++owner->PartCount;
+	owner->CheckedEpoch = UINT64_MAX;
+	if (SceneProfiling) ++GetSceneSurfaceProfile().GpuPersistentRebuilds;
+}
+
+static bool TryGpuPersistentWall(HWWall& wall, HWWallDispatcher* di, seg_t* seg, sector_t* front, sector_t* back, bool culled)
+{
+	HWSceneScopeTimer admissionTimer(GetSceneSurfaceProfile().GpuOwnerAdmissionNS);
+	auto reject = [](EGpuOwnerRejectReason reason)
+	{
+		if (SceneProfiling) ++GetSceneSurfaceProfile().GpuOwnerRejects[reason];
+		return false;
+	};
+	if (!vk_gpu_driven_persistent || !vk_gpu_driven_bake || !vk_gpu_driven_candidate || !vk_gpu_driven_geometry ||
+		!vk_gpu_driven_indexed || !vk_gpu_driven_bindless || vk_retainedworld || gl_wallcache || gl_seamless ||
+		(vk_gpu_driven_resident && vk_sharedappearance) ||
+		!di->di || di->SuppressSubmit || di->PreparedCapture || di->PreparedReplay || !screen->IsVulkan() || !screen->BuffersArePersistent()) return reject(GOR_Unavailable);
+	if (SceneProfiling) ++GetSceneSurfaceProfile().GpuPersistentRequests;
+	if (culled || !seg || !seg->linedef || !seg->sidedef || !front ||
+		front != seg->frontsector || !wall.sub || wall.sub->sector != front || seg->sidedef->linedef != seg->linedef ||
+		back != seg->backsector) return reject(GOR_Identity);
+	if (di->di->outer || di->di->mCurrentPortal || di->di->mClipPortal || di->di->Viewpoint.bDoOob || di->di->Viewpoint.bDoOrtho) return reject(GOR_PortalView);
+	if (di->Level->HasDynamicLights || sysCallbacks.PreBindTexture) return reject(GOR_DynamicLight);
+	if (front->floorplane.isSlope() || front->ceilingplane.isSlope() ||
+		(back && (back->floorplane.isSlope() || back->ceilingplane.isSlope())) ||
+		front->GetHeightSec() || (back && back->GetHeightSec()) ||
+		front->e->XFloor.ffloors.Size() || front->e->XFloor.lightlist.Size() ||
+		(back && (back->e->XFloor.ffloors.Size() || back->e->XFloor.lightlist.Size())) ||
+		seg->sidedef->AttachedDecals || seg->sidedef->lightmap ||
+		(seg->sidedef->Flags & (WALLF_POLYOBJ | WALLF_BLOCKRENDERING | WALLF_DITHERTRANS_TOP | WALLF_DITHERTRANS_BOTTOM | WALLF_DITHERTRANS_MID)) ||
+		seg->linedef->isVisualPortal() || seg->linedef->GetTransferredPortal() || seg->linedef->special == Line_Horizon || seg->linedef->special == Line_Mirror) return reject(GOR_SlopeOrSpecial);
+	// [Karto] Admit sky segs (ordinary parts can be owned), but never take the valid-empty bypass for a sky-adjacent owner.
+	// Portal-emitting segs fall back via PutPortal's reject.
+	const bool frontSky = front->GetTexture(sector_t::floor) == skyflatnum || front->GetTexture(sector_t::ceiling) == skyflatnum;
+	const bool backSky = back && (back->GetTexture(sector_t::floor) == skyflatnum || back->GetTexture(sector_t::ceiling) == skyflatnum);
+	if (frontSky && SceneProfiling) ++GetSceneSurfaceProfile().GpuOwnerRejects[backSky ? GOR_Sky : GOR_SkyFront];
+	else if (backSky && SceneProfiling) ++GetSceneSurfaceProfile().GpuOwnerRejects[GOR_SkyBack];
+	auto planeEffects = [](sector_t* sector)
+	{
+		return sector && (sector->ValidatePortal(sector_t::floor) || sector->ValidatePortal(sector_t::ceiling) ||
+			sector->GetReflect(sector_t::floor) > 0 || sector->GetReflect(sector_t::ceiling) > 0);
+	};
+	if (planeEffects(front) || planeEffects(back)) return reject(GOR_PlaneEffect);
+	auto side = seg->sidedef;
+	auto textureTop = TexMan.GetGameTexture(side->GetTexture(side_t::top), true);
+	auto textureMid = TexMan.GetGameTexture(side->GetTexture(side_t::mid), true);
+	auto textureBottom = TexMan.GetGameTexture(side->GetTexture(side_t::bottom), true);
+	auto ordinaryTexture = [](FGameTexture* texture)
+	{
+		return !texture || !texture->isValid() || (texture->GetShaderIndex() == 0 && !texture->isHardwareCanvas() &&
+			!texture->isFullbright() && !texture->isMasked() && !texture->GetTranslucency());
+	};
+	if (back ? ((textureMid && textureMid->isValid()) || !ordinaryTexture(textureTop) || !ordinaryTexture(textureBottom) ||
+		(!di->isFullbrightScene() && CheckFog(di->Level, front, back, di->lightmode))) : !ordinaryTexture(textureMid)) return reject(GOR_Texture);
+	float topGlow[4], bottomGlow[4];
+	if (front->GetWallGlow(topGlow, bottomGlow)) return reject(GOR_WallGlow);
+	const bool forward = side == seg->linedef->sidedef[0];
+	auto v1 = forward ? seg->linedef->v1 : seg->linedef->v2;
+	auto v2 = forward ? seg->linedef->v2 : seg->linedef->v1;
+	const float ffh1 = front->floorplane.ZatPoint(v1);
+	const float ffh2 = front->floorplane.ZatPoint(v2);
+	const float fch1 = front->ceilingplane.ZatPoint(v1);
+	const float fch2 = front->ceilingplane.ZatPoint(v2);
+	if (fch1 <= ffh1 && fch2 <= ffh2) return reject(GOR_Degenerate);
+	auto texelW = [](FGameTexture* t) { return t ? float(t->GetTexelWidth()) : 0.f; };
+	auto texelH = [](FGameTexture* t) { return t ? float(t->GetTexelHeight()) : 0.f; };
+	FGpuPersistentWallInputs inputs;
+	inputs.TextureTop = textureTop;
+	inputs.TextureMid = textureMid;
+	inputs.TextureBottom = textureBottom;
+	inputs.Values = { float(v1->fX()), float(v2->fX()), float(v1->fY()), float(v2->fY()),
+		ffh1, fch1, back ? float(back->floorplane.ZatPoint(v1)) : ffh1, back ? float(back->ceilingplane.ZatPoint(v1)) : fch1,
+		float(front->GetPlaneTexZ(sector_t::floor)), float(front->GetPlaneTexZ(sector_t::ceiling)),
+		back ? float(back->GetPlaneTexZ(sector_t::floor)) : 0.f, back ? float(back->GetPlaneTexZ(sector_t::ceiling)) : 0.f,
+		float(side->GetTextureXOffset(side_t::top)), float(side->GetTextureYOffset(side_t::top)),
+		float(side->GetTextureXScale(side_t::top)), float(side->GetTextureYScale(side_t::top)),
+		float(side->GetTextureXOffset(side_t::mid)), float(side->GetTextureYOffset(side_t::mid)),
+		float(side->GetTextureXScale(side_t::mid)), float(side->GetTextureYScale(side_t::mid)),
+		float(side->GetTextureXOffset(side_t::bottom)), float(side->GetTextureYOffset(side_t::bottom)),
+		float(side->GetTextureXScale(side_t::bottom)), float(side->GetTextureYScale(side_t::bottom)),
+		texelW(textureTop), texelH(textureTop), texelW(textureMid), texelH(textureMid), texelW(textureBottom), texelH(textureBottom),
+		ffh2, fch2,
+		textureTop ? textureTop->GetScaleX() : 0.f, textureTop ? textureTop->GetScaleY() : 0.f,
+		textureTop ? textureTop->GetDisplayWidth() : 0.f, textureTop ? textureTop->GetDisplayHeight() : 0.f,
+		textureMid ? textureMid->GetScaleX() : 0.f, textureMid ? textureMid->GetScaleY() : 0.f,
+		textureMid ? textureMid->GetDisplayWidth() : 0.f, textureMid ? textureMid->GetDisplayHeight() : 0.f,
+		textureBottom ? textureBottom->GetScaleX() : 0.f, textureBottom ? textureBottom->GetScaleY() : 0.f,
+		textureBottom ? textureBottom->GetDisplayWidth() : 0.f, textureBottom ? textureBottom->GetDisplayHeight() : 0.f };
+	// [Karto] Plane texture writes can create sky encounters without moving geometry, so they invalidate the whole owner too.
+	const bool forceWorldPanning = di->Level->flags3 & LEVEL3_FORCEWORLDPANNING;
+	inputs.Modes = { int(seg->linedef->flags & (ML_DONTPEGBOTTOM | ML_DONTPEGTOP | ML_DRAWFULLHEIGHT | ML_TWOSIDED | ML_3DMIDTEX)),
+		int(side->TexelLength), front->special,
+		int((textureTop && textureTop->useWorldPanning()) || forceWorldPanning),
+		int((textureMid && textureMid->useWorldPanning()) || forceWorldPanning),
+		int((textureBottom && textureBottom->useWorldPanning()) || forceWorldPanning),
+		int(front->transdoor), int(back && back->transdoor),
+		front->GetTexture(sector_t::floor).GetIndex(), front->GetTexture(sector_t::ceiling).GetIndex(),
+		back ? back->GetTexture(sector_t::floor).GetIndex() : -1, back ? back->GetTexture(sector_t::ceiling).GetIndex() : -1 };
+	if (GpuPersistentOwnersLevel != di->Level)
+	{
+		GpuPersistentSegOwner.assign(di->Level->segs.Size(), -1);
+		GpuPersistentOwners.clear();
+		// [Karto] Draw lists borrow owner part addresses until the view finishes; pool growth must never relocate them.
+		GpuPersistentOwners.reserve(32768);
+		GpuPersistentOwnersLevel = di->Level;
+	}
+	const uint32_t segIndex = uint32_t(seg->Index());
+	if (segIndex >= GpuPersistentSegOwner.size()) return reject(GOR_LevelMismatch);
+	int32_t slot = GpuPersistentSegOwner[segIndex];
+	if (slot < 0)
+	{
+		if (GpuPersistentOwners.size() >= 32768) return reject(GOR_Other);
+		slot = int32_t(GpuPersistentOwners.size());
+		GpuPersistentOwners.emplace_back();
+		GpuPersistentSegOwner[segIndex] = slot;
+	}
+	auto& owner = GpuPersistentOwners[slot];
+	if (!owner.Valid || !(owner.Inputs == inputs))
+	{
+		owner.Inputs = inputs;
+		owner.Valid = false;
+		owner.PartCount = 0;
+		owner.CaptureRejected = false;
+		wall.GpuOwnerCandidate = &owner;
+		return false;
+	}
+	if (owner.PartCount == 0)
+	{
+		// [Karto] A zero-part capture is a valid-empty certificate only when the seg is not sky-adjacent, which can emit unregistered sky output with no ordinary part.
+		if (frontSky || backSky) return false;
+		if (SceneProfiling) ++GetSceneSurfaceProfile().GpuPersistentEmpty;
+		static bool emptyLogged = false;
+		if (!emptyLogged)
+		{
+			emptyLogged = true;
+			Printf("G1PERSISTEMPTY valid_empty=1\n");
+		}
+		return true;
+	}
+	const auto epoch = GPUBakeEpoch();
+	if (owner.CheckedEpoch != epoch)
+	{
+		owner.CheckedEpoch = epoch;
+		for (int p = 0; p < owner.PartCount; ++p) owner.Parts[p].Row = UINT32_MAX;
+	}
+	// [Karto] A second encounter must not mutate a template already borrowed by this view or overwrite its referenced row.
+	if (vk_gpu_driven_resident && owner.BorrowedView == RetainedWorld::View) return false;
+	owner.BorrowedView = RetainedWorld::View;
+	auto sub = wall.sub;
+	HWSceneScopeTimer replayTimer(GetSceneSurfaceProfile().GpuOwnerReplayNS);
+	for (int p = 0; p < owner.PartCount; ++p)
+	{
+		auto& part = owner.Parts[p];
+		auto& output = vk_gpu_driven_resident ? part.Wall : wall;
+		if (!vk_gpu_driven_resident) wall = part.Wall;
+		output.sub = sub;
+		output.seg = seg;
+		output.frontsector = front;
+		output.backsector = back;
+		output.vertexes[0] = v1;
+		output.vertexes[1] = v2;
+		output.Colormap = front->Colormap;
+		if (di->isFullbrightScene()) output.Colormap.Clear();
+		output.vertcount = 0;
+		output.vertindex = 0;
+		output.dynlightindex = -1;
+		const int texpos = part.Type == RENDERWALL_TOP ? side_t::top : part.Type == RENDERWALL_BOTTOM ? side_t::bottom : side_t::mid;
+		int rel = 0;
+		const int originalLight = hw_ClampLight(front->lightlevel);
+		const bool foggy = !output.Colormap.FadeColor.isBlack() || (di->Level->flags & LEVEL_HASFADETABLE);
+		output.lightlevel = RescaleLightLevel(side->GetLightLevel(foggy, originalLight, texpos, false, &rel));
+		output.rellight = CalcRelLight(output.lightlevel, originalLight, rel);
+		output.GpuResidentEpoch = 0;
+		output.GpuResidentRow = UINT32_MAX;
+		output.GpuOwnerSlot = slot;
+		if (part.Row == UINT32_MAX && epoch)
+		{
+			uint32_t offset, count;
+			GPUBakeLookupWall(seg, part.Type, part.Vertices.data(), &offset, &count, &part.Row);
+		}
+		if (part.Row != UINT32_MAX && epoch)
+		{
+			output.GpuResidentRow = part.Row;
+			output.GpuResidentEpoch = epoch;
+			if (SceneProfiling) ++GetSceneSurfaceProfile().GpuPersistentResident;
+			static bool residentLogged = false;
+			if (!residentLogged)
+			{
+				residentLogged = true;
+				Printf("G1PERSISTRESIDENT row=%u epoch=%llu\n", part.Row, static_cast<unsigned long long>(epoch));
+			}
+		}
+		if (vk_gpu_driven_resident)
+		{
+			FGpuResidentAppearanceInputs appearance;
+			appearance.LightingContext = RetainedWorld::ValidateLightingContext(di->Level);
+			appearance.WallContext = RetainedWorld::ValidateWallLightingContext(di->Level);
+			appearance.Modes = { int(di->lightmode), output.lightlevel, output.rellight, getExtraLight(),
+				int(di->isFullbrightScene()), int(side->Flags & WALLF_EXTCOLOR), int(side->textures[texpos].flags) };
+			appearance.Colormap = output.Colormap;
+			if (side->Flags & WALLF_EXTCOLOR)
+			{
+				appearance.Colors = { side->GetSpecialColor(texpos, side_t::walltop, front).d,
+					side->GetSpecialColor(texpos, side_t::wallbottom, front).d, side->GetAdditiveColor(texpos, front).d, 0 };
+				appearance.TextureFx = side->textures[texpos].TextureFx;
+			}
+			appearance.Material = { output.texture->GetGlossiness(), output.texture->GetSpecularLevel(), float(output.texture->GetShaderSpeed()) };
+			if (!part.AppearanceValid || !(part.Appearance == appearance))
+			{
+				part.Appearance = appearance;
+				part.AppearanceValid = true;
+				output.GpuAppearanceRevision = ++GpuResidentNextRevision;
+			}
+			output.GpuAppearanceId = uint32_t(slot) * 3 + uint32_t(p);
+			output.texture->setSeen();
+			di->di->drawlists[GLDL_PLAINWALLS].NewWall(&output);
+			if (SceneProfiling)
+			{
+				auto& profile = GetSceneSurfaceProfile();
+				++profile.Submitted; ++profile.OpaqueRegular;
+				if (part.Type == RENDERWALL_TOP) ++profile.OutOrdinaryTop;
+				else if (part.Type == RENDERWALL_BOTTOM) ++profile.OutOrdinaryBottom;
+				else ++profile.OutOrdinaryM1S;
+			}
+		}
+		else output.PutWall(di, false);
+	}
+	if (SceneProfiling)
+	{
+		++GetSceneSurfaceProfile().GpuPersistentHits;
+		if (owner.PartCount >= 2) ++GetSceneSurfaceProfile().GpuOwnerMultiPartCalls;
+	}
+	static bool logged[2] = {};
+	const int sided = back ? 1 : 0;
+	if (!logged[sided])
+	{
+		logged[sided] = true;
+		Printf("G1PERSISTUSE early=2 two_sided=%d parts=%d owner_bytes=%llu\n", sided, owner.PartCount, static_cast<unsigned long long>(sizeof(FGpuPersistentWall)));
+	}
+	return true;
+}
+
+void HWWall::Process(HWWallDispatcher* di, seg_t* seg, sector_t* front, sector_t* back, bool culled)
+{
+	if (SceneProfiling && !di->SuppressSubmit)
+	{
+		auto &profile = GetSceneSurfaceProfile();
+		++profile.ProcessCalls;
+		if (!back) ++profile.OneSided;
+		else ++profile.ProcessTwoSidedCalls;
+		if (seg->sidedef->Flags & WALLF_POLYOBJ) ++profile.Polyobjects;
+		if (seg->linedef->isVisualPortal()) ++profile.VisualPortals;
+		const auto &realFront = di->Level->sectors[front->sectornum];
+		const auto *realBack = back ? &di->Level->sectors[back->sectornum] : nullptr;
+		if (front != &realFront || back != realBack) ++profile.FakeSectors;
+		if (front->floorplane.isSlope() || front->ceilingplane.isSlope() ||
+			(back && (back->floorplane.isSlope() || back->ceilingplane.isSlope())))
+		{
+			++profile.Slopes;
+		}
+		if (front->e->XFloor.ffloors.Size() || (back && back->e->XFloor.ffloors.Size()))
+		{
+			++profile.ThreeDFloors;
+		}
+		if (front->GetHeightSec() || (back && back->GetHeightSec())) ++profile.HeightSectors;
+	}
+	struct FProcessOutputCensus
+	{
+		HWSceneSurfaceProfile* Profile;
+		seg_t* Seg;
+		sector_t* Front;
+		sector_t* Back;
+		cycle_t Timer;
+		uint64_t BeforeSubmitted;
+		uint64_t BeforeOrdinaryOpaque;
+		uint64_t BeforeTop;
+		uint64_t BeforeBottom;
+		uint64_t BeforeM2S;
+		FProcessOutputCensus(HWSceneSurfaceProfile* profile, seg_t* seg, sector_t* front, sector_t* back)
+			: Profile(profile), Seg(seg), Front(front), Back(back)
+		{
+			BeforeSubmitted = profile ? profile->Submitted : 0;
+			BeforeOrdinaryOpaque = profile ? profile->OpaqueRegular : 0;
+			BeforeTop = profile ? profile->OutOrdinaryTop : 0;
+			BeforeBottom = profile ? profile->OutOrdinaryBottom : 0;
+			BeforeM2S = profile ? profile->OutM2S : 0;
+			if (profile) Timer.ResetAndClock();
+		}
+		~FProcessOutputCensus()
+		{
+			if (!Profile) return;
+			Timer.Unclock();
+			const uint64_t ns = uint64_t(Timer.Time() * 1e9);
+			Profile->CensusProcessNS += ns;
+			const uint64_t submitted = Profile->Submitted - BeforeSubmitted;
+			const uint64_t ordinary = Profile->OpaqueRegular - BeforeOrdinaryOpaque;
+			Profile->ProcessWallSubmissions += submitted;
+			Profile->ProcessOrdinaryOpaqueParts += ordinary;
+			if (submitted) ++Profile->ProcessCallsWithWallSubmission;
+			else
+			{
+				++Profile->ProcessCallsWithoutWallSubmission;
+				Profile->CensusEmptyProcessNS += ns;
+				bool cert = false;
+				if (Back && Front && Seg && Seg->sidedef && Seg->linedef)
+				{
+					auto midtex = TexMan.GetGameTexture(Seg->sidedef->GetTexture(side_t::mid), true);
+					const bool noMid = (!midtex || !midtex->isValid());
+					const bool noPortal = !Seg->linedef->isVisualPortal() &&
+						Seg->linedef->special != Line_Horizon && Seg->linedef->special != Line_Mirror &&
+						!Seg->linedef->GetTransferredPortal();
+					const bool equalPlanes = !Front->floorplane.isSlope() && !Back->floorplane.isSlope() &&
+						!Front->ceilingplane.isSlope() && !Back->ceilingplane.isSlope() &&
+						Front->floorplane.D == Back->floorplane.D && Front->ceilingplane.D == Back->ceilingplane.D;
+					cert = noMid && noPortal && equalPlanes;
+				}
+				if (cert)
+				{
+					++Profile->CensusEmptyEqualCandidate;
+					Profile->CensusEmptyEqualCandidateNS += ns;
+				}
+			}
+			if (ordinary) ++Profile->ProcessCallsWithOrdinaryOpaque;
+			const uint64_t top = Profile->OutOrdinaryTop - BeforeTop;
+			const uint64_t bottom = Profile->OutOrdinaryBottom - BeforeBottom;
+			const uint64_t mid = Profile->OutM2S - BeforeM2S;
+			if (mid)
+			{
+				++Profile->CensusMidNativeSides;
+				Profile->CensusMidNativeTop += top;
+				Profile->CensusMidNativeBottom += bottom;
+				Profile->CensusMidNativeProcessNS += ns;
+				if (!top && !bottom) ++Profile->CensusMidOnlySides;
+			}
+		}
+	};
+	HWSceneSurfaceProfile* censusProfile = (SceneProfiling && !di->SuppressSubmit) ? &GetSceneSurfaceProfile() : nullptr;
+	FProcessOutputCensus outputCensus(censusProfile, seg, front, back);
+	Prepared = nullptr;
+	GpuOwnerCandidate = nullptr;
+	GpuResidentEpoch = 0;
+	GpuResidentRow = UINT32_MAX;
+	GpuOwnerSlot = -1;
+	GpuAppearanceId = UINT32_MAX;
+	GpuAppearanceRevision = 0;
+	if (di->mh)
+	{
+		PrepareWall(di, seg, front, back, culled);
+		return;
+	}
+	if (TryGpuPersistentWall(*this, di, seg, front, back, culled)) return;
+	struct FGpuPersistentCapture
+	{
+		FGpuPersistentWall* Owner;
+		~FGpuPersistentCapture()
+		{
+			if (Owner) Owner->Valid = !Owner->CaptureRejected;
+		}
+	} gpuCapture { GpuOwnerCandidate };
+	RetainedWorld::SideInputs inputs;
+	RetainedWorld::Entry* found = nullptr;
+	bool hit = false;
+	cycle_t validation;
+	if (SceneProfiling) validation.ResetAndClock();
+	const bool eligible = vk_retainedworld && RetainedWorld::Snapshot(di, seg, front, back, culled, inputs, found, hit);
+	if (SceneProfiling)
+	{
+		validation.Unclock();
+		GetSceneSurfaceProfile().PreparedValidationNS += uint64_t(validation.Time() * 1e9);
+	}
+	const bool owns = di->di && di->di->OwnOpaqueWalls && di->SubmissionOrder && !di->SuppressSubmit;
+	bool selectOwned = false;
+	if (owns)
+	{
+		HWSceneScopeTimer admissionTimer(GetSceneSurfaceProfile().OwnedAdmissionNS);
+		EOwnedAdmissionReason reason = OAR_Admitted;
+		if (culled) reason = OAR_Culled;
+		else if (front != seg->frontsector || back != seg->backsector || seg->Subsector->sector != front) reason = OAR_FakeSectorMismatch;
+		else if (seg->sidedef->linedef != seg->linedef) reason = OAR_SideLineMismatch;
+		else if (seg->sidedef->Flags & (WALLF_POLYOBJ | WALLF_BLOCKRENDERING | WALLF_DITHERTRANS_TOP | WALLF_DITHERTRANS_BOTTOM | WALLF_DITHERTRANS_MID)) reason = OAR_BlockFlags;
+		else if (!eligible) reason = OAR_RetainedRecipeUnavailable;
+		else if (inputs.EmptyOnly)
+		{
+			const auto& empty = RetainedWorld::EmptySides;
+			const RetainedWorld::EmptyInputs live = { front, back, inputs.FrontVersion, inputs.BackVersion, inputs.LineFlags };
+			if (empty.empty() || !empty[seg->sidedef->Index()].Valid || !(empty[seg->sidedef->Index()].Inputs == live)) reason = OAR_ColdRecipe;
+		}
+		else if (!hit) reason = OAR_ColdRecipe;
+		selectOwned = reason == OAR_Admitted;
+		if (SceneProfiling)
+		{
+			auto& profile = GetSceneSurfaceProfile();
+			++profile.OwnedAdmissionCalls;
+			++profile.OwnedAdmissionReasons[reason];
+			if (selectOwned) ++profile.OwnedCandidates;
+		}
+	}
+	bool ownedRejected = false;
+	if (selectOwned)
+	{
+		HWSceneScopeTimer ownedTimer(GetSceneSurfaceProfile().OwnedPrepareNS);
+		if (inputs.EmptyOnly)
+		{
+			if (SceneProfiling)
+			{
+				++GetSceneSurfaceProfile().OwnedEmptySelections;
+				++GetSceneSurfaceProfile().PreparedHits;
+			}
+			return;
+		}
+		if (SelectOwnedWall(di, *this, seg, front, back, *found, inputs))
+		{
+			if (SceneProfiling) ++GetSceneSurfaceProfile().PreparedHits;
+			return;
+		}
+		ownedRejected = true;
+		if (SceneProfiling)
+		{
+			++GetSceneSurfaceProfile().OwnedRejected;
+			++GetSceneSurfaceProfile().OwnedInlineReplayFallbacks;
+		}
+	}
+	if (!eligible)
+	{
+		if (SceneProfiling && vk_retainedworld) ++GetSceneSurfaceProfile().PreparedFallbacks;
+		PrepareWall(di, seg, front, back, culled);
+		return;
+	}
+	if (inputs.EmptyOnly)
+	{
+		RetainedWorld::ProcessEmpty(*this, di, seg, front, back, inputs);
+		return;
+	}
+	if (RetainedWorld::SideSlots.empty()) RetainedWorld::SideSlots.resize(di->Level->sides.Size());
+	if (!hit && RetainedWorld::Geometry.size() + 3 > RetainedWorld::Capacity)
+	{
+		RetainedWorld::Fallback(6);
+		if (SceneProfiling) ++GetSceneSurfaceProfile().PreparedFallbacks;
+		PrepareWall(di, seg, front, back, culled);
+		return;
+	}
+	auto replay = [&]()
+	{
+		cycle_t timer;
+		if (SceneProfiling) timer.ResetAndClock();
+		RetainedWorld::ReplayViewEffects(di, *this, seg, front, back);
+		RetainedWorld::ReplayEntry(di, *this, *found, &inputs);
+		if (SceneProfiling)
+		{
+			timer.Unclock();
+			GetSceneSurfaceProfile().PreparedReplayNS += uint64_t(timer.Time() * 1e9);
+			if (ownedRejected) GetSceneSurfaceProfile().OwnedFallbackNS += uint64_t(timer.Time() * 1e9);
+		}
+	};
+	if (hit && !vk_retainedworld_verify)
+	{
+		di->PreparedReplay = &found->Output;
+		if (SceneProfiling) ++GetSceneSurfaceProfile().PreparedHits;
+		replay();
+		di->PreparedReplay = nullptr;
+		return;
+	}
+	HWMeshHelper capture;
+	if (hit)
+	{
+		di->PreparedReplay = &found->Output;
+		if (SceneProfiling) ++GetSceneSurfaceProfile().PreparedHits;
+		if (vk_retainedworld_verify) di->PreparedCapture = &capture;
+	}
+	else
+	{
+		di->PreparedCapture = &capture;
+		if (SceneProfiling) ++GetSceneSurfaceProfile().PreparedRebuilds;
+	}
+	if (hit) replay();
+	else PrepareWall(di, seg, front, back, culled);
+	di->PreparedReplay = nullptr;
+	di->PreparedCapture = nullptr;
+	if (hit && vk_retainedworld_verify)
+	{
+		HWMeshHelper reference;
+		di->PreparedCapture = &reference;
+		di->SuppressSubmit = true;
+		PrepareWall(di, seg, front, back, culled);
+		di->PreparedCapture = nullptr;
+		di->SuppressSubmit = false;
+		auto compareMissing = [](const TArray<HWMissing>& cached, const TArray<HWMissing>& original)
+		{
+			if (cached.Size() != original.Size()) return false;
+			for (unsigned i = 0; i < cached.Size(); ++i)
+				if (cached[i].side != original[i].side || cached[i].plane != original[i].plane) return false;
+			return true;
+		};
+		if (!compareMissing(found->Output.upper, reference.upper) || !compareMissing(found->Output.lower, reference.lower))
+			I_FatalError("Retained missing-texture recipe differs on side %d", seg->sidedef->Index());
+		if (capture.list.Size() != reference.list.Size()) I_FatalError("Retained wall output count differs on side %d", seg->sidedef->Index());
+		for (unsigned i = 0; i < capture.list.Size(); ++i)
+		{
+			FFlatVertex quad[4];
+			auto ptr = quad;
+			reference.list[i].CreateVertices(ptr, false);
+			auto& cached = capture.list[i];
+			auto& original = reference.list[i];
+			if (!cached.Prepared || memcmp(quad, cached.Prepared->Vertices.data(), sizeof(quad)) ||
+				cached.type != original.type || cached.flags != original.flags || cached.texture != original.texture ||
+				cached.alpha != original.alpha || cached.RenderStyle != original.RenderStyle ||
+				memcmp(&cached.glseg, &original.glseg, sizeof(cached.glseg)) ||
+				cached.lightlevel != original.lightlevel || cached.rellight != original.rellight ||
+				memcmp(&cached.Colormap, &original.Colormap, sizeof(FColormap)) ||
+				((cached.flags & HWF_GLOW) && (memcmp(cached.topglowcolor, original.topglowcolor, sizeof(cached.topglowcolor)) ||
+				memcmp(cached.bottomglowcolor, original.bottomglowcolor, sizeof(cached.bottomglowcolor)))))
+			{
+				I_FatalError("Retained wall reference differs on side %d part %d", seg->sidedef->Index(), original.type);
+			}
+		}
+		if (SceneProfiling) ++GetSceneSurfaceProfile().PreparedVerified;
+	}
+	else if (!hit)
+	{
+		RetainedWorld::StoreSideEntry(seg->sidedef->Index(), inputs, std::move(capture));
+	}
+}
+
+//==========================================================================
+//
+//
+//
+//==========================================================================
+void HWWall::PrepareWall(HWWallDispatcher *di, seg_t *seg, sector_t * frontsector, sector_t * backsector, bool isculled)
+{
+	struct PreparationTimer
+	{
+		bool Active;
+		cycle_t Timer;
+		PreparationTimer(bool active) : Active(active)
+		{
+			if (Active)
+			{
+				Timer.ResetAndClock();
+			}
+		}
+		~PreparationTimer()
+		{
+			if (Active)
+			{
+				Timer.Unclock();
+				GetSceneSurfaceProfile().PreparedBuildNS += uint64_t(Timer.Time() * 1e9);
+			}
+		}
+	} preparationTimer(SceneProfiling && !di->SuppressSubmit);
 	vertex_t * v1, *v2;
 	float fch1;
 	float ffh1;
@@ -2168,6 +3219,19 @@ void HWWall::Process(HWWallDispatcher *di, seg_t *seg, sector_t * frontsector, s
 	}
 	frefz = realfront->GetPlaneTexZ(sector_t::floor);
 	crefz = realfront->GetPlaneTexZ(sector_t::ceiling);
+
+	// [Karto] Shader plane heights: only tiers drawn straight from the real sectors' planes name them; fake
+	// (Transfer_Heights) copies, polyobjects and portal-aligned backs keep producer-only geometry.
+	HeightArmed = HeightValid = false;
+	const bool heightPlanes = segfront == realfront && segback == realback && !(seg->sidedef->Flags & WALLF_POLYOBJ) &&
+		!seg->linedef->isVisualPortal();
+	auto armHeights = [&](sector_t* top, int topPlane, sector_t* bottom, int bottomPlane, sector_t* anchor, int anchorPlane)
+	{
+		HeightArmed = heightPlanes;
+		HeightTop = top->Index() * 2 + topPlane;
+		HeightBottom = bottom->Index() * 2 + bottomPlane;
+		HeightAnchor = anchor->Index() * 2 + anchorPlane;
+	};
 
 	if (seg->sidedef == seg->linedef->sidedef[0])
 	{
@@ -2245,6 +3309,9 @@ void HWWall::Process(HWWallDispatcher *di, seg_t *seg, sector_t * frontsector, s
 
 	if (isculled)
 	{
+		// [Karto] The native cutoff emits a top wall before ordinary tier setup; initialize lighting so producer bypass cannot expose stale stack fields.
+		lightlevel = RescaleLightLevel(seg->sidedef->GetLightLevel(foggy, orglightlevel, side_t::top, false, &rel));
+		rellight = CalcRelLight(lightlevel, orglightlevel, rel);
 		if (frontsector->GetTexture(sector_t::ceiling) == skyflatnum)
 		{
 			SkyNormal(di, frontsector, v1, v2);
@@ -2271,6 +3338,11 @@ void HWWall::Process(HWWallDispatcher *di, seg_t *seg, sector_t * frontsector, s
 		// sector's sky
 		SkyNormal(di, frontsector, v1, v2);
 
+		if (di->PreparedReplay)
+		{
+			RetainedWorld::Replay(di, *this);
+			return;
+		}
 		if (isportal)
 		{
 			lineportal = seg->linedef->getPortal()->mGroup;
@@ -2297,6 +3369,8 @@ void HWWall::Process(HWWallDispatcher *di, seg_t *seg, sector_t * frontsector, s
 				float skew =
 					skewflag == side_t::skew_front_ceiling ? fch2 - fch1 :
 					skewflag == side_t::skew_front_floor ? ffh2 - ffh1 : 0.;
+				armHeights(realfront, sector_t::ceiling, realfront, sector_t::floor, realfront,
+					(seg->linedef->flags & ML_DONTPEGBOTTOM) ? sector_t::floor : sector_t::ceiling);
 				DoTexture(di, RENDERWALL_M1S, seg, (seg->linedef->flags & ML_DONTPEGBOTTOM) > 0,
 					crefz, frefz,	// must come from the original!
 					fch1, fch2, ffh1, ffh2, 0, skew);
@@ -2345,6 +3419,11 @@ void HWWall::Process(HWWallDispatcher *di, seg_t *seg, sector_t * frontsector, s
 			SkyTop(di, seg, frontsector, backsector, v1, v2);
 			SkyBottom(di, seg, frontsector, backsector, v1, v2);
 		}
+		if (di->PreparedReplay)
+		{
+			RetainedWorld::Replay(di, *this);
+			return;
+		}
 
 		// upper texture
 		if (frontsector->GetTexture(sector_t::ceiling) != skyflatnum || backsector->GetTexture(sector_t::ceiling) != skyflatnum)
@@ -2389,6 +3468,9 @@ void HWWall::Process(HWWallDispatcher *di, seg_t *seg, sector_t * frontsector, s
 						skew = bfh2 - bfh1;
 						break;
 					}
+					armHeights(realfront, sector_t::ceiling, bch1a != bch1 || bch2a != bch2 ? realfront : realback,
+						bch1a != bch1 || bch2a != bch2 ? sector_t::floor : sector_t::ceiling,
+						(seg->linedef->flags & ML_DONTPEGTOP) ? realfront : realback, sector_t::ceiling);
 					DoTexture(di, RENDERWALL_TOP, seg, (seg->linedef->flags & (ML_DONTPEGTOP)) == 0,
 						crefz, realback->GetPlaneTexZ(sector_t::ceiling),
 						fch1, fch2, bch1a, bch2a, 0, skew);
@@ -2402,6 +3484,9 @@ void HWWall::Process(HWWallDispatcher *di, seg_t *seg, sector_t * frontsector, s
 						texture = TexMan.GetGameTexture(frontsector->GetTexture(sector_t::ceiling), true);
 						if (texture && texture->isValid())
 						{
+							armHeights(realfront, sector_t::ceiling, bch1a != bch1 || bch2a != bch2 ? realfront : realback,
+								bch1a != bch1 || bch2a != bch2 ? sector_t::floor : sector_t::ceiling,
+								(seg->linedef->flags & ML_DONTPEGTOP) ? realfront : realback, sector_t::ceiling);
 							DoTexture(di, RENDERWALL_TOP, seg, (seg->linedef->flags & (ML_DONTPEGTOP)) == 0,
 								crefz, realback->GetPlaneTexZ(sector_t::ceiling),
 								fch1, fch2, bch1a, bch2a, 0, 0);
@@ -2410,9 +3495,11 @@ void HWWall::Process(HWWallDispatcher *di, seg_t *seg, sector_t * frontsector, s
 					else
 					{
 						// skip processing if the back is a malformed subsector
-						if (seg->PartnerSeg != NULL && !(seg->PartnerSeg->Subsector->hacked & 4))
+							if (di->PreparedCapture && !di->PreparedReplay) di->PreparedCapture->upper.Push({ seg->sidedef, nullptr, bch1a });
+							if (seg->PartnerSeg != NULL && !(seg->PartnerSeg->Subsector->hacked & 4))
 						{
-							di->AddUpperMissingTexture(seg->sidedef, sub, bch1a);
+							RejectGpuPersistentWall(this);
+						di->AddUpperMissingTexture(seg->sidedef, sub, bch1a);
 						}
 					}
 				}
@@ -2496,10 +3583,12 @@ void HWWall::Process(HWWallDispatcher *di, seg_t *seg, sector_t * frontsector, s
 		/* bottom texture */
 		// the back sector's ceiling obstructs part of this wall (specially important for sky sectors)
 		float bfh1a = bfh1, bfh2a = bfh2;
+		bool lowerObstructed = false;
 		if (fch1 < bfh1 && fch2 < bfh2 && (seg->linedef->flags & ML_DRAWFULLHEIGHT) == 0)
 		{
 			bfh1 = fch1;
 			bfh2 = fch2;
+			lowerObstructed = true;
 		}
 
 		if (bfh1 > ffh1 || bfh2 > ffh2)
@@ -2531,6 +3620,11 @@ void HWWall::Process(HWWallDispatcher *di, seg_t *seg, sector_t * frontsector, s
 					break;
 				}
 
+				armHeights(lowerObstructed ? realfront : realback, lowerObstructed ? sector_t::ceiling : sector_t::floor,
+					realfront, sector_t::floor,
+					!(seg->linedef->flags & ML_DONTPEGBOTTOM) ? realback :
+					frontsector->GetTexture(sector_t::ceiling) == skyflatnum && backsector->GetTexture(sector_t::ceiling) == skyflatnum ? realback : realfront,
+					!(seg->linedef->flags & ML_DONTPEGBOTTOM) ? sector_t::floor : sector_t::ceiling);
 				DoTexture(di, RENDERWALL_BOTTOM, seg, (seg->linedef->flags & ML_DONTPEGBOTTOM) > 0,
 					realback->GetPlaneTexZ(sector_t::floor), frefz,
 					bfh1, bfh2, ffh1, ffh2,
@@ -2550,6 +3644,9 @@ void HWWall::Process(HWWallDispatcher *di, seg_t *seg, sector_t * frontsector, s
 					texture = TexMan.GetGameTexture(frontsector->GetTexture(sector_t::floor), true);
 					if (texture && texture->isValid())
 					{
+						armHeights(lowerObstructed ? realfront : realback, lowerObstructed ? sector_t::ceiling : sector_t::floor,
+							realfront, sector_t::floor, (seg->linedef->flags & ML_DONTPEGBOTTOM) ? realfront : realback,
+							(seg->linedef->flags & ML_DONTPEGBOTTOM) ? sector_t::ceiling : sector_t::floor);
 						DoTexture(di, RENDERWALL_BOTTOM, seg, (seg->linedef->flags & ML_DONTPEGBOTTOM) > 0,
 							realback->GetPlaneTexZ(sector_t::floor), frefz,
 							bfh1, bfh2, ffh1, ffh2, frefz - crefz, 0);
@@ -2558,8 +3655,10 @@ void HWWall::Process(HWWallDispatcher *di, seg_t *seg, sector_t * frontsector, s
 				else if (backsector->GetTexture(sector_t::floor) != skyflatnum)
 				{
 					// skip processing if the back is a malformed subsector
-					if (seg->PartnerSeg != NULL && !(seg->PartnerSeg->Subsector->hacked & 4))
+						if (di->PreparedCapture && !di->PreparedReplay) di->PreparedCapture->lower.Push({ seg->sidedef, nullptr, bfh1 });
+						if (seg->PartnerSeg != NULL && !(seg->PartnerSeg->Subsector->hacked & 4))
 					{
+						RejectGpuPersistentWall(this);
 						di->AddLowerMissingTexture(seg->sidedef, sub, bfh1);
 					}
 				}

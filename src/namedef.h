@@ -324,6 +324,7 @@ xx(Alresamplers)
 
 // Decorate compatibility functions
 xx(BuiltinRandom)
+xx(BuiltinArrayWritten)
 xx(BuiltinRandom2)
 xx(BuiltinFRandom)
 xx(BuiltinNameToClass)

@@ -75,6 +75,7 @@ static PClassActor *FindClassTentative(const char *name, PClass *ancestor, bool 
 //==========================================================================
 void ModActorFlag(AActor *actor, FFlagDef *fd, bool set)
 {
+	if (set && fd->structoffset == myoffsetof(AActor, flags9) && (fd->flagbit & MF9_SHADOWBLOCK)) ShadowBlockPossible = true;
 	// Little-Endian machines only need one case, because all field sizes
 	// start at the same address. (Unless the machine has unaligned access
 	// exceptions, in which case you'll need multiple cases for it too.)

@@ -23,6 +23,9 @@
 ** more useful.
 */
 
+#include "d_logiccensus.h"
+#include "c_dispatch.h"
+#include "i_time.h"
 #include "colorspace.h"
 #include "doomtype.h"
 #include "doomstat.h"
@@ -141,6 +144,7 @@ static particle_t *NewParticle (FLevelLocals *Level, bool replace = false)
 	// Array isn't full.
 	uint32_t current = Level->ActiveParticles;
 	auto result = &Level->Particles[Level->InactiveParticles];
+	result->live = 1;
 	Level->InactiveParticles = result->tnext;
 	result->tnext = current;
 	result->tprev = NO_PARTICLE;
@@ -276,79 +280,176 @@ void P_InitEffects ()
 	blood2 = ParticleColor(RPART(kind)/3, GPART(kind)/3, BPART(kind)/3);
 }
 
+CVAR(Bool, p_particle_samexy, true, 0)
+
+std::vector<particle_t>* WorldModeParticleStageBegin(FLevelLocals* level, std::vector<uint16_t>*& indices);
+void WorldModeParticleStageEnd(FLevelLocals* level);
+
+CVAR(Bool, p_particle_poolorder, true, 0)
+// [Karto] Each particle's tic is independent; the list walk that frees and stages stays serial, so results match one thread.
+CVAR(Int, p_particle_threads, 4, 0)
+CVAR(Bool, p_particle_threads_verify, false, 0)
+static uint64_t ParticleThreadPasses = 0, ParticleThreadChecks = 0, ParticleThreadMismatches = 0, ParticleThinkNS = 0, ParticleThinks = 0;
+void WorldModeParallelFor(int parts, void (*job)(void* context, int part, int parts), void* context);
+
+CCMD(particle_thread_stats)
+{
+	Printf("PARTICLETHREADS threads=%d passes=%llu checks=%llu mismatches=%llu us_per_think=%.1f\n", *p_particle_threads,
+		(unsigned long long)ParticleThreadPasses, (unsigned long long)ParticleThreadChecks, (unsigned long long)ParticleThreadMismatches,
+		ParticleThinks ? double(ParticleThinkNS) / ParticleThinks / 1000.0 : 0.0);
+	if (argv.argc() == 2 && stricmp(argv[1], "reset") == 0)
+		ParticleThreadPasses = ParticleThreadChecks = ParticleThreadMismatches = ParticleThinkNS = ParticleThinks = 0;
+}
+
+static inline bool ThinkParticle(FLevelLocals* Level, particle_t* particle, bool frozen)
+{
+	if (frozen && !(particle->flags &SPF_NOTIMEFREEZE))
+	{
+		if(particle->flags & SPF_LOCAL_ANIM)
+		{
+			particle->animData.SwitchTic++;
+		}
+		return true;
+	}
+
+	particle->alpha -= particle->fadestep;
+	if (	(!!(particle->flags & SPF_FADE_IN_OUT) && particle->alpha >= 1.0)
+		 || (!!(particle->flags & SPF_FADE_IN_HOLD_OUT) && (particle->ttl * fabs(particle->fadeoutstep)) <= std::min(1.0f, fabs(particle->alpha)))
+	) { // [Jay] if SPF_FADE_IN_HOLD_OUT, hold until the fade out would line up with ttl
+		particle->alpha = std::min(1.0f, fabs(particle->alpha));
+		particle->fadestep = particle->fadeoutstep;
+		particle->flags &= ~(SPF_FADE_IN_OUT|SPF_FADE_IN_HOLD_OUT);
+	}
+
+	// It looks really glitchy if the alpha is allowed to overshoot
+	if (particle->alpha > 1.0)
+		particle->alpha = 1.0;
+
+	particle->size += particle->sizestep;
+	if (particle->alpha <= 0 || --particle->ttl <= 0 || (particle->size <= 0))
+	{ // The particle has expired, so free it
+		return false;
+	}
+
+	const DVector2 oldxy = particle->Pos.XY();
+	subsector_t* const oldsub = particle->subsector;
+	// Handle crossing a line portal
+	DVector2 newxy = Level->GetPortalOffsetPosition(particle->Pos.X, particle->Pos.Y, particle->Vel.X, particle->Vel.Y);
+	particle->Pos.X = newxy.X;
+	particle->Pos.Y = newxy.Y;
+	particle->Pos.Z += particle->Vel.Z;
+	particle->Vel += particle->Acc;
+
+	if(particle->flags & SPF_ROLL)
+	{
+		particle->Roll += particle->RollVel;
+		particle->RollVel += particle->RollAcc;
+	}
+
+	if (!p_particle_samexy || oldsub == nullptr || particle->Pos.XY() != oldxy)
+		particle->subsector = Level->PointInRenderSubsector(particle->Pos);
+	if (LogicCensusArmed)
+	{
+		++LogicCensus.Particles;
+		LogicCensus.ParticlesUnmoved += particle->Pos.XY() == oldxy;
+		LogicCensus.ParticlesSameSubsector += particle->subsector == oldsub;
+	}
+	sector_t *s = particle->subsector->sector;
+	// Handle crossing a sector portal.
+	if (!s->PortalBlocksMovement(sector_t::ceiling))
+	{
+		if (particle->Pos.Z > s->GetPortalPlaneZ(sector_t::ceiling))
+		{
+			particle->Pos += s->GetPortalDisplacement(sector_t::ceiling);
+			particle->subsector = NULL;
+		}
+	}
+	else if (!s->PortalBlocksMovement(sector_t::floor))
+	{
+		if (particle->Pos.Z < s->GetPortalPlaneZ(sector_t::floor))
+		{
+			particle->Pos += s->GetPortalDisplacement(sector_t::floor);
+			particle->subsector = NULL;
+		}
+	}
+	return true;
+}
+
 void P_ThinkParticles (FLevelLocals *Level)
 {
+	if (LogicCensusArmed) ++LogicCensus.Tics;
 	int i = Level->ActiveParticles;
-	particle_t *particle = nullptr, *prev = nullptr;
-	while (i != NO_PARTICLE)
+	particle_t *particle = nullptr;
+	std::vector<uint16_t>* stageIndices = nullptr;
+	std::vector<particle_t>* stage = WorldModeParticleStageBegin(Level, stageIndices);
+	// [Karto] The publish copy of a survivor needs its pool index, since freeing a later particle still rewrites its forward link.
+	auto stageParticle = [&](particle_t* p)
+	{
+		if (p->subsector == nullptr) p->subsector = Level->PointInRenderSubsector(p->Pos);
+		stage->push_back(*p);
+		stageIndices->push_back(uint16_t(p - Level->Particles.Data()));
+	};
+	const bool frozen = Level->isFrozen();
+	auto think = [&](particle_t* particle) -> bool { return ThinkParticle(Level, particle, frozen); };
+	if (p_particle_poolorder)
+	{
+		particle_t* const pool = Level->Particles.Data();
+		const unsigned count = Level->Particles.Size();
+		struct FJob { FLevelLocals* Level; particle_t* Pool; unsigned Count; bool Frozen; } job = { Level, pool, count, frozen };
+		auto part = [](void* context, int index, int parts)
+		{
+			auto& j = *static_cast<FJob*>(context);
+			const unsigned end = unsigned(uint64_t(j.Count) * (index + 1) / parts);
+			for (unsigned k = unsigned(uint64_t(j.Count) * index / parts); k < end; ++k)
+			{
+				if (j.Pool[k].live != 0 && !ThinkParticle(j.Level, &j.Pool[k], j.Frozen)) j.Pool[k].live = 2;
+			}
+		};
+		// [Karto] The census shares totals and portal offset lookups use the shared intercept list and validcount: one thread.
+		const int threads = LogicCensusArmed || Level->PortalBlockmap.containsLines || Level->ActiveParticles == NO_PARTICLE ||
+			count < 4096 ? 1 : std::clamp(*p_particle_threads, 1, 8);
+		std::vector<particle_t> reference;
+		if (threads > 1 && p_particle_threads_verify) reference.assign(pool, pool + count);
+		const uint64_t thinkStart = I_nsTime();
+		if (threads > 1)
+		{
+			++ParticleThreadPasses;
+			WorldModeParallelFor(threads, part, &job);
+		}
+		else part(&job, 0, 1);
+		ParticleThinkNS += I_nsTime() - thinkStart;
+		++ParticleThinks;
+		if (!reference.empty())
+		{
+			FJob serial = { Level, reference.data(), count, frozen };
+			part(&serial, 0, 1);
+			for (unsigned k = 0; k < count; ++k)
+			{
+				if (reference[k].live == 0 && pool[k].live == 0) continue;
+				++ParticleThreadChecks;
+				ParticleThreadMismatches += memcmp(&reference[k], &pool[k], sizeof(particle_t)) != 0;
+			}
+		}
+		while (i != NO_PARTICLE)
+		{
+			particle = &Level->Particles[i];
+			i = particle->tnext;
+			if (particle->live == 2) FreeParticle(Level, particle);
+			else if (stage) stageParticle(particle);
+		}
+	}
+	else while (i != NO_PARTICLE)
 	{
 		particle = &Level->Particles[i];
 		i = particle->tnext;
-		if (Level->isFrozen() && !(particle->flags &SPF_NOTIMEFREEZE))
+		if (!think(particle))
 		{
-			if(particle->flags & SPF_LOCAL_ANIM)
-			{
-				particle->animData.SwitchTic++;
-			}
-
-			prev = particle;
-			continue;
-		}
-
-		particle->alpha -= particle->fadestep;
-		if (	(!!(particle->flags & SPF_FADE_IN_OUT) && particle->alpha >= 1.0)
-			 || (!!(particle->flags & SPF_FADE_IN_HOLD_OUT) && (particle->ttl * fabs(particle->fadeoutstep)) <= std::min(1.0f, fabs(particle->alpha)))
-		) { // [Jay] if SPF_FADE_IN_HOLD_OUT, hold until the fade out would line up with ttl
-			particle->alpha = std::min(1.0f, fabs(particle->alpha));
-			particle->fadestep = particle->fadeoutstep;
-			particle->flags &= ~(SPF_FADE_IN_OUT|SPF_FADE_IN_HOLD_OUT);
-		}
-
-		// It looks really glitchy if the alpha is allowed to overshoot
-		if (particle->alpha > 1.0)
-			particle->alpha = 1.0;
-
-		particle->size += particle->sizestep;
-		if (particle->alpha <= 0 || --particle->ttl <= 0 || (particle->size <= 0))
-		{ // The particle has expired, so free it
 			FreeParticle(Level, particle);
 			continue;
 		}
-
-		// Handle crossing a line portal
-		DVector2 newxy = Level->GetPortalOffsetPosition(particle->Pos.X, particle->Pos.Y, particle->Vel.X, particle->Vel.Y);
-		particle->Pos.X = newxy.X;
-		particle->Pos.Y = newxy.Y;
-		particle->Pos.Z += particle->Vel.Z;
-		particle->Vel += particle->Acc;
-
-		if(particle->flags & SPF_ROLL)
-		{
-			particle->Roll += particle->RollVel;
-			particle->RollVel += particle->RollAcc;
-		}
-
-		particle->subsector = Level->PointInRenderSubsector(particle->Pos);
-		sector_t *s = particle->subsector->sector;
-		// Handle crossing a sector portal.
-		if (!s->PortalBlocksMovement(sector_t::ceiling))
-		{
-			if (particle->Pos.Z > s->GetPortalPlaneZ(sector_t::ceiling))
-			{
-				particle->Pos += s->GetPortalDisplacement(sector_t::ceiling);
-				particle->subsector = NULL;
-			}
-		}
-		else if (!s->PortalBlocksMovement(sector_t::floor))
-		{
-			if (particle->Pos.Z < s->GetPortalPlaneZ(sector_t::floor))
-			{
-				particle->Pos += s->GetPortalDisplacement(sector_t::floor);
-				particle->subsector = NULL;
-			}
-		}
-		prev = particle;
+		if (stage) stageParticle(particle);
 	}
+	if (stage) WorldModeParticleStageEnd(Level);
 }
 
 void P_SpawnParticle(FLevelLocals *Level, const DVector3 &pos, const DVector3 &vel, const DVector3 &accel, PalEntry color, double startalpha, int lifetime, double size,

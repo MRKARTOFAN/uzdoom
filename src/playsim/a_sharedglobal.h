@@ -187,7 +187,8 @@ public:
 	double GetFalloff(double dist, double radius) const;
 	void DoQuakeDamage(DEarthquake *quake, AActor *victim, bool falloff) const;
 
-	static int StaticGetQuakeIntensities(double ticFrac, AActor *viewer, FQuakeJiggers &jiggers);
+	int AddQuakeIntensities(double ticFrac, AActor *victim, FQuakeJiggers &jiggers);
+	static int StaticGetQuakeIntensities(double ticFrac, AActor *viewer, FQuakeJiggers &jiggers, DEarthquake* const* published = nullptr, int publishedCount = -1);
 };
 
 #endif //__A_SHAREDGLOBAL_H__

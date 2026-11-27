@@ -2144,3 +2144,14 @@ UCVarValue FZSColorCVar::GenericZSCVarCallback(UCVarValue value, ECVarType type)
 	v.Int = val;
 	return v;
 }
+
+extern bool NameFastLookup;
+CUSTOM_CVAR(Bool, name_fastlookup, true, 0)
+{
+	NameFastLookup = self;
+}
+extern bool NameCacheLookup;
+CUSTOM_CVAR(Bool, name_cache, true, 0)
+{
+	NameCacheLookup = self;
+}

@@ -54,6 +54,9 @@ public:
 	int VertexFormat;
 	int DrawType;
 	int NumTextureLayers;
+	int RetainedWorld = 0;
+	int GpuIndexedWorld = 0;
+	int ModelInstances = 0;
 
 	bool operator<(const VkPipelineKey &other) const { return memcmp(this, &other, sizeof(VkPipelineKey)) < 0; }
 	bool operator==(const VkPipelineKey &other) const { return memcmp(this, &other, sizeof(VkPipelineKey)) == 0; }
@@ -97,6 +100,7 @@ class VkVertexFormat
 public:
 	int NumBindingPoints;
 	size_t Stride;
+	std::vector<size_t> BindingStrides;
 	std::vector<FVertexBufferAttribute> Attrs;
 	int UseVertexData;
 };
@@ -153,7 +157,7 @@ public:
 	VkRenderPassSetup *GetRenderPass(const VkRenderPassKey &key);
 	int GetVertexFormat(int numBindingPoints, int numAttributes, size_t stride, const FVertexBufferAttribute *attrs);
 	VkVertexFormat *GetVertexFormat(int index);
-	VulkanPipelineLayout* GetPipelineLayout(int numLayers);
+	VulkanPipelineLayout* GetPipelineLayout(int numLayers, bool gpuWorld = false);
 
 	VkPPRenderPassSetup* GetPPRenderPass(const VkPPRenderPassKey& key);
 
@@ -164,6 +168,7 @@ private:
 
 	std::map<VkRenderPassKey, std::unique_ptr<VkRenderPassSetup>> RenderPassSetup;
 	std::vector<std::unique_ptr<VulkanPipelineLayout>> PipelineLayouts;
+	std::unique_ptr<VulkanPipelineLayout> GpuWorldPipelineLayout;
 	std::vector<VkVertexFormat> VertexFormats;
 
 	std::map<VkPPRenderPassKey, std::unique_ptr<VkPPRenderPassSetup>> PPRenderPassSetup;

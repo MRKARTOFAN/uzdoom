@@ -33,11 +33,26 @@ layout(binding=0) uniform sampler2D InputTexture;
 
 #ifdef FXAA_LUMA_PASS
 
+#ifdef BLOOM_ADD
+// [Karto] r_pp_fxaabloom: the luma must come from the colour as the RGBA16F target stores it; AMD truncates, so rounding would change edge choices.
+layout(binding=1) uniform sampler2D Bloom;
+float Half(float x)
+{
+	if (abs(x) < 6.103515625e-05) return trunc(x * 16777216.0) / 16777216.0;	// half subnormals: steps of 2^-24
+	return uintBitsToFloat(floatBitsToUint(x) & ~0x1fffu);
+}
+#endif
+
 void main()
 {
-	vec3 tex = texture(InputTexture, TexCoord).rgb;
 	vec3 luma = vec3(0.299, 0.587, 0.114);
+#ifdef BLOOM_ADD
+	vec3 sum = texture(InputTexture, TexCoord).rgb + texture(Bloom, TexCoord).rgb;
+	FragColor = vec4(sum, dot(vec3(Half(sum.r), Half(sum.g), Half(sum.b)), luma));
+#else
+	vec3 tex = texture(InputTexture, TexCoord).rgb;
 	FragColor = vec4(tex, dot(tex, luma));
+#endif
 }
 
 #else // FXAA itself

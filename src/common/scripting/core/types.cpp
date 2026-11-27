@@ -22,6 +22,7 @@
 **
 */
 
+#include "dynarrayindex.h"
 #include "filesystem.h"
 #include "i_interface.h"
 #include "maps.h"
@@ -2224,6 +2225,8 @@ void PDynArray::DestroyValue(void *addr) const
 
 	if (aray->Array != nullptr)
 	{
+		// [Karto] A new array may get this address, so the index must not outlive the buffer.
+		ArrayIndexDropData(aray->Array);
 		if (ElementType->GetRegType() != REGT_STRING)
 		{
 			M_Free(aray->Array);
@@ -2305,6 +2308,7 @@ bool PDynArray::ReadValue(FSerializer &ar, const char *key, void *addr) const
 {
 	FArray *aray = (FArray*)addr;
 	DestroyValue(addr);	// note that even after calling this we still got a validly constructed empty array.
+	ArrayIndexClearAll();
 
 	if (ar.BeginArray(key))
 	{
@@ -2854,8 +2858,8 @@ PMapIterator::PMapIterator(PType *keytype, PType *valtype, PStruct *backing, int
 	: KeyType(keytype), ValueType(valtype), BackingType(backing), BackingClass((decltype(BackingClass)) backing_class)
 {
 	mDescriptiveName.Format("MapIterator<%s, %s>", keytype->DescriptiveName(), valtype->DescriptiveName());
-	Size = sizeof(ZSFMap);
-	Align = alignof(ZSFMap);
+	Size = std::max(sizeof(ZSFMap), sizeof(ZSMapIterator<FString, FString>));
+	Align = std::max(alignof(ZSFMap), alignof(ZSMapIterator<FString, FString>));
 	CreateOverrideFunction<OFN_RET_KEY,  OFN_ARG_VOID>(this, NAME_GetKey);
 	CreateOverrideFunction<OFN_RET_VAL,  OFN_ARG_VOID>(this, NAME_GetValue);
 	CreateOverrideFunction<OFN_RET_VOID, OFN_ARG_VAL>(this, NAME_SetValue);

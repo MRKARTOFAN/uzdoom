@@ -23,6 +23,7 @@
 */
 
 #include "animtexture.h"
+#include "d_ticworkercheck.h"
 #include "basics.h"
 #include "c_cvars.h"
 #include "c_dispatch.h"
@@ -75,8 +76,12 @@ FTextureManager::~FTextureManager ()
 //
 //==========================================================================
 
+void ClearDecodeHandoffs();
+
 void FTextureManager::DeleteAll()
 {
+	++ResourceGeneration;
+	ClearDecodeHandoffs();
 	for (unsigned int i = 0; i < Textures.Size(); ++i)
 	{
 		delete Textures[i].Texture;
@@ -107,6 +112,7 @@ void FTextureManager::DeleteAll()
 
 void FTextureManager::FlushAll()
 {
+	++ResourceGeneration;
 	for (int i = TexMan.NumTextures() - 1; i >= 0; i--)
 	{
 		for (int j = 0; j < 2; j++)
@@ -398,6 +404,7 @@ bool FTextureManager::OkForLocalization(FTextureID texnum, const char *substitut
 
 FTextureID FTextureManager::AddGameTexture (FGameTexture *texture, bool addtohash)
 {
+	TicWorkerCheckNote(TWS_TextureAdd);
 	int bucket;
 	int hash;
 
@@ -502,6 +509,7 @@ void FTextureManager::ReplaceTexture (FTextureID texid, FGameTexture *newtexture
 		calcShouldUpscale(newtexture);	// calculate this once at insertion
 	}
 
+	++ResourceGeneration;
 	auto oldtexture = Textures[index].Texture;
 
 	newtexture->SetName(oldtexture->GetName().GetChars());

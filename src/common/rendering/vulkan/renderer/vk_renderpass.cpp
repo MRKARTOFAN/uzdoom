@@ -119,9 +119,11 @@ int VkRenderPassManager::GetVertexFormat(int numBindingPoints, int numAttributes
 	VkVertexFormat fmt;
 	fmt.NumBindingPoints = numBindingPoints;
 	fmt.Stride = stride;
+	fmt.BindingStrides.resize(numBindingPoints, stride);
 	fmt.UseVertexData = 0;
 	for (int j = 0; j < numAttributes; j++)
 	{
+		if (attrs[j].BindingStride) fmt.BindingStrides[attrs[j].binding] = attrs[j].BindingStride;
 		if (attrs[j].location == VATTR_COLOR)
 			fmt.UseVertexData |= 1;
 		else if (attrs[j].location == VATTR_NORMAL)
@@ -137,8 +139,23 @@ VkVertexFormat *VkRenderPassManager::GetVertexFormat(int index)
 	return &VertexFormats[index];
 }
 
-VulkanPipelineLayout* VkRenderPassManager::GetPipelineLayout(int numLayers)
+VulkanPipelineLayout* VkRenderPassManager::GetPipelineLayout(int numLayers, bool gpuWorld)
 {
+	if (gpuWorld)
+	{
+		if (!GpuWorldPipelineLayout)
+		{
+			auto descriptors = fb->GetDescriptorSetManager();
+			GpuWorldPipelineLayout = PipelineLayoutBuilder()
+				.AddSetLayout(descriptors->GetFixedSetLayout())
+				.AddSetLayout(descriptors->GetHWBufferSetLayout())
+				.AddSetLayout(descriptors->GetBindlessTextureSetLayout())
+				.AddSetLayout(descriptors->GetGpuWorldSetLayout())
+				.AddPushConstantRange(VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants))
+				.DebugName("GpuIndexedWorld.PipelineLayout").Create(fb->device.get());
+		}
+		return GpuWorldPipelineLayout.get();
+	}
 	if (PipelineLayouts.size() <= (size_t)numLayers)
 		PipelineLayouts.resize(numLayers + 1);
 
@@ -246,7 +263,19 @@ std::unique_ptr<VulkanPipeline> VkRenderPassSetup::CreatePipeline(const VkPipeli
 	builder.Cache(fb->GetRenderPassManager()->GetCache());
 
 	VkShaderProgram *program;
-	if (key.SpecialEffect != EFF_NONE)
+	if (key.GpuIndexedWorld)
+	{
+		program = fb->GetShaderManager()->GetGpuWorld(PassKey.DrawBuffers > 1 ? GBUFFER_PASS : NORMAL_PASS, key.AlphaTest, key.GpuIndexedWorld);
+	}
+	else if (key.RetainedWorld)
+	{
+		program = fb->GetShaderManager()->GetRetained(PassKey.DrawBuffers > 1 ? GBUFFER_PASS : NORMAL_PASS, key.RetainedWorld == 2);
+	}
+	else if (key.ModelInstances)
+	{
+		program = fb->GetShaderManager()->GetModelInstances(PassKey.DrawBuffers > 1 ? GBUFFER_PASS : NORMAL_PASS, key.AlphaTest);
+	}
+	else if (key.SpecialEffect != EFF_NONE)
 	{
 		program = fb->GetShaderManager()->GetEffect(key.SpecialEffect, PassKey.DrawBuffers > 1 ? GBUFFER_PASS : NORMAL_PASS);
 	}
@@ -260,7 +289,7 @@ std::unique_ptr<VulkanPipeline> VkRenderPassSetup::CreatePipeline(const VkPipeli
 	const VkVertexFormat &vfmt = *fb->GetRenderPassManager()->GetVertexFormat(key.VertexFormat);
 
 	for (int i = 0; i < vfmt.NumBindingPoints; i++)
-		builder.AddVertexBufferBinding(i, vfmt.Stride);
+		builder.AddVertexBufferBinding(i, vfmt.BindingStrides[i]);
 
 	const static VkFormat vkfmts[] = {
 		VK_FORMAT_R32G32B32A32_SFLOAT,
@@ -330,7 +359,7 @@ std::unique_ptr<VulkanPipeline> VkRenderPassSetup::CreatePipeline(const VkPipeli
 
 	builder.RasterizationSamples((VkSampleCountFlagBits)PassKey.Samples);
 
-	builder.Layout(fb->GetRenderPassManager()->GetPipelineLayout(key.NumTextureLayers));
+	builder.Layout(fb->GetRenderPassManager()->GetPipelineLayout(key.NumTextureLayers, key.GpuIndexedWorld != 0));
 	builder.RenderPass(GetRenderPass(0));
 	builder.DebugName("VkRenderPassSetup.Pipeline");
 
@@ -436,6 +465,7 @@ void VkPPRenderPassSetup::CreateRenderPass(const VkPPRenderPassKey& key)
 
 	builder.AddSubpass();
 	builder.AddSubpassColorAttachmentRef(0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+	// [Karto] Automatic attachment transitions must publish to colour clears and writes as well as reads.
 	if (key.StencilTest != WhichDepthStencil::None)
 	{
 		builder.AddSubpassDepthStencilAttachmentRef(1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
@@ -443,7 +473,7 @@ void VkPPRenderPassSetup::CreateRenderPass(const VkPPRenderPassKey& key)
 			VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 			VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-			VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+			VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
 	}
 	else
 	{
@@ -451,7 +481,7 @@ void VkPPRenderPassSetup::CreateRenderPass(const VkPPRenderPassKey& key)
 			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 			VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-			VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+			VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
 	}
 
 	builder.DebugName("VkPPRenderPassSetup.RenderPass");

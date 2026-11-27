@@ -24,7 +24,10 @@
 
 // HEADER FILES ------------------------------------------------------------
 
+#include "dynarrayindex.h"
 #include "dobject.h"
+#include <atomic>
+#include <mutex>
 
 #include "c_dispatch.h"
 #include "menu.h"
@@ -115,8 +118,34 @@ static size_t CalcStepSize();
 
 // PUBLIC DATA DEFINITIONS -------------------------------------------------
 
+bool ArenaRelease(void* block, size_t size);
+
+// [Karto] UI scripts may create objects on the main thread while the tic worker runs. The object list head (Root) and the
+// gray list (Barrier) are the only collector structures both can write, so both pushes lock while TicWorkerBusy is set.
+extern std::atomic<bool> TicWorkerBusy;
+CVAR(Bool, r_tic_worker_gclock, true, 0)
+static std::mutex GCLinkLock;
+
 namespace GC
 {
+void LinkNewObject(DObject* obj, DObject*& objNext)
+{
+	if (r_tic_worker_gclock && TicWorkerBusy.load(std::memory_order_acquire))
+	{
+		std::lock_guard<std::mutex> lock(GCLinkLock);
+		objNext = Root;
+		Root = obj;
+		return;
+	}
+	objNext = Root;
+	Root = obj;
+}
+
+bool LinkLocked()
+{
+	return r_tic_worker_gclock;
+}
+
 size_t AllocBytes;
 size_t RunningAllocBytes;
 size_t RunningDeallocBytes;
@@ -231,8 +260,10 @@ static size_t SweepObjects(size_t count)
 			{	// must erase 'curr'
 				*SweepPos = curr->ObjNext;
 				curr->ObjectFlags |= OF_Cleanup;
+				// [Karto] The class size must be read before the destructor runs.
+				const size_t size = curr->GetClass()->Size;
 				curr->~DObject();
-				M_Free(curr);
+				if (!ArenaRelease(curr, size)) M_Free(curr);
 				swept += GCDELETECOST;
 			}
 		}
@@ -294,6 +325,7 @@ void Mark(DObject **obj)
 		if (lobj->ObjectFlags & OF_EuthanizeMe)
 		{
 			*obj = (DObject *)NULL;
+			ArrayIndexNoteElement(obj);
 		}
 		else if (lobj->IsWhite())
 		{
@@ -580,6 +612,13 @@ void Barrier(DObject *pointing, DObject *pointed)
 	// The invariant only needs to be maintained in the propagate state.
 	if (State == GCS_Propagate)
 	{
+		std::unique_lock<std::mutex> lock(GCLinkLock, std::defer_lock);
+		if (r_tic_worker_gclock && TicWorkerBusy.load(std::memory_order_acquire))
+		{
+			lock.lock();
+			// [Karto] The other thread may have grayed it meanwhile; a second push would break the gray list.
+			if (!pointed->IsWhite()) return;
+		}
 		pointed->White2Gray();
 		pointed->GCNext = Gray;
 		Gray = pointed;

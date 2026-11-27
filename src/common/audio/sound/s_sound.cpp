@@ -23,9 +23,12 @@
 */
 
 #include <stdio.h>
+#include "d_ticworkercheck.h"
 #include <stdlib.h>
 
 #include "c_cvars.h"
+#include <atomic>
+#include "c_dispatch.h"
 #include "gamestate.h"
 #include "i_soundinternal.h"
 #include "m_haptics.h"
@@ -52,6 +55,23 @@ enum
 };
 static FCRandom pr_soundpitch ("SoundPitch");
 SoundEngine* soundEngine;
+static TMap<const void*, TArray<FSoundChan*>> SourceChannels;
+static TMap<int, TArray<FSoundChan*>> SoundChannels;
+static TMap<int, unsigned> SoundChannelsPruned;	// each list's size after its last prune
+CVAR(Bool, snd_limit_live, true, 0)
+struct FLimitLive
+{
+	uint64_t Gen = 0;
+	TArray<FSoundChan*> Chans;
+};
+static TMap<int, FLimitLive> LimitLive;
+static uint64_t LimitLiveGen = 1;
+static bool LimitLiveOn = false;
+static inline void LimitLiveChanged() { ++LimitLiveGen; }
+EXTERN_CVAR(Bool, snd_source_index)
+CVAR(Bool, snd_index_verify, false, 0)
+uint64_t SoundIndexChecks[4], SoundIndexMismatches[4];	// limit, channel used, lowest (oalsound.cpp), playing something
+template<class F> static void ForSourceChannels(TMap<const void*, TArray<FSoundChan*>>& index, const void* source, F&& apply);
 
 //==========================================================================
 //
@@ -95,6 +115,10 @@ void SoundEngine::Shutdown ()
 	FSoundChan *chan, *next;
 
 	StopAllChannels();
+	SourceChannels.Clear();
+	SoundChannels.Clear();
+	SoundChannelsPruned.Clear();
+	LimitLive.Clear();
 
 	for (chan = FreeChannels; chan != NULL; chan = next)
 	{
@@ -227,6 +251,7 @@ FSoundChan *SoundEngine::GetChannel(void *syschan)
 
 void SoundEngine::ReturnChannel(FSoundChan *chan)
 {
+	LimitLiveChanged();
 	UnlinkChannel(chan);
 	memset(chan, 0, sizeof(*chan));
 	LinkChannel(chan, &FreeChannels);
@@ -394,10 +419,48 @@ static float CalcPitch(int pitchmask, float defpitch, float defpitchmax)
 //
 //==========================================================================
 
+// [Karto] The channel lists are not safe to share with the tic worker: a main-thread start during a worker tic is queued and played after it.
+// Only starts without a source object are queued, so a source the worker could destroy is never held.
+CVAR(Bool, snd_worker_defer, true, 0)
+extern std::atomic<bool> TicWorkerBusy;
+bool TicWorkerOnThread();
+struct FDeferredStart
+{
+	int Type, Channel;
+	bool HasPoint, HasRolloff;
+	FVector3 Point;
+	FRolloffInfo Rolloff;
+	EChanFlags Flags;
+	FSoundID Sound;
+	float Volume, Attenuation, Pitch, StartTime;
+};
+static TArray<FDeferredStart> DeferredStarts;
+
+void SoundEngine::FlushDeferredStarts()
+{
+	if (DeferredStarts.Size() == 0) return;
+	TArray<FDeferredStart> starts = std::move(DeferredStarts);
+	DeferredStarts.Clear();
+	for (auto& d : starts)
+	{
+		StartSound(d.Type, nullptr, d.HasPoint ? &d.Point : nullptr, d.Channel, d.Flags, d.Sound, d.Volume, d.Attenuation,
+			d.HasRolloff ? &d.Rolloff : nullptr, d.Pitch, d.StartTime);
+	}
+}
+
 FSoundChan *SoundEngine::StartSound(int type, const void *source,
 	const FVector3 *pt, int channel, EChanFlags flags, FSoundID sound_id, float volume, float attenuation,
 	FRolloffInfo *forcedrolloff, float spitch, float startTime)
 {
+	if (snd_worker_defer && (type == SOURCE_None || type == SOURCE_Unattached) && TicWorkerBusy.load(std::memory_order_acquire) &&
+		!TicWorkerOnThread())
+	{
+		FDeferredStart d = { type, channel, pt != nullptr, forcedrolloff != nullptr, pt ? *pt : FVector3(0, 0, 0),
+			forcedrolloff ? *forcedrolloff : FRolloffInfo{}, flags, sound_id, volume, attenuation, spitch, startTime };
+		DeferredStarts.Push(d);
+		return nullptr;
+	}
+	TicWorkerCheckNote(TWS_SoundStart);
 	sfxinfo_t *sfx;
 	EChanFlags chanflags = flags;
 	int basepriority;
@@ -538,7 +601,22 @@ FSoundChan *SoundEngine::StartSound(int type, const void *source,
 	// If this actor is already playing something on the selected channel, stop it.
 	if (!(chanflags & CHANF_OVERLAP) && type != SOURCE_None && ((source == NULL && channel != CHAN_AUTO) || (source != NULL && IsChannelUsed(type, source, channel, &seen))))
 	{
-		for (chan = Channels; chan != NULL; chan = chan->NextChan)
+		// [Karto] Several matches are still stopped by the walk, since stop order decides which voices are freed first.
+		const bool indexed = snd_source_index && source != nullptr && type != SOURCE_Unattached;
+		FSoundChan* only = nullptr;
+		int matches = 0;
+		if (indexed)
+		{
+			ForSourceChannels(SourceChannels, source, [&](FSoundChan* c)
+			{
+				if (c->SourceType == type && c->EntChannel == channel) only = c, ++matches;
+			});
+		}
+		if (indexed && matches <= 1)
+		{
+			if (only != nullptr) StopChannel(only);
+		}
+		else for (chan = Channels; chan != NULL; chan = chan->NextChan)
 		{
 			if (chan->SourceType == type && chan->EntChannel == channel)
 			{
@@ -613,6 +691,7 @@ FSoundChan *SoundEngine::StartSound(int type, const void *source,
 	if (chan != NULL)
 	{
 		chan->SoundID = sound_id;
+		NoteChannelSound(chan);
 		chan->OrgID = org_id;
 		chan->EntChannel = channel;
 		chan->Volume = float(volume);
@@ -631,6 +710,7 @@ FSoundChan *SoundEngine::StartSound(int type, const void *source,
 		else if (type != SOURCE_None)
 		{
 			chan->Source = source;
+			NoteChannelSource(chan);
 		}
 	}
 
@@ -704,6 +784,7 @@ void SoundEngine::RestartChannel(FSoundChan *chan)
 	{
 		chan->ChanFlags = oldflags;
 	}
+	else LimitLiveChanged();
 }
 
 //==========================================================================
@@ -831,6 +912,98 @@ bool SoundEngine::CheckSoundLimit(sfxinfo_t *sfx, const FVector3 &pos, int near_
 	FSoundChan *chan;
 	int count;
 
+	auto walk = [&]() -> bool
+	{
+		int count = 0;
+		for (FSoundChan* chan = Channels; chan != NULL && count < near_limit; chan = chan->NextChan)
+		{
+			if (chan->ChanFlags & CHANF_FORGETTABLE) continue;
+			if (!(chan->ChanFlags & CHANF_EVICTED) && &S_sfx[chan->SoundID.index()] == sfx)
+			{
+				FVector3 chanorigin;
+				if (actor != NULL && chan->EntChannel == channel && chan->SourceType == sourcetype && chan->Source == actor) return false;
+				CalcPosVel(chan, &chanorigin, NULL);
+				float attn = min(chan->DistanceScale, attenuation);
+				if (attn <= 0 || (chanorigin - pos).LengthSquared() <= limit_range / attn) count++;
+			}
+		}
+		return count >= near_limit;
+	};
+	// 0: not counted, 1: counted, 2: the sound restarts on its own channel, so it always plays.
+	auto visit = [&](FSoundChan* chan) -> int
+	{
+		if (actor != NULL && chan->EntChannel == channel && chan->SourceType == sourcetype && chan->Source == actor) return 2;
+		FVector3 chanorigin;
+		CalcPosVel(chan, &chanorigin, NULL);
+		float attn = min(chan->DistanceScale, attenuation);
+		return attn <= 0 || (chanorigin - pos).LengthSquared() <= limit_range / attn;
+	};
+	auto indexed = [&]() -> bool
+	{
+		const int index = int(sfx - &S_sfx[0]);
+		if (LimitLiveOn && snd_limit_live)
+		{
+			FLimitLive& live = LimitLive[index];
+			if (live.Gen != LimitLiveGen)
+			{
+				live.Gen = LimitLiveGen;
+				live.Chans.Clear();
+				if (auto* list = SoundChannels.CheckKey(index))
+				{
+					for (int i = int(list->Size()) - 1; i >= 0; --i)
+					{
+						chan = (*list)[i];
+						if (chan->SoundID.index() != index) list->Delete(i);
+						else if (!(chan->ChanFlags & (CHANF_FORGETTABLE | CHANF_EVICTED))) live.Chans.Push(chan);
+					}
+					if (list->Size() == 0) SoundChannels.Remove(index);
+				}
+			}
+			count = 0;
+			for (unsigned i = 0; i < live.Chans.Size() && count < near_limit; ++i)
+			{
+				const int seen = visit(live.Chans[i]);
+				if (seen == 2) return false;
+				count += seen;
+			}
+			return count >= near_limit;
+		}
+		auto* list = SoundChannels.CheckKey(index);
+		count = 0;
+		if (list != nullptr)
+		{
+			for (int i = int(list->Size()) - 1; i >= 0 && count < near_limit; --i)
+			{
+				chan = (*list)[i];
+				if (chan->SoundID.index() != index)
+				{
+					list->Delete(i);
+					continue;
+				}
+				if (chan->ChanFlags & CHANF_FORGETTABLE) continue;
+				if (chan->ChanFlags & CHANF_EVICTED) continue;
+				const int seen = visit(chan);
+				if (seen == 2)
+				{ // We are restarting a playing sound. Always let it play.
+					return false;
+				}
+				count += seen;
+			}
+			if (list->Size() == 0) SoundChannels.Remove(index);
+		}
+		return count >= near_limit;
+	};
+	if (snd_source_index)
+	{
+		const bool limited = indexed();
+		if (snd_index_verify)
+		{
+			++SoundIndexChecks[0];
+			SoundIndexMismatches[0] += walk() != limited;
+		}
+		return limited;
+	}
+
 	for (chan = Channels, count = 0; chan != NULL && count < near_limit; chan = chan->NextChan)
 	{
 		if (chan->ChanFlags & CHANF_FORGETTABLE) continue;
@@ -910,6 +1083,16 @@ void SoundEngine::StopSound (int channel, FSoundID sound_id)
 
 void SoundEngine::StopSound(int sourcetype, const void* actor, int channel, FSoundID sound_id)
 {
+	if (snd_source_index && actor != nullptr)
+	{
+		ForSourceChannels(SourceChannels, actor, [&](FSoundChan* chan)
+		{
+			if (chan->SourceType == sourcetype &&
+				(sound_id == INVALID_SOUND ? (chan->EntChannel == channel || channel < 0) : (chan->OrgID == sound_id)))
+				StopChannel(chan);
+		});
+		return;
+	}
 	FSoundChan* chan = Channels;
 	while (chan != NULL)
 	{
@@ -937,6 +1120,15 @@ void SoundEngine::StopActorSounds(int sourcetype, const void* actor, int chanmin
 	const bool all = (chanmin == 0 && chanmax == 0);
 	if (chanmax < chanmin) std::swap(chanmin, chanmax);
 
+	if (snd_source_index && actor != nullptr)
+	{
+		ForSourceChannels(SourceChannels, actor, [&](FSoundChan* chan)
+		{
+			if (chan->SourceType == sourcetype && (all || (chan->EntChannel >= chanmin && chan->EntChannel <= chanmax)))
+				StopChannel(chan);
+		});
+		return;
+	}
 	FSoundChan* chan = Channels;
 	while (chan != nullptr)
 	{
@@ -984,29 +1176,41 @@ void SoundEngine::RelinkSound (int sourcetype, const void *from, const void *to,
 	if (from == NULL)
 		return;
 
+	const auto relink = [&](FSoundChan* chan)
+	{
+		if (to != NULL)
+		{
+			chan->Source = to;
+			NoteChannelSource(chan);
+		}
+		else if (!(chan->ChanFlags & CHANF_LOOP) && optpos)
+		{
+			chan->Source = NULL;
+			chan->SourceType = SOURCE_Unattached;
+			chan->Point[0] = optpos->X;
+			chan->Point[1] = optpos->Y;
+			chan->Point[2] = optpos->Z;
+		}
+		else
+		{
+			StopChannel(chan);
+		}
+	};
+	if (snd_source_index)
+	{
+		TArray<FSoundChan*> found;
+		ForSourceChannels(SourceChannels, from, [&](FSoundChan* chan)
+		{
+			if (chan->SourceType == sourcetype) found.Push(chan);
+		});
+		for (FSoundChan* chan : found) relink(chan);
+		return;
+	}
 	FSoundChan *chan = Channels;
 	while (chan != NULL)
 	{
 		FSoundChan *next = chan->NextChan;
-		if (chan->SourceType == sourcetype && chan->Source == from)
-		{
-			if (to != NULL)
-			{
-				chan->Source = to;
-			}
-			else if (!(chan->ChanFlags & CHANF_LOOP) && optpos)
-			{
-				chan->Source = NULL;
-				chan->SourceType = SOURCE_Unattached;
-				chan->Point[0] = optpos->X;
-				chan->Point[1] = optpos->Y;
-				chan->Point[2] = optpos->Z;
-			}
-			else
-			{
-				StopChannel(chan);
-			}
-		}
+		if (chan->SourceType == sourcetype && chan->Source == from) relink(chan);
 		chan = next;
 	}
 }
@@ -1017,6 +1221,75 @@ void SoundEngine::RelinkSound (int sourcetype, const void *from, const void *to,
 //
 //==========================================================================
 
+CVAR(Bool, snd_source_index, true, 0)
+
+void SoundEngine::NoteChannelSource(FSoundChan* chan)
+{
+	if (chan->Source == nullptr) return;
+	auto& list = SourceChannels[chan->Source];
+	if (list.Find(chan) == list.Size()) list.Push(chan);
+	if (SourceChannels.CountUsed() > 8192) PurgeSourceIndex();
+}
+
+// [Karto] A sound's list is in creation order, so reversed it is the channel list's own order.
+CCMD(snd_index_stats)
+{
+	Printf("SNDINDEXSTATS limit=%llu/%llu used=%llu/%llu lowest=%llu/%llu playing=%llu/%llu (mismatches/checks)\n",
+		(unsigned long long)SoundIndexMismatches[0], (unsigned long long)SoundIndexChecks[0],
+		(unsigned long long)SoundIndexMismatches[1], (unsigned long long)SoundIndexChecks[1],
+		(unsigned long long)SoundIndexMismatches[2], (unsigned long long)SoundIndexChecks[2],
+		(unsigned long long)SoundIndexMismatches[3], (unsigned long long)SoundIndexChecks[3]);
+}
+
+void SoundEngine::NoteChannelSound(FSoundChan* chan)
+{
+	if (!chan->SoundID.isvalid()) return;
+	LimitLiveChanged();
+	const int index = chan->SoundID.index();
+	auto& list = SoundChannels[index];
+	const unsigned* pruned = SoundChannelsPruned.CheckKey(index);
+	if (list.Size() >= 16 && list.Size() >= 2 * (pruned != nullptr ? *pruned : 8u))
+	{
+		unsigned kept = 0;
+		for (unsigned i = 0; i < list.Size(); ++i)
+		{
+			if (list[i]->SoundID.index() == index) list[kept++] = list[i];
+		}
+		list.Resize(kept);
+		SoundChannelsPruned[index] = std::max(kept, 8u);
+	}
+	const unsigned at = list.Find(chan);
+	if (at < list.Size()) list.Delete(at);
+	list.Push(chan);
+}
+
+void SoundEngine::PurgeSourceIndex()
+{
+	SourceChannels.Clear();
+	for (FSoundChan* chan = Channels; chan != nullptr; chan = chan->NextChan)
+	{
+		if (chan->Source != nullptr) SourceChannels[chan->Source].Push(chan);
+	}
+}
+
+template<class F> static void ForSourceChannels(TMap<const void*, TArray<FSoundChan*>>& index, const void* source, F&& apply)
+{
+	auto* list = index.CheckKey(source);
+	if (list == nullptr) return;
+	for (unsigned i = 0; i < list->Size();)
+	{
+		FSoundChan* chan = (*list)[i];
+		if (chan->Source != source)
+		{
+			list->Delete(i);
+			continue;
+		}
+		apply(chan);
+		++i;
+	}
+	if (list->Size() == 0) index.Remove(source);
+}
+
 void SoundEngine::ChangeSoundVolume(int sourcetype, const void *source, int channel, double dvolume)
 {
 	float volume = float(dvolume);
@@ -1025,6 +1298,19 @@ void SoundEngine::ChangeSoundVolume(int sourcetype, const void *source, int chan
 		volume = 0.0;
 	else if (volume > 1.0)
 		volume = 1.0;
+
+	if (snd_source_index && source != nullptr)
+	{
+		ForSourceChannels(SourceChannels, source, [&](FSoundChan* chan)
+		{
+			if (chan->SourceType == sourcetype && (chan->EntChannel == channel || channel == -1))
+			{
+				GSnd->ChannelVolume(chan, volume);
+				chan->Volume = volume;
+			}
+		});
+		return;
+	}
 
 	for (FSoundChan *chan = Channels; chan != NULL; chan = chan->NextChan)
 	{
@@ -1057,6 +1343,15 @@ void SoundEngine::SetVolume(FSoundChan* chan, float volume)
 
 void SoundEngine::ChangeSoundPitch(int sourcetype, const void *source, int channel, double pitch, FSoundID sound_id)
 {
+	if (snd_source_index && source != nullptr)
+	{
+		ForSourceChannels(SourceChannels, source, [&](FSoundChan* chan)
+		{
+			if (chan->SourceType == sourcetype && (sound_id == INVALID_SOUND ? (chan->EntChannel == channel) : (chan->OrgID == sound_id)))
+				SetPitch(chan, (float)pitch);
+		});
+		return;
+	}
 	for (FSoundChan *chan = Channels; chan != NULL; chan = chan->NextChan)
 	{
 		if (chan->SourceType == sourcetype &&
@@ -1129,6 +1424,28 @@ bool SoundEngine::IsChannelUsed(int sourcetype, const void *actor, int channel, 
 	{
 		return true;
 	}
+	// [Karto] seen may hold channels the walk would have stopped short of; its one caller (StartSound) does not read it afterwards.
+	if (snd_source_index && actor != nullptr)
+	{
+		bool used = false;
+		ForSourceChannels(SourceChannels, actor, [&](FSoundChan* chan)
+		{
+			if (chan->SourceType == sourcetype)
+			{
+				*seen |= 1 << chan->EntChannel;
+				used |= chan->EntChannel == channel;
+			}
+		});
+		if (snd_index_verify)
+		{
+			bool walked = false;
+			for (FSoundChan* chan = Channels; chan != NULL && !walked; chan = chan->NextChan)
+				walked = chan->SourceType == sourcetype && chan->Source == actor && chan->EntChannel == channel;
+			++SoundIndexChecks[1];
+			SoundIndexMismatches[1] += walked != used;
+		}
+		return used;
+	}
 	for (FSoundChan *chan = Channels; chan != NULL; chan = chan->NextChan)
 	{
 		if (chan->SourceType == sourcetype && chan->Source == actor)
@@ -1151,17 +1468,39 @@ bool SoundEngine::IsChannelUsed(int sourcetype, const void *actor, int channel, 
 
 bool SoundEngine::IsSourcePlayingSomething (int sourcetype, const void *actor, int channel, FSoundID sound_id)
 {
-	for (FSoundChan *chan = Channels; chan != NULL; chan = chan->NextChan)
+	const auto matches = [&](const FSoundChan* chan)
 	{
-		if (chan->SourceType == sourcetype && (sourcetype == SOURCE_None || sourcetype == SOURCE_Unattached || chan->Source == actor))
+		return (channel == 0 || chan->EntChannel == channel) && (sound_id == INVALID_SOUND || chan->OrgID == sound_id);
+	};
+	const auto walk = [&]()
+	{
+		for (FSoundChan *chan = Channels; chan != NULL; chan = chan->NextChan)
 		{
-			if ((channel == 0 || chan->EntChannel == channel) && (sound_id == INVALID_SOUND || chan->OrgID == sound_id))
+			if (chan->SourceType == sourcetype && (sourcetype == SOURCE_None || sourcetype == SOURCE_Unattached || chan->Source == actor))
 			{
-				return true;
+				if (matches(chan))
+				{
+					return true;
+				}
 			}
 		}
+		return false;
+	};
+	if (snd_source_index && actor != nullptr && sourcetype != SOURCE_None && sourcetype != SOURCE_Unattached)
+	{
+		bool found = false;
+		ForSourceChannels(SourceChannels, actor, [&](FSoundChan* chan)
+		{
+			found = found || (chan->SourceType == sourcetype && matches(chan));
+		});
+		if (snd_index_verify)
+		{
+			++SoundIndexChecks[3];
+			SoundIndexMismatches[3] += walk() != found;
+		}
+		return found;
 	}
-	return false;
+	return walk();
 }
 
 //==========================================================================
@@ -1225,6 +1564,7 @@ void SoundEngine::RestoreEvictedChannel(FSoundChan *chan)
 			else if (!(chan->ChanFlags & CHANF_JUSTSTARTED))
 			{ // Should this sound become evicted again, it's okay to forget about it.
 				chan->ChanFlags |= CHANF_FORGETTABLE;
+				LimitLiveChanged();
 			}
 		}
 	}
@@ -1243,10 +1583,19 @@ void SoundEngine::RestoreEvictedChannel(FSoundChan *chan)
 //
 //==========================================================================
 
+CVAR(Bool, snd_restore_lowcache, true, 0)
+void S_SetLowestChannelCache(bool on);
+
 void SoundEngine::RestoreEvictedChannels()
 {
+	S_SetLowestChannelCache(snd_restore_lowcache);
+	LimitLiveChanged();
+	LimitLiveOn = true;
 	// Restart channels in the same order they were originally played.
 	RestoreEvictedChannel(Channels);
+	LimitLiveOn = false;
+	LimitLive.Clear();
+	S_SetLowestChannelCache(false);
 }
 
 //==========================================================================
@@ -1334,6 +1683,7 @@ void SoundEngine::ChannelEnded(FISoundChannel *ichan)
 	FSoundChan *schan = static_cast<FSoundChan*>(ichan);
 	bool evicted;
 
+	LimitLiveChanged();
 	if (schan != NULL)
 	{
 		// If the sound was stopped with GSnd->StopSound(), then we know

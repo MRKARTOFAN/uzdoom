@@ -131,11 +131,14 @@ void R_InitSkyMap()
 //
 //==========================================================================
 
+int WorldModeFrameTimer(FLevelLocals* level);
+
 void R_UpdateSky(double ticFrac)
 {
 	for(auto Level : AllLevels())
 	{
-		double mstime = ((Level->LocalWorldTimer + ticFrac) * 1000.0) / TICRATE;
+		// [Karto] The clock of the tic frames draw, not the live one.
+		double mstime = ((WorldModeFrameTimer(Level) + ticFrac) * 1000.0) / TICRATE;
 		double ms     = mstime * FRACUNIT;
 
 		// Scroll the sky

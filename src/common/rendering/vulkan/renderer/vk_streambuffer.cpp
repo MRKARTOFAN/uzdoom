@@ -25,14 +25,22 @@
 #include "zvulkan/vulkanbuilders.h"
 #include "vulkan/system/vk_buffer.h"
 #include "vulkan/renderer/vk_streambuffer.h"
+#include "hw_clock.h"
 
 VkStreamBufferWriter::VkStreamBufferWriter(VulkanRenderDevice* fb)
 {
 	mBuffer = fb->GetBufferManager()->StreamBuffer.get();
 }
 
-bool VkStreamBufferWriter::Write(const StreamData& data)
+bool VkStreamBufferWriter::Write(const StreamData& data, bool reuse)
 {
+	if (SceneProfiling) ++SceneMainSurfaceProfile.UniformRequests;
+	// [Karto] Reuse only an immutable live slot; a reset invalidates it before the stream memory can be overwritten.
+	if (reuse && mLastDataValid && memcmp(&mLastData, &data, sizeof(data)) == 0)
+	{
+		if (SceneProfiling) ++SceneMainSurfaceProfile.UniformReuses;
+		return true;
+	}
 	mDataIndex++;
 	if (mDataIndex == MAX_STREAM_DATA)
 	{
@@ -43,11 +51,15 @@ bool VkStreamBufferWriter::Write(const StreamData& data)
 	}
 	uint8_t* ptr = (uint8_t*)mBuffer->UniformBuffer->Memory();
 	memcpy(ptr + mStreamDataOffset + sizeof(StreamData) * mDataIndex, &data, sizeof(StreamData));
+	if (reuse) mLastData = data;
+	mLastDataValid = reuse;
+	if (SceneProfiling) ++SceneMainSurfaceProfile.UniformUploads;
 	return true;
 }
 
 void VkStreamBufferWriter::Reset()
 {
+	mLastDataValid = false;
 	mDataIndex = MAX_STREAM_DATA - 1;
 	mStreamDataOffset = 0;
 	mBuffer->Reset();

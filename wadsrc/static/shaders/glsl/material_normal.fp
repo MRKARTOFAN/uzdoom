@@ -56,6 +56,7 @@ vec3 ProcessMaterialLight(Material material, vec3 color)
 	vec4 dynlight = uDynLightColor;
 	vec3 normal = material.Normal;
 
+#ifndef SPEC_NO_DYNLIGHT
 	if (uLightIndex >= 0)
 	{
 		ivec4 lightRange = ivec4(lights[uLightIndex]) + ivec4(uLightIndex + 1);
@@ -74,6 +75,7 @@ vec3 ProcessMaterialLight(Material material, vec3 color)
 			}
 		}
 	}
+#endif
 
 	vec3 frag;
 
@@ -91,6 +93,7 @@ vec3 ProcessMaterialLight(Material material, vec3 color)
 		frag = material.Base.rgb * clamp(color + desaturate(dynlight).rgb, 0.0, 1.4);
 	}
 
+#ifndef SPEC_NO_DYNLIGHT
 	if (uLightIndex >= 0)
 	{
 		ivec4 lightRange = ivec4(lights[uLightIndex]) + ivec4(uLightIndex + 1);
@@ -107,6 +110,7 @@ vec3 ProcessMaterialLight(Material material, vec3 color)
 			frag = clamp(frag + desaturate(addlight).rgb, 0.0, 1.0);
 		}
 	}
+#endif
 
 	return frag;
 }

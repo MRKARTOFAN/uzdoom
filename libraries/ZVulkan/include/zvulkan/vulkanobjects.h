@@ -408,6 +408,7 @@ public:
 	void resetEvent(VkEvent event, VkPipelineStageFlags stageMask);
 	void waitEvents(uint32_t eventCount, const VkEvent* pEvents, VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask, uint32_t memoryBarrierCount, const VkMemoryBarrier* pMemoryBarriers, uint32_t bufferMemoryBarrierCount, const VkBufferMemoryBarrier* pBufferMemoryBarriers, uint32_t imageMemoryBarrierCount, const VkImageMemoryBarrier* pImageMemoryBarriers);
 	void pipelineBarrier(VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask, VkDependencyFlags dependencyFlags, uint32_t memoryBarrierCount, const VkMemoryBarrier* pMemoryBarriers, uint32_t bufferMemoryBarrierCount, const VkBufferMemoryBarrier* pBufferMemoryBarriers, uint32_t imageMemoryBarrierCount, const VkImageMemoryBarrier* pImageMemoryBarriers);
+	static inline uint64_t BarrierCalls = 0, BarrierItems = 0;
 	void beginQuery(VulkanQueryPool *queryPool, uint32_t query, VkQueryControlFlags flags);
 	void beginQuery(VkQueryPool queryPool, uint32_t query, VkQueryControlFlags flags);
 	void endQuery(VulkanQueryPool *queryPool, uint32_t query);
@@ -787,6 +788,7 @@ inline void VulkanCommandBuffer::drawIndexedIndirect(VkBuffer buffer, VkDeviceSi
 	vkCmdDrawIndexedIndirect(this->buffer, buffer, offset, drawCount, stride);
 }
 
+
 inline void VulkanCommandBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 {
 	vkCmdDispatch(buffer, x, y, z);
@@ -878,6 +880,8 @@ inline void VulkanCommandBuffer::waitEvents(uint32_t eventCount, const VkEvent* 
 
 inline void VulkanCommandBuffer::pipelineBarrier(VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask, VkDependencyFlags dependencyFlags, uint32_t memoryBarrierCount, const VkMemoryBarrier* pMemoryBarriers, uint32_t bufferMemoryBarrierCount, const VkBufferMemoryBarrier* pBufferMemoryBarriers, uint32_t imageMemoryBarrierCount, const VkImageMemoryBarrier* pImageMemoryBarriers)
 {
+	++BarrierCalls;
+	BarrierItems += memoryBarrierCount + bufferMemoryBarrierCount + imageMemoryBarrierCount;
 	vkCmdPipelineBarrier(buffer, srcStageMask, dstStageMask, dependencyFlags, memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount, pBufferMemoryBarriers, imageMemoryBarrierCount, pImageMemoryBarriers);
 }
 

@@ -33,21 +33,41 @@
 #include "flatvertices.h"
 #include "hw_vertexbuilder.h"
 #include "hw_walldispatcher.h"
+#include <limits>
+#include <memory>
+#include <vector>
+#include <algorithm>
 
 #include "p_visualthinker.h"
+#include "hw_spriterecord.h"
+#include "c_dispatch.h"
+#include "d_framestages.h"
 
 #ifdef ARCH_IA32
 #include <immintrin.h>
 #endif // ARCH_IA32
 
 CVAR(Bool, gl_multithread, true, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
+CVAR(Bool, gl_jobqueue_fast, true, 0)
 
 EXTERN_CVAR(Float, r_actorspriteshadowdist)
 EXTERN_CVAR(Bool, r_radarclipper)
 EXTERN_CVAR(Bool, r_dithertransparency)
 EXTERN_CVAR(Color, gl_cullcolor)
+EXTERN_CVAR(Bool, vk_gpu_driven_bake)
+EXTERN_CVAR(Bool, vk_gpu_driven_wallbake)
+extern bool g_bakeSweepActive;
+extern uint64_t g_sweepMvCalls, g_sweepBaked, g_sweepSkipNoTex, g_sweepSkipSplit, g_sweepSkipCanCache, g_sweepSkipOther;
+
+CVAR(Bool, vk_gpu_driven_compat, false, 0)
+static std::vector<uint8_t> g_coveragePending;
 
 thread_local bool isWorkerThread;
+HWSceneSurfaceProfile &GetSceneSurfaceProfile()
+{
+	return isWorkerThread ? SceneWorkerSurfaceProfile : SceneMainSurfaceProfile;
+}
+
 ctpl::thread_pool renderPool(1);
 bool inited = false;
 
@@ -78,31 +98,110 @@ struct RenderJob
 	subsector_t *sub;
 	seg_t *seg;
 	bool isculled;
+	unsigned wallOrder;
 };
 
+static_assert(RenderJob::TerminateJob == 5);
 
 class RenderJobQueue
 {
-	RenderJob pool[300000];	// Way more than ever needed. The largest ever seen on a single viewpoint is around 40000.
+	static constexpr int InitialCapacity = 300000;
+	static constexpr int ChunkCapacity = 4096;
+	struct JobChunk
+	{
+		RenderJob Jobs[ChunkCapacity];
+		std::unique_ptr<JobChunk> Next;
+	};
+	RenderJob pool[InitialCapacity];
+	std::unique_ptr<JobChunk> Overflow;
+	JobChunk* ProducerChunk = nullptr;
+	JobChunk* ConsumerChunk = nullptr;
+	int ProducerOffset = 0;
+	int ConsumerOffset = 0;
 	std::atomic<int> readindex{};
 	std::atomic<int> writeindex{};
-public:
-	void AddJob(int type, subsector_t *sub, seg_t *seg = nullptr, bool isculled = false)
-	{
-		// This does not check for array overflows. The pool should be large enough that it never hits the limit.
+	alignas(64) bool Fast = false;
+	alignas(64) int ProducerIndex = 0;
+	alignas(64) std::atomic<int> Published{};
+	alignas(64) int ConsumerIndex = 0;
+	int Available = 0;
 
-		pool[writeindex] = { type, sub, seg, isculled };
-		writeindex++;	// update index only after the value has been written.
+	RenderJob* ProducerSlot(int index)
+	{
+		if (index < InitialCapacity) return &pool[index];
+		// [Karto] Stable chunks grow the append pool without moving payloads still referenced by the worker.
+		if (!ProducerChunk)
+		{
+			if (!Overflow) Overflow = std::make_unique<JobChunk>();
+			ProducerChunk = Overflow.get();
+		}
+		else if (ProducerOffset == ChunkCapacity)
+		{
+			if (!ProducerChunk->Next) ProducerChunk->Next = std::make_unique<JobChunk>();
+			ProducerChunk = ProducerChunk->Next.get();
+			ProducerOffset = 0;
+		}
+		return &ProducerChunk->Jobs[ProducerOffset++];
+	}
+
+	RenderJob* ConsumerSlot(int index)
+	{
+		if (index < InitialCapacity) return &pool[index];
+		// [Karto] The acquired published count covers chunk links as well as payloads; only the producer appends links.
+		if (!ConsumerChunk) ConsumerChunk = Overflow.get();
+		else if (ConsumerOffset == ChunkCapacity)
+		{
+			ConsumerChunk = ConsumerChunk->Next.get();
+			ConsumerOffset = 0;
+		}
+		return &ConsumerChunk->Jobs[ConsumerOffset++];
+	}
+
+public:
+	void AddJob(int type, subsector_t *sub, seg_t *seg = nullptr, bool isculled = false, unsigned wallOrder = 0)
+	{
+		if (SceneProfiling)
+		{
+			++SceneTraversalProfile.Jobs[type];
+		}
+		if (Fast)
+		{
+			const int index = ProducerIndex;
+			if (index == std::numeric_limits<int>::max()) I_FatalError("Render job index limit exceeded");
+			*ProducerSlot(index) = { type, sub, seg, isculled, wallOrder };
+			++ProducerIndex;
+			// [Karto] One producer owns each slot; release publishes its complete payload without a locked increment.
+			Published.store(index + 1, std::memory_order_release);
+			return;
+		}
+
+		const int index = writeindex.load(std::memory_order_relaxed);
+		if (index == std::numeric_limits<int>::max()) I_FatalError("Render job index limit exceeded");
+		*ProducerSlot(index) = { type, sub, seg, isculled, wallOrder };
+		writeindex.store(index + 1);
 	}
 
 	RenderJob *GetJob()
 	{
-		if (readindex < writeindex) return &pool[readindex++];
+		if (Fast)
+		{
+			// [Karto] Acquire only when the consumed prefix runs out; published slots stay immutable until the worker joins.
+			if (ConsumerIndex == Available) Available = Published.load(std::memory_order_acquire);
+			if (ConsumerIndex < Available) return ConsumerSlot(ConsumerIndex++);
+			return nullptr;
+		}
+		if (readindex < writeindex) return ConsumerSlot(readindex++);
 		return nullptr;
 	}
 
 	void ReleaseAll()
 	{
+		// [Karto] RenderBSP joins the previous consumer before reset, so mode changes cannot mix queue protocols.
+		Fast = gl_jobqueue_fast;
+		ProducerIndex = ConsumerIndex = Available = 0;
+		ProducerChunk = ConsumerChunk = nullptr;
+		ProducerOffset = ConsumerOffset = 0;
+		Published.store(0, std::memory_order_relaxed);
 		readindex = 0;
 		writeindex = 0;
 	}
@@ -112,6 +211,8 @@ static RenderJobQueue jobQueue;	// One static queue is sufficient here. This cod
 
 void HWDrawInfo::WorkerThread()
 {
+	const bool profile = SceneProfiling;
+	uint64_t emptyPolls = 0;
 	sector_t *front, *back;
 	HWWallDispatcher disp(this);
 
@@ -122,6 +223,7 @@ void HWDrawInfo::WorkerThread()
 		auto job = jobQueue.GetJob();
 		if (job == nullptr)
 		{
+			if (profile) ++emptyPolls;
 #ifdef ARCH_IA32
 			// The queue is empty. But yielding would be too costly here and possibly cause further delays down the line if the thread is halted.
 			// So instead add a few pause instructions and retry immediately.
@@ -136,17 +238,29 @@ void HWDrawInfo::WorkerThread()
 			_mm_pause();
 			_mm_pause();
 #endif // ARCH_IA32
+			continue;
+		}
+		if (profile)
+		{
+			++SceneWorkerProfile.Jobs[job->type];
 		}
 		// Note that the main thread MUST have prepared the fake sectors that get used below!
 		// This worker thread cannot prepare them itself without costly synchronization.
-		else switch (job->type)
+		switch (job->type)
 		{
 		case RenderJob::TerminateJob:
+			if (profile)
+			{
+				++SceneWorkerProfile.Runs;
+				SceneWorkerProfile.EmptyPolls += emptyPolls;
+			}
 			WTTotal.Unclock();
 			return;
 
 		case RenderJob::WallJob:
 		{
+			disp.SubmissionOrder = job->wallOrder;
+			disp.SubmissionPart = 0;
 			HWWall wall;
 			SetupWall.Clock();
 			wall.sub = job->sub;
@@ -211,6 +325,7 @@ void HWDrawInfo::WorkerThread()
 
 		case RenderJob::PortalJob:
 			AddSubsectorToPortal((FSectorPortalGroup *)job->seg, job->sub);
+			if (profile) ++SceneTraversalProfile.PortalRegistrations;
 			break;
 		}
 
@@ -226,6 +341,11 @@ EXTERN_CVAR(Bool, gl_render_segs)
 CVAR(Bool, gl_render_things, true, 0)
 CVAR(Bool, gl_render_walls, true, 0)
 CVAR(Bool, gl_render_flats, true, 0)
+CVAR(Bool, r_ceiling_noworld, false, 0)
+EXTERN_CVAR(Bool, r_worldmode)
+// [Karto] A world-mode traversal that keeps only gameplay-visible side effects (automap, drawn flags);
+// file-static because AddLine/DoSubsector run on the main thread only and must not queue any production.
+static bool WorldSideEffectsOnly = false;
 
 void HWDrawInfo::UnclipSubsector(subsector_t *sub)
 {
@@ -257,37 +377,33 @@ void HWDrawInfo::UnclipSubsector(subsector_t *sub)
 //==========================================================================
 
 EXTERN_CVAR(Int, r_distance_cull_type)
+EXTERN_CVAR(Int, gl_particles_style)
 EXTERN_CVAR(Float, r_line_distance_cull)
 
-bool HWDrawInfo::IsDistanceCulled(seg_t *line)
+bool hw_IsLineDistanceCulled(const line_t* line, const DVector2& VPos, double cullDistanceSquared)
 {
-	if (Viewpoint.culldistsq <= 0.0)
+	if (cullDistanceSquared <= 0.0)
 		return false;
 
-	DVector2 VPos = Viewpoint.Pos.XY();
-	if (Viewpoint.bDoOob && r_radarclipper && !(Level->flags3 & LEVEL3_NOFOGOFWAR))
-	{
-		VPos = Viewpoint.OffPos.XY();
-	}
-	DVector2 vec1 = (line->linedef->v1->fPos() - VPos);
-	DVector2 vec2 = (line->linedef->v2->fPos() - VPos);
+	DVector2 vec1 = (line->v1->fPos() - VPos);
+	DVector2 vec2 = (line->v2->fPos() - VPos);
 	double dist1 = vec1.LengthSquared();
 	double dist2 = vec2.LengthSquared();
-	if ((dist1 > Viewpoint.culldistsq) && (dist2 > Viewpoint.culldistsq))
+	if ((dist1 > cullDistanceSquared) && (dist2 > cullDistanceSquared))
 	{
-		if (vec1.dot(vec2) > 0.0) // Angle subtended by the line at the viewpoint less than 90-degrees
+		if (vec1.dot(vec2) > 0.0)
 		{
 			return true;
 		}
 		else
 		{
-			DVector2 linevec = line->linedef->Delta();
+			DVector2 linevec = line->Delta();
 			double linelensq = linevec.LengthSquared();
 			if (linelensq > 0.0)
 			{
 				double projlen = -vec1.dot(linevec) / linelensq;
-				DVector2 closest = line->linedef->v1->fPos() + linevec * projlen;
-				if ((VPos- closest).LengthSquared() > Viewpoint.culldistsq)
+				DVector2 closest = line->v1->fPos() + linevec * projlen;
+				if ((VPos- closest).LengthSquared() > cullDistanceSquared)
 				{
 					return true;
 				}
@@ -297,8 +413,18 @@ bool HWDrawInfo::IsDistanceCulled(seg_t *line)
 	return false;
 }
 
+bool HWDrawInfo::IsDistanceCulled(seg_t *line)
+{
+	if (Viewpoint.culldistsq <= 0.0) return false;
+	DVector2 VPos = Viewpoint.Pos.XY();
+	if (Viewpoint.bDoOob && r_radarclipper && !(Level->flags3 & LEVEL3_NOFOGOFWAR)) VPos = Viewpoint.OffPos.XY();
+	return hw_IsLineDistanceCulled(line->linedef, VPos, Viewpoint.culldistsq);
+}
+
 void HWDrawInfo::AddLine (seg_t *seg, bool portalclip)
 {
+	const bool profile = SceneProfiling;
+	if (profile) ++SceneTraversalProfile.Lines;
 	const bool doOob = Viewpoint.bDoOob;
 	bool isculled = false;
 
@@ -314,7 +440,11 @@ void HWDrawInfo::AddLine (seg_t *seg, bool portalclip)
 	if (portalclip)
 	{
 		int clipres = mClipPortal->ClipSeg(seg, Viewpoint.Pos);
-		if (clipres == PClip_InFront) return;
+		if (clipres == PClip_InFront)
+		{
+			if (profile) ++SceneTraversalProfile.PortalRejected;
+			return;
+		}
 	}
 
 	auto &clipper = *mClipper;
@@ -327,6 +457,7 @@ void HWDrawInfo::AddLine (seg_t *seg, bool portalclip)
 
 	if(doOob && r_radarclipper && !(Level->flags3 & LEVEL3_NOFOGOFWAR))
 	{
+		if (profile) ++SceneTraversalProfile.RadarLines;
 		startAngleR = clipperr.PointToPseudoAngle(seg->v2->fX(), seg->v2->fY());
 		endAngleR = clipperr.PointToPseudoAngle(seg->v1->fX(), seg->v1->fY());
 
@@ -335,7 +466,16 @@ void HWDrawInfo::AddLine (seg_t *seg, bool portalclip)
 			if (!seg->backsector) clipperr.SafeAddClipRange(startAngleR - paddingR, endAngleR + paddingR);
 			else if((seg->sidedef != nullptr) && !uint8_t(seg->sidedef->Flags & WALLF_POLYOBJ) && (currentsector->sectornum != seg->backsector->sectornum))
 			{
-				if (in_area == area_default) in_area = hw_CheckViewArea(seg->v1, seg->v2, seg->frontsector, seg->backsector);
+				if (in_area == area_default)
+				{
+					if (profile) ++SceneTraversalProfile.ViewAreaChecks;
+					in_area = hw_CheckViewArea(seg->v1, seg->v2, seg->frontsector, seg->backsector);
+				}
+				if (profile)
+				{
+					++SceneTraversalProfile.FakeBackCalls;
+					++SceneTraversalProfile.ClipChecks;
+				}
 				backsector = hw_FakeFlat(seg->backsector, in_area, true);
 				if (hw_CheckClip(seg->sidedef, currentsector, backsector)) clipperr.SafeAddClipRange(startAngleR - paddingR, endAngleR + paddingR);
 				backsector = nullptr;
@@ -346,20 +486,24 @@ void HWDrawInfo::AddLine (seg_t *seg, bool portalclip)
 	// Back side, i.e. backface culling	- read: endAngle >= startAngle!
 	if (startAngle-endAngle<ANGLE_180)
 	{
+		if (profile) ++SceneTraversalProfile.BackfaceRejected;
 		return;
 	}
 
 	if (seg->sidedef == nullptr)
 	{
+		if (profile) ++SceneTraversalProfile.Minisegs;
 		if (!(currentsubsector->flags & SSECMF_DRAWN))
 		{
 			if (clipper.SafeCheckRange(startAngle, endAngle) && !doOob)
 			{
-			  currentsubsector->flags |= SSECMF_DRAWN;
+				currentsubsector->flags |= SSECMF_DRAWN;
+				if (profile) ++SceneTraversalProfile.SubsectorDrawnWrites;
 			}
 			if (doOob && ((r_radarclipper && !(Level->flags3 & LEVEL3_NOFOGOFWAR)) || (r_distance_cull_type > 0)) && clipperr.SafeCheckRange(startAngleR, endAngleR))
 			{
-			  currentsubsector->flags |= SSECMF_DRAWN;
+				currentsubsector->flags |= SSECMF_DRAWN;
+				if (profile) ++SceneTraversalProfile.SubsectorDrawnWrites;
 			}
 		}
 		return;
@@ -367,16 +511,22 @@ void HWDrawInfo::AddLine (seg_t *seg, bool portalclip)
 
 	if (!clipper.SafeCheckRange(startAngle, endAngle))
 	{
+		if (profile) ++SceneTraversalProfile.RangeRejected;
 		return;
 	}
 
 	if (!doOob || (!r_radarclipper || (Level->flags3 & LEVEL3_NOFOGOFWAR) || clipperr.SafeCheckRange(startAngleR, endAngleR)))
+	{
 		currentsubsector->flags |= SSECMF_DRAWN;
+		if (profile) ++SceneTraversalProfile.SubsectorDrawnWrites;
+	}
 
 	uint8_t ispoly = uint8_t(seg->sidedef->Flags & WALLF_POLYOBJ);
 
+	if (profile && r_distance_cull_type > 0) ++SceneTraversalProfile.DistanceChecks;
 	if (r_distance_cull_type > 0 && IsDistanceCulled(seg))
 	{
+		if (profile) ++SceneTraversalProfile.DistanceCulled;
 		isculled = true;
 		if(doOob)
 		{
@@ -409,8 +559,9 @@ void HWDrawInfo::AddLine (seg_t *seg, bool portalclip)
 				auto tex = TexMan.GetGameTexture(seg->sidedef->GetTexture(side_t::mid), true);
 				if (!tex || !tex->isValid()) 
 				{
+					if (profile) ++SceneTraversalProfile.EmptyTextureRejected;
 					// nothing to do here!
-					seg->linedef->validcount=validcount;
+					seg->linedef->validcount=rendervalidcount;
 					return;
 				}
 			}
@@ -419,7 +570,16 @@ void HWDrawInfo::AddLine (seg_t *seg, bool portalclip)
 		else
 		{
 			// clipping checks are only needed when the backsector is not the same as the front sector
-			if (in_area == area_default) in_area = hw_CheckViewArea(seg->v1, seg->v2, seg->frontsector, seg->backsector);
+			if (in_area == area_default)
+			{
+				if (profile) ++SceneTraversalProfile.ViewAreaChecks;
+				in_area = hw_CheckViewArea(seg->v1, seg->v2, seg->frontsector, seg->backsector);
+			}
+			if (profile)
+			{
+				++SceneTraversalProfile.FakeBackCalls;
+				++SceneTraversalProfile.ClipChecks;
+			}
 
 			backsector = hw_FakeFlat(seg->backsector, in_area, true);
 
@@ -437,21 +597,39 @@ void HWDrawInfo::AddLine (seg_t *seg, bool portalclip)
 	}
 
 	seg->linedef->flags |= ML_MAPPED;
-
-	if (ispoly || seg->linedef->validcount!=validcount)
+	if (profile) ++SceneTraversalProfile.MLMappedWrites;
+	if (vk_gpu_driven_compat)
 	{
-		if (!ispoly) seg->linedef->validcount=validcount;
+		const unsigned revealIndex = seg->linedef->Index();
+		if (g_coveragePending.size() > (revealIndex >> 3)) g_coveragePending[revealIndex >> 3] |= uint8_t(1u << (revealIndex & 7));
+	}
 
-		if (gl_render_walls)
+	if (ispoly || seg->linedef->validcount!=rendervalidcount)
+	{
+		if (!ispoly) seg->linedef->validcount=rendervalidcount;
+
+		if (gl_render_walls && !WorldSideEffectsOnly)
 		{
+			if (profile)
+			{
+				++SceneTraversalProfile.WallWork;
+				if (ispoly) ++SceneTraversalProfile.PolyWallWork;
+			}
+			unsigned order = 0;
+			if (OwnOpaqueWalls)
+			{
+				if (OwnedNextOrder == std::numeric_limits<unsigned>::max()) I_FatalError("Wall submission order limit exceeded");
+				order = OwnedNextOrder++;
+			}
 			if (multithread)
 			{
-				jobQueue.AddJob(RenderJob::WallJob, seg->Subsector, seg, isculled);
+				jobQueue.AddJob(RenderJob::WallJob, seg->Subsector, seg, isculled, order);
 			}
 			else
 			{
 				HWWall wall;
 				HWWallDispatcher disp(this);
+				disp.SubmissionOrder = order;
 				SetupWall.Clock();
 				wall.sub = seg->Subsector;
 				wall.Process(&disp, seg, currentsector, backsector, isculled);
@@ -459,7 +637,9 @@ void HWDrawInfo::AddLine (seg_t *seg, bool portalclip)
 				SetupWall.Unclock();
 			}
 		}
+		else if (profile) ++SceneTraversalProfile.DisabledWalls;
 	}
+	else if (profile) ++SceneTraversalProfile.DuplicateLines;
 }
 
 //==========================================================================
@@ -623,18 +803,20 @@ void HWDrawInfo::AddSpecialPortalLines(subsector_t * sub, sector_t * sector, lin
 //
 //==========================================================================
 
+CVAR(Bool, r_worldmode_thingsplit, true, 0)
+static std::vector<int> ThingStamps;
+
 void HWDrawInfo::RenderThings(subsector_t * sub, sector_t * sector)
 {
 	sector_t * sec=sub->sector;
 	// Handle all things in sector.
 	const auto &vp = Viewpoint;
-	for (auto p = sec->touching_renderthings; p != nullptr; p = p->m_snext)
+	auto listedThing = [&](AActor* thing)
 	{
-		auto thing = p->m_thing;
-		if (thing->validcount == validcount) continue;
-		thing->validcount = validcount;
+		if (thing->validcount == rendervalidcount) return;
+		thing->validcount = rendervalidcount;
 
-		if(Viewpoint.bDoOob && thing->Sector->isSecret() && thing->Sector->wasSecret() && !r_radarclipper) continue; // This covers things that are touching non-secret sectors
+		if(Viewpoint.bDoOob && thing->Sector->isSecret() && thing->Sector->wasSecret() && !r_radarclipper) return; // This covers things that are touching non-secret sectors
 		FIntCVar *cvar = thing->GetInfo()->distancecheck;
 		if (cvar != nullptr && *cvar >= 0)
 		{
@@ -642,7 +824,7 @@ void HWDrawInfo::RenderThings(subsector_t * sub, sector_t * sector)
 			double check = (double)**cvar;
 			if (dist >= check * check)
 			{
-				continue;
+				return;
 			}
 		}
 		if (r_distance_cull_type > 0)
@@ -652,7 +834,7 @@ void HWDrawInfo::RenderThings(subsector_t * sub, sector_t * sector)
 				(thing->Pos() - (vp.bDoOob ? vp.OffPos : vp.Pos)).Length() - 1.414 * thing->RenderRadius();
 			if (dist2 >= (renderradcheck ? vp.culldistsq : vp.culldist))
 			{
-				continue;
+				return;
 			}
 		}
 		// If this thing is in a map section that's not in view it can't possibly be visible
@@ -673,11 +855,50 @@ void HWDrawInfo::RenderThings(subsector_t * sub, sector_t * sector)
 
 			sprite.Process(this, thing, sector, in_area, false);
 		}
-	}
-
-	for (msecnode_t *node = sec->sectorportal_thinglist; node; node = node->m_snext)
+	};
+	auto recordThing = [&](FSpriteRecord& r)
 	{
-		AActor *thing = node->m_thing;
+		if (r.validcount == rendervalidcount) return;
+		r.validcount = rendervalidcount;
+		if (Viewpoint.bDoOob && r.Sector->isSecret() && r.Sector->wasSecret() && !r_radarclipper) return;
+		FIntCVar *cvar = r.Class->ActorInfo()->distancecheck;
+		if (cvar != nullptr && *cvar >= 0)
+		{
+			double dist = (r.Pos - (vp.bDoOob ? vp.OffPos : vp.Pos)).LengthSquared();
+			double check = (double)**cvar;
+			if (dist >= check * check)
+			{
+				return;
+			}
+		}
+		if (r_distance_cull_type > 0)
+		{
+			bool renderradcheck = r.RenderRadius < 0.25 * vp.culldist;
+			double dist2 = renderradcheck ? (r.Pos - (vp.bDoOob ? vp.OffPos : vp.Pos)).LengthSquared() :
+				(r.Pos - (vp.bDoOob ? vp.OffPos : vp.Pos)).Length() - 1.414 * r.RenderRadius;
+			if (dist2 >= (renderradcheck ? vp.culldistsq : vp.culldist))
+			{
+				return;
+			}
+		}
+		if (CurrentMapSections[r.MapSection])
+		{
+			// [Karto] Draw only the instances this traversal reaches: drawing every published one rasterized hidden rooms.
+			if (GpuSprites && r.Instance >= 0)
+			{
+				const int blend = WorldModeGpuSpriteBlend(r.Instance);
+				if (blend >= 0)
+				{
+					GpuSpriteVisible[blend].push_back(r.Instance);
+					return;
+				}
+			}
+			HWSprite sprite;
+			sprite.ProcessRecord(this, r, sector, in_area, false);
+		}
+	};
+	auto portalThing = [&](AActor* thing)
+	{
 		FIntCVar *cvar = thing->GetInfo()->distancecheck;
 		if (cvar != nullptr && *cvar >= 0)
 		{
@@ -685,7 +906,7 @@ void HWDrawInfo::RenderThings(subsector_t * sub, sector_t * sector)
 			double check = (double)**cvar;
 			if (dist >= check * check)
 			{
-				continue;
+				return;
 			}
 		}
 
@@ -703,15 +924,68 @@ void HWDrawInfo::RenderThings(subsector_t * sub, sector_t * sector)
 		}
 
 		sprite.Process(this, thing, sector, in_area, true);
+	};
+
+	const FSnapshotThing* listed = nullptr;
+	AActor* const* portal = nullptr;
+	uint32_t listedCount = 0, portalCount = 0;
+	if (UseActorSnapshot && WorldModeSnapshotThings(Level, sec, listed, listedCount, portal, portalCount))
+	{
+		// [Karto] Written once per publish; view-dependent tests (out-of-bounds secrets, distance cull) send the frame
+		// down the full path.
+		const FThingSplitEntry* split;
+		uint32_t gpuCount, splitCount;
+		if (r_worldmode_thingsplit && GpuSprites && !Viewpoint.bDoOob && r_distance_cull_type <= 0 &&
+			WorldModeThingSplit(Level, sec, split, gpuCount, splitCount))
+		{
+			const uint32_t instances = WorldModeGpuInstanceCount();
+			if (ThingStamps.size() != instances) ThingStamps.assign(instances, INT_MIN);
+			for (uint32_t i = 0; i < gpuCount; ++i)
+			{
+				const FThingSplitEntry& e = split[i];
+				if (ThingStamps[e.Instance] == rendervalidcount) continue;
+				ThingStamps[e.Instance] = rendervalidcount;
+				if (!CurrentMapSections[e.MapSection]) continue;
+				if (WorldModeGpuFrameFailed(e.GpuFrame))
+				{
+					recordThing(*listed[e.Listed].Record);
+					continue;
+				}
+				GpuSpriteVisible[e.Blend].push_back(int32_t(e.Instance));
+			}
+			for (uint32_t i = gpuCount; i < splitCount; ++i)
+			{
+				const FSnapshotThing& t = listed[split[i].Listed];
+				if (t.Record != nullptr) recordThing(*t.Record);
+				else listedThing(t.Copy);
+			}
+			for (uint32_t i = 0; i < portalCount; ++i) portalThing(portal[i]);
+			return;
+		}
+		for (uint32_t i = 0; i < listedCount; ++i)
+		{
+			if (listed[i].Record != nullptr) recordThing(*listed[i].Record);
+			else listedThing(listed[i].Copy);
+		}
+		for (uint32_t i = 0; i < portalCount; ++i) portalThing(portal[i]);
+		return;
 	}
+	for (auto p = sec->touching_renderthings; p != nullptr; p = p->m_snext) listedThing(p->m_thing);
+	for (msecnode_t *node = sec->sectorportal_thinglist; node; node = node->m_snext) portalThing(node->m_thing);
 }
 
 void HWDrawInfo::RenderParticles(subsector_t *sub, sector_t *front)
 {
+	FFrameStageScope stage(FS_ParticleCollect);
 	SetupSprite.Clock();
-	for (uint32_t i = 0; i < sub->sprites.Size(); i++)
+	particle_t* particles;
+	int first;
+	DVisualThinker* const* visuals;
+	unsigned visualCount;
+	WorldModeSubsectorParticles(Level, sub, particles, first, visuals, visualCount);
+	for (uint32_t i = 0; i < visualCount; i++)
 	{
-		DVisualThinker *sp = sub->sprites[i];
+		DVisualThinker *sp = visuals[i];
 		if (!sp || sp->ObjectFlags & OF_EuthanizeMe)
 			continue;
 		if (r_distance_cull_type > 0)
@@ -731,11 +1005,17 @@ void HWDrawInfo::RenderParticles(subsector_t *sub, sector_t *front)
 		HWSprite sprite;
 		sprite.ProcessParticle(this, &sp->PT, front, sp);
 	}
-	for (int i = Level->ParticlesInSubsec[sub->Index()]; i != NO_PARTICLE; i = Level->Particles[i].snext)
+	if (GpuParticles)
+	{
+		RenderGpuParticles(particles, first, front, sub);
+		SetupSprite.Unclock();
+		return;
+	}
+	for (int i = first; i != NO_PARTICLE; i = particles[i].snext)
 	{
 		if (r_distance_cull_type > 0)
 		{
-			double dist2 = (Level->Particles[i].Pos - (Viewpoint.bDoOob ? Viewpoint.OffPos : Viewpoint.Pos)).LengthSquared();
+			double dist2 = (particles[i].Pos - (Viewpoint.bDoOob ? Viewpoint.OffPos : Viewpoint.Pos)).LengthSquared();
 			if (dist2 >= Viewpoint.culldistsq)
 			{
 				continue;
@@ -743,14 +1023,165 @@ void HWDrawInfo::RenderParticles(subsector_t *sub, sector_t *front)
 		}
 		if (mClipPortal)
 		{
-			int clipres = mClipPortal->ClipPoint(Level->Particles[i].Pos.XY());
+			int clipres = mClipPortal->ClipPoint(particles[i].Pos.XY());
 			if (clipres == PClip_InFront) continue;
 		}
 
 		HWSprite sprite;
-		sprite.ProcessParticle(this, &Level->Particles[i], front, nullptr);
+		sprite.ProcessParticle(this, &particles[i], front, nullptr);
 	}
 	SetupSprite.Unclock();
+}
+
+// [Karto] GPU particles: a class's first particle carries the draw key and the rest are indices the GPU expands; chain
+// order within a key is kept. Only the main view uses it: light slices, the distance cull and portal clipping are view
+// dependent.
+namespace
+{
+	enum : uint32_t { PP_Group = 1u << 24, PP_Single = 2u << 24, PP_CountMask = (1u << 24) - 1 };
+	std::vector<uint32_t> ParticleProgram;		// per subsector: ops (op | count, then count particle indices)
+	std::vector<uint32_t> ParticleProgramAt;	// per subsector: start in ParticleProgram + 1, 0 = not written
+	std::vector<uint32_t> ParticleProgramEnd;
+	uint64_t ParticleProgramSerial = 0;
+	uint64_t ParticleProgramVersion = 0;	// changes with every clear or write, for the GPU copy
+	int ParticleProgramStyle = -1;
+	FLevelLocals* ParticleProgramLevel = nullptr;
+}
+
+CVAR(Bool, r_particle_program, true, 0)
+CVAR(Bool, r_particle_programranges, true, 0)
+
+void GpuParticleProgramStore(FGpuParticleIndices& out)
+{
+	out.Program = ParticleProgram.data();
+	out.ProgramCount = uint32_t(ParticleProgram.size());
+	out.ProgramVersion = ParticleProgramVersion;
+}
+
+// [Karto] Appends the subsector's program to out. Every particle field ProcessParticle's key reads must be part of the class.
+static void WriteParticleProgram(const particle_t* particles, int first, bool sliced, const FRenderViewpoint& vp,
+	HWPortal* clipPortal, std::vector<uint32_t>& out)
+{
+	struct FSlot { uint64_t Class; };
+	static constexpr unsigned MaxSlots = 8;
+	FSlot slots[MaxSlots];
+	static std::vector<uint32_t> lists[MaxSlots];
+	unsigned used = 0;
+	auto flush = [&]()
+	{
+		for (unsigned k = 0; k < used; ++k)
+		{
+			out.push_back(PP_Group | uint32_t(lists[k].size()));
+			out.insert(out.end(), lists[k].begin(), lists[k].end());
+			lists[k].clear();
+		}
+		used = 0;
+	};
+	const DVector3& viewPos = vp.bDoOob ? vp.OffPos : vp.Pos;
+	for (int i = first; i != NO_PARTICLE; i = particles[i].snext)
+	{
+		const particle_t& p = particles[i];
+		if (p.alpha <= 0) continue;
+		if (r_distance_cull_type > 0 && (p.Pos - viewPos).LengthSquared() >= vp.culldistsq) continue;
+		if (clipPortal && clipPortal->ClipPoint(p.Pos.XY()) == PClip_InFront) continue;
+		if (sliced || ((p.flags & SPF_LOCAL_ANIM) && p.animData.ok))
+		{
+			// [Karto] Own key (animation frame, light slice): nothing after it may join a group opened before it, or the order within a key changes.
+			flush();
+			out.push_back(PP_Single | 1u);
+			out.push_back(uint32_t(i));
+			continue;
+		}
+		const bool textured = p.texture.isValid();
+		const int style = textured ? 2 : gl_particles_style;
+		const bool solid = style != 2 && p.alpha >= 1.0f - FLT_EPSILON;
+		const uint64_t cls = uint64_t(uint32_t(p.texture.GetIndex())) | (uint64_t(uint8_t(p.style)) << 32) |
+			(uint64_t((p.flags & SPF_FULLBRIGHT) ? 1 : 0) << 40) | (uint64_t((p.flags & SPF_ALLOWSHADERS) ? 1 : 0) << 41) |
+			(uint64_t(solid) << 42);
+		unsigned k = 0;
+		while (k < used && slots[k].Class != cls) ++k;
+		if (k == used)
+		{
+			if (used == MaxSlots) { flush(); k = 0; }
+			slots[k].Class = cls;
+			++used;
+		}
+		lists[k].push_back(uint32_t(i));
+	}
+	flush();
+}
+
+void HWDrawInfo::RenderGpuParticles(particle_t* particles, int first, sector_t* front, subsector_t* sub)
+{
+	const bool sliced = front->e->XFloor.lightlist.Size() != 0;
+	const bool cacheable = r_particle_program && !sliced && r_distance_cull_type <= 0 && mClipPortal == nullptr;
+	static std::vector<uint32_t> live;
+	const uint32_t* op;
+	const uint32_t* end;
+	if (cacheable)
+	{
+		if (ParticleProgramSerial != GpuParticleSerial || ParticleProgramStyle != gl_particles_style || ParticleProgramLevel != Level)
+		{
+			ParticleProgramSerial = GpuParticleSerial;
+			ParticleProgramStyle = gl_particles_style;
+			ParticleProgramLevel = Level;
+			ParticleProgram.clear();
+			++ParticleProgramVersion;
+			ParticleProgramAt.assign(Level->subsectors.Size(), 0);
+			ParticleProgramEnd.assign(Level->subsectors.Size(), 0);
+		}
+		const unsigned ss = sub->Index();
+		if (ParticleProgramAt[ss] == 0)
+		{
+			ParticleProgramAt[ss] = uint32_t(ParticleProgram.size()) + 1;
+			WriteParticleProgram(particles, first, false, Viewpoint, nullptr, ParticleProgram);
+			ParticleProgramEnd[ss] = uint32_t(ParticleProgram.size());
+			++ParticleProgramVersion;
+		}
+		op = ParticleProgram.data() + ParticleProgramAt[ss] - 1;
+		end = ParticleProgram.data() + ParticleProgramEnd[ss];
+	}
+	else
+	{
+		live.clear();
+		WriteParticleProgram(particles, first, sliced, Viewpoint, mClipPortal, live);
+		op = live.data();
+		end = live.data() + live.size();
+	}
+	while (op < end)
+	{
+		const uint32_t count = *op & PP_CountMask;
+		const bool group = (*op & ~PP_CountMask) == PP_Group;
+		const uint32_t* idx = op + 1;
+		op = idx + count;
+		if (!group)
+		{
+			HWSprite sprite;
+			sprite.ProcessParticle(this, &particles[idx[0]], front, nullptr);
+			continue;
+		}
+		const unsigned before = drawlists[GLDL_PARTICLES].Size() + drawlists[GLDL_SOLIDPARTICLES].Size() + drawlists[GLDL_ADDPARTICLES].Size();
+		HWSprite sprite;
+		sprite.GpuParticleRange = int32_t(GpuParticleRanges.size());
+		sprite.ProcessParticle(this, &particles[idx[0]], front, nullptr);
+		if (drawlists[GLDL_PARTICLES].Size() + drawlists[GLDL_SOLIDPARTICLES].Size() + drawlists[GLDL_ADDPARTICLES].Size() == before + 1)
+		{
+			if (cacheable && r_particle_programranges)
+			{
+				GpuParticleRanges.push_back({ GpuParticleProgramRange | uint32_t(idx - ParticleProgram.data()), count });
+				continue;
+			}
+			GpuParticleRanges.push_back({ uint32_t(GpuParticleIndices.size()), count });
+			for (uint32_t n = 0; n < count; ++n) GpuParticleIndices.push_back(uint16_t(idx[n]));
+			continue;
+		}
+		// [Karto] A leader the bucket passes do not draw (desaturated or dynamically lit) went to another list; its class follows it there.
+		for (uint32_t n = 1; n < count; ++n)
+		{
+			HWSprite follower;
+			follower.ProcessParticle(this, &particles[idx[n]], front, nullptr);
+		}
+	}
 }
 
 
@@ -765,6 +1196,12 @@ void HWDrawInfo::RenderParticles(subsector_t *sub, sector_t *front)
 
 void HWDrawInfo::DoSubsector(subsector_t * sub)
 {
+	const bool profile = SceneProfiling;
+	if (profile) ++SceneTraversalProfile.Subsectors;
+	auto reject = [&]()
+	{
+		if (profile) ++SceneTraversalProfile.SubsectorRejected;
+	};
 	const bool doOob = Viewpoint.bDoOob;
 	sector_t * sector;
 	sector_t * fakesector;
@@ -777,11 +1214,18 @@ void HWDrawInfo::DoSubsector(subsector_t * sub)
 #endif
 
 	sector=sub->sector;
-	if (!sector) return;
+	if (!sector)
+	{
+		reject();
+		return;
+	}
 
 	// If the mapsections differ this subsector can't possibly be visible from the current view point
-	if (!CurrentMapSections[sub->mapsection]) return;
-	if (sub->flags & SSECF_POLYORG) return;	// never render polyobject origin subsectors because their vertices no longer are where one may expect.
+	if (!CurrentMapSections[sub->mapsection] || (sub->flags & SSECF_POLYORG))
+	{
+		reject();
+		return;
+	}
 
 	if (ss_renderflags[sub->Index()] & SSRF_SEEN)
 	{
@@ -790,16 +1234,24 @@ void HWDrawInfo::DoSubsector(subsector_t * sub)
 		// range this subsector spans before going on.
 		UnclipSubsector(sub);
 	}
-	if (mClipper->IsBlocked()) return;	// if we are inside a stacked sector portal which hasn't unclipped anything yet.
+	if (mClipper->IsBlocked())
+	{
+		reject();
+		return;
+	}
 
 	fakesector=hw_FakeFlat(sector, in_area, false);
 
-	if(doOob && sector->isSecret() && sector->wasSecret() && !r_radarclipper) return;
+	if (doOob && sector->isSecret() && sector->wasSecret() && !r_radarclipper)
+	{
+		reject();
+		return;
+	}
 
 	// cull everything if subsector outside all relevant clippers
 	if (doOob && (sub->polys == nullptr))
 	{
-		auto &clipper = *mClipper;
+	auto &clipper = *mClipper;
 		auto &clipperv = *vClipper;
 		auto &clipperr = *rClipper;
 		int count = sub->numlines;
@@ -862,7 +1314,11 @@ void HWDrawInfo::DoSubsector(subsector_t * sub)
 			seg++;
 		}
 		// Skip subsector if outside vertical or horizontal clippers or is in unexplored territory (fog of war)
-		if(!pitchvisible || !anglevisible || (!radarvisible && r_radarclipper)) return;
+		if (!pitchvisible || !anglevisible || (!radarvisible && r_radarclipper))
+		{
+			reject();
+			return;
+		}
 	}
 
 	if (mClipPortal)
@@ -873,17 +1329,24 @@ void HWDrawInfo::DoSubsector(subsector_t * sub)
 			auto line = mClipPortal->ClipLine();
 			// The subsector is out of range, but we still have to check lines that lie directly on the boundary and may expose their upper or lower parts.
 			if (line) AddSpecialPortalLines(sub, fakesector, line);
+			reject();
 			return;
 		}
 	}
 
-	if (sector->validcount != validcount)
+	if (sector->validcount != rendervalidcount)
 	{
+		if (profile) ++SceneTraversalProfile.UniqueSectors;
 		CheckUpdate(screen->mVertexData, sector);
 	}
+	if (profile) ++SceneTraversalProfile.SubsectorEntered;
 
 	// [RH] Add particles
-	if (gl_render_things && (sub->sprites.Size() > 0 || Level->ParticlesInSubsec[sub->Index()] != NO_PARTICLE))
+	particle_t* subParticles;
+	int subFirst;
+	DVisualThinker* const* subVisuals;
+	unsigned subVisualCount;
+	if (gl_render_things && !WorldSideEffectsOnly && WorldModeSubsectorParticles(Level, sub, subParticles, subFirst, subVisuals, subVisualCount))
 	{
 		if (multithread)
 		{
@@ -903,13 +1366,14 @@ void HWDrawInfo::DoSubsector(subsector_t * sub)
 	// A sector might have been split into several
 	//	subsectors during BSP building.
 	// Thus we check whether it was already added.
-	if (sector->validcount != validcount)
+	if (sector->validcount != rendervalidcount)
 	{
 		// Well, now it will be done.
-		sector->validcount = validcount;
+		sector->validcount = rendervalidcount;
 		sector->MoreFlags |= SECMF_DRAWN;
+		if (SceneProfiling) ++SceneTraversalProfile.SectorDrawnWrites;
 
-		if (gl_render_things && (sector->touching_renderthings || sector->sectorportal_thinglist))
+		if (gl_render_things && !WorldSideEffectsOnly && (sector->touching_renderthings || sector->sectorportal_thinglist))
 		{
 			if (multithread)
 			{
@@ -928,7 +1392,7 @@ void HWDrawInfo::DoSubsector(subsector_t * sub)
 			for (auto p = sector->touching_renderthings; p != nullptr; p = p->m_snext)
 			{
 				auto thing = p->m_thing;
-				if (thing->validcount == validcount) continue; // Don't double count
+				if (thing->validcount == rendervalidcount) continue; // Don't double count
 				if (((thing->flags3 & MF3_ISMONSTER) && !(thing->flags & MF_CORPSE)) || (thing->flags & MF_MISSILE))
 				{
 					if (RTnum < MAXDITHERACTORS) RenderedTargets[RTnum++] = thing;
@@ -938,7 +1402,7 @@ void HWDrawInfo::DoSubsector(subsector_t * sub)
 		}
 	}
 
-	if (gl_render_flats)
+	if (gl_render_flats && !WorldSideEffectsOnly)
 	{
 		// Subsectors with only 2 lines cannot have any area
 		if (sub->numlines>2 || (sub->hacked&1))
@@ -997,7 +1461,7 @@ void HWDrawInfo::DoSubsector(subsector_t * sub)
 					}
 					else
 					{
-						AddSubsectorToPortal(portal, sub);
+						AddSubsectorToPortal(portal, sub); if (SceneProfiling) ++SceneTraversalProfile.PortalRegistrations;
 					}
 				}
 
@@ -1010,7 +1474,7 @@ void HWDrawInfo::DoSubsector(subsector_t * sub)
 					}
 					else
 					{
-						AddSubsectorToPortal(portal, sub);
+						AddSubsectorToPortal(portal, sub); if (SceneProfiling) ++SceneTraversalProfile.PortalRegistrations;
 					}
 				}
 			}
@@ -1032,6 +1496,7 @@ void HWDrawInfo::DoSubsector(subsector_t * sub)
 
 void HWDrawInfo::RenderBSPNode (void *node)
 {
+	const bool profile = SceneProfiling;
 	if (Level->nodes.Size() == 0)
 	{
 		DoSubsector (&Level->subsectors[0]);
@@ -1039,6 +1504,7 @@ void HWDrawInfo::RenderBSPNode (void *node)
 	}
 	while (!((size_t)node & 1))  // Keep going until found a subsector
 	{
+		if (profile) ++SceneTraversalProfile.Nodes;
 		node_t *bsp = (node_t *)node;
 
 		// Decide which side the view point is on.
@@ -1051,10 +1517,14 @@ void HWDrawInfo::RenderBSPNode (void *node)
 		side ^= 1;
 
 		// It is not necessary to use the slower precise version here
+		if (profile) ++SceneTraversalProfile.BoxChecks;
 		if (!mClipper->CheckBox(bsp->bbox[side]))
 		{
 			if (!(no_renderflags[bsp->Index()] & SSRF_SEEN))
+			{
+				if (profile) ++SceneTraversalProfile.BoxRejected;
 				return;
+			}
 		}
 		if (Viewpoint.bDoOrtho)
 		{
@@ -1091,9 +1561,75 @@ void HWDrawInfo::RenderOrthoNoFog()
 	}
 }
 
+void HWDrawInfo::GPUBakeSweepWalls()
+{
+	if (!vk_gpu_driven_wallbake || !vk_gpu_driven_bake || !Level) return;
+	if (BakeSweptLevel == (const void*)Level) return;
+	BakeSweptLevel = Level;
+	HWMeshHelper mesh;
+	HWWallDispatcher disp(Level, &mesh, lightmode);
+	uint64_t swept = 0;
+	for (auto& seg : Level->segs)
+	{
+		if (!seg.sidedef || !seg.frontsector) continue;
+		HWWall wall;
+		wall.sub = seg.Subsector;
+		sector_t* front = hw_FakeFlat(seg.frontsector, in_area, false);
+		sector_t* back = nullptr;
+		sector_t* backsector = seg.backsector;
+		if (backsector)
+		{
+			if (front->sectornum == backsector->sectornum || (seg.sidedef->Flags & WALLF_POLYOBJ)) back = front;
+			else back = hw_FakeFlat(backsector, in_area, true);
+		}
+		wall.Process(&disp, &seg, front, back, false);
+		++swept;
+	}
+	g_sweepMvCalls = g_sweepBaked = g_sweepSkipNoTex = g_sweepSkipSplit = g_sweepSkipCanCache = g_sweepSkipOther = 0;
+	g_bakeSweepActive = true;
+	for (auto& w : mesh.list) w.MakeVertices(false);
+	g_bakeSweepActive = false;
+	Printf("Wall bake sweep: segs=%llu produced=%llu mvCalls=%llu baked=%llu skipNoTex=%llu skipSplit=%llu skipCanCache=%llu skipOther=%llu\n",
+		static_cast<unsigned long long>(swept), static_cast<unsigned long long>(mesh.list.Size()),
+		static_cast<unsigned long long>(g_sweepMvCalls), static_cast<unsigned long long>(g_sweepBaked),
+		static_cast<unsigned long long>(g_sweepSkipNoTex), static_cast<unsigned long long>(g_sweepSkipSplit),
+		static_cast<unsigned long long>(g_sweepSkipCanCache), static_cast<unsigned long long>(g_sweepSkipOther));
+}
+
+void SpriteFrameCensus(HWDrawInfo* di);
+void ModelFrameCensus();
+
 void HWDrawInfo::RenderBSP(void *node, bool drawpsprites)
 {
+	GPUBakeSweepWalls();
+	// [Karto] World mode bakes once per level and otherwise forgets it, so stale bindless IDs never replay.
+	if (r_worldmode) BakeWorldMode(); else ForgetWorldMode();
+	const bool worldMode = WorldModeActive(Level);
+	if (worldMode && drawpsprites && !mCurrentPortal)
+	{
+		FFrameStageScope stage(FS_UpdateWorldMode);
+		UpdateWorldMode();
+	}
+	WorldSideEffectsOnly = worldMode && WorldModeSideEffectsDue(Level, drawpsprites && !mCurrentPortal);
+	const bool skipWorld = r_ceiling_noworld || (worldMode && !WorldSideEffectsOnly);
+	// [Karto] A native walk shares the clipper's vertex angle cache with the automap walker; never overlap them.
+	if (!skipWorld) WorldModeWalkerWait();
+	BeginRetainedWorldView(Level);
+	OwnOpaqueWalls = CanOwnOpaqueWalls(this);
+	OwnedNextOrder = 1;
+	if (SceneProfiling)
+	{
+		if (OwnOpaqueWalls) ++SceneMainSurfaceProfile.OwnedViews;
+		++SceneTraversalProfile.Views;
+		if (mClipPortal != nullptr) ++SceneTraversalProfile.ClipPortalViews;
+		if (gl_multithread) ++SceneTraversalProfile.ThreadedViews;
+	}
 	ClearDitherTargets();
+	if (vk_gpu_driven_compat)
+	{
+		const size_t coverageBytes = (Level->lines.Size() + 7) / 8;
+		g_coveragePending.assign(coverageBytes, 0);
+	}
 	Bsp.Clock();
 
 	// Give the DrawInfo the viewpoint in fixed point because that's what the nodes are.
@@ -1105,18 +1641,16 @@ void HWDrawInfo::RenderBSP(void *node, bool drawpsprites)
 		viewy = FLOAT2FIXED(Viewpoint.OffPos.Y);
 	}
 
-	validcount++;	// used for processing sidedefs only once by the renderer.
+	rendervalidcount++;	// used for processing sidedefs only once by the renderer.
 
 	multithread = gl_multithread;
 	if (multithread)
 	{
 		jobQueue.ReleaseAll();
-		auto future = renderPool.push([&](int id) {
-			WorkerThread();
-		});
-		if (Viewpoint.bDoOrtho && ((Level->flags3 & LEVEL3_NOFOGOFWAR) || !r_radarclipper)) RenderOrthoNoFog();
+		std::future<void> future = renderPool.push([&](int id) { WorkerThread(); });
+		if (skipWorld) {}
+		else if (Viewpoint.bDoOrtho && ((Level->flags3 & LEVEL3_NOFOGOFWAR) || !r_radarclipper)) RenderOrthoNoFog();
 		else RenderBSPNode(node);
-
 		jobQueue.AddJob(RenderJob::TerminateJob, nullptr, nullptr);
 		Bsp.Unclock();
 		MTWait.Clock();
@@ -1125,24 +1659,59 @@ void HWDrawInfo::RenderBSP(void *node, bool drawpsprites)
 	}
 	else
 	{
-		if (Viewpoint.bDoOrtho && ((Level->flags3 & LEVEL3_NOFOGOFWAR) || !r_radarclipper)) RenderOrthoNoFog();
+		if (skipWorld) {}
+		else if (Viewpoint.bDoOrtho && ((Level->flags3 & LEVEL3_NOFOGOFWAR) || !r_radarclipper)) RenderOrthoNoFog();
 		else RenderBSPNode(node);
 		Bsp.Unclock();
 	}
+	WorldSideEffectsOnly = false;
+	// [Karto] The save picture is a second top-level view of the same camera, without psprites; it needs the same
+	// sprites and sky as the frame.
+	if (worldMode && !mCurrentPortal && (drawpsprites || outer == nullptr))
+	{
+		if (drawpsprites)
+		{
+			FFrameStageScope stage(FS_Walker);
+			WorldModeWalkerFrame();
+		}
+		{
+			FFrameStageScope stage(FS_Sprites);
+			CollectWorldModeSprites();
+		}
+		SpriteFrameCensus(this);
+		ModelFrameCensus();
+		{
+			FFrameStageScope stage(FS_Sky);
+			ReplayWorldModeSky();
+		}
+		ReplayWorldModeHorizons();
+		ReplayWorldModeTranslucentWalls();
+		CollectWorldModeMissingTextures();
+	}
 
 	// Make rendered targets set dither transparency flags on level geometry for next pass
-	// Can't do this inside DoSubsector() because both Trace() and P_CheckSight() affect 'validcount' global variable
-	for (int ii = 0; ii < MAXDITHERACTORS; ii++)
+	// Can't do this inside DoSubsector() because both Trace() and P_CheckSight() affect 'rendervalidcount' global variable
 	{
-		if ( RenderedTargets[ii] && P_CheckSight(players[consoleplayer].mo, RenderedTargets[ii], 0) )
+		cycle_t ditherTimer;
+		const bool timeDither = SceneProfiling;
+		if (timeDither) { ditherTimer.ResetAndClock(); for (int ii = 0; ii < MAXDITHERACTORS; ii++) if (RenderedTargets[ii]) ++SceneTraversalProfile.DitherCandidates; }
+		for (int ii = 0; ii < MAXDITHERACTORS; ii++)
 		{
-			SetDitherTransFlags(RenderedTargets[ii]);
+			if ( RenderedTargets[ii] && P_CheckSight(players[consoleplayer].mo, RenderedTargets[ii], 0) )
+			{
+				SetDitherTransFlags(RenderedTargets[ii]);
+				if (timeDither) ++SceneTraversalProfile.DitherTargetsSet;
+			}
 		}
+		if (timeDither) { ditherTimer.Unclock(); SceneTraversalProfile.DitherTraceNS += uint64_t(ditherTimer.Time() * 1e9); }
 	}
+
+	if (vk_gpu_driven_compat)
+		screen->RenderState()->UploadCoverage(g_coveragePending.data(), g_coveragePending.size());
 
 	// Process all the sprites on the current portal's back side which touch the portal.
 	if (mCurrentPortal != nullptr) mCurrentPortal->RenderAttached(this);
 
 	if (drawpsprites)
-		PreparePlayerSprites(Viewpoint.sector, in_area);
+		PreparePlayerSprites(WorldModePublishedSector(Viewpoint.sector), in_area);
 }

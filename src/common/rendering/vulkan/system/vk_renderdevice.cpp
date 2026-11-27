@@ -36,6 +36,8 @@
 #include "hwrenderer/data/hw_viewpointbuffer.h"
 #include "m_png.h"
 #include "printf.h"
+#include "i_time.h"
+#include "g_levellocals.h"
 #include "v_draw.h"
 #include "v_video.h"
 #include "version.h"
@@ -61,6 +63,16 @@ EXTERN_CVAR(Int, screenblocks)
 EXTERN_CVAR(Bool, cl_capfps)
 
 CVAR(Bool, vk_raytrace, false, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
+CVAR(Bool, r_shader_specialize, true, 0)
+int ShaderFeaturesSeen = 0;
+EXTERN_CVAR(Bool, r_pp_bloomcopy)
+EXTERN_CVAR(Bool, r_pp_sharedextract)
+EXTERN_CVAR(Bool, r_pp_fxaabloom)
+EXTERN_CVAR(Bool, r_pp_fxaascene)
+EXTERN_CVAR(Bool, r_pp_weaponbloom)
+EXTERN_CVAR(Bool, r_pp_fused)
+EXTERN_CVAR(Int, gl_fxaa)
+EXTERN_CVAR(Bool, gl_lens)
 
 // Physical device info
 static std::vector<VulkanCompatibleDevice> SupportedDevices;
@@ -113,11 +125,24 @@ VulkanRenderDevice::VulkanRenderDevice(void *hMonitor, bool fullscreen, std::sha
 	Super(hMonitor, fullscreen)
 {
 	VulkanDeviceBuilder builder;
-	builder.OptionalRayQuery();
+	// [Karto] Only RaytracingEnabled uses ray query. Requested without it, the buffer device address extension fixes an
+	// address on every VMA allocation, which RenderDoc replay on AMD cannot re-create.
+	if (vk_raytrace) builder.OptionalRayQuery();
+	builder.OptionalDescriptorIndexing();
 	builder.Surface(surface);
 	builder.SelectDevice(vk_device);
 	SupportedDevices = builder.FindDevices(surface->Instance);
 	device = builder.Create(surface->Instance);
+	Printf("Vulkan: validation layer %s\n", surface->Instance->DebugLayerActive ? "active" : (vk_debug ? "requested but unavailable" : "not requested"));
+	const auto& indexing = device->EnabledFeatures.DescriptorIndexing;
+	DescriptorIndexingSupported = device->SupportsExtension(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) &&
+		indexing.runtimeDescriptorArray == VK_TRUE && indexing.descriptorBindingPartiallyBound == VK_TRUE &&
+		indexing.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE &&
+		indexing.descriptorBindingVariableDescriptorCount == VK_TRUE &&
+		indexing.shaderSampledImageArrayNonUniformIndexing == VK_TRUE;
+	Printf("Vulkan: descriptor indexing (bindless) %s\n", DescriptorIndexingSupported ? "available" : "unavailable");
+	ShaderDrawParametersSupported = device && device->EnabledFeatures.ShaderDrawParameters.shaderDrawParameters == VK_TRUE;
+	Printf("Vulkan: shader draw parameters (gl_DrawID) %s\n", ShaderDrawParametersSupported ? "available" : "unavailable");
 }
 
 VulkanRenderDevice::~VulkanRenderDevice()
@@ -183,11 +208,15 @@ void VulkanRenderDevice::InitializeState()
 	mRenderPassManager.reset(new VkRenderPassManager(this));
 	mRaytrace.reset(new VkRaytrace(this));
 
-	mVertexData = new FFlatVertexBuffer(GetWidth(), GetHeight());
+	// [Karto] Two copies of every host-written frame buffer so vk_frames_in_flight can change at runtime; the frame slot
+	// picks the copy the parked frame is not reading.
+	mPipelineNbr = 2;
+	mPipelineFrameSlot = mCommands->GetFrameSlot();
+	mVertexData = new FFlatVertexBuffer(GetWidth(), GetHeight(), mPipelineNbr);
 	mSkyData = new FSkyVertexBuffer;
-	mViewpoints = new HWViewpointBuffer;
-	mLights = new FLightBuffer();
-	mBones = new BoneBuffer();
+	mViewpoints = new HWViewpointBuffer(mPipelineNbr);
+	mLights = new FLightBuffer(mPipelineNbr);
+	mBones = new BoneBuffer(mPipelineNbr);
 
 	mShaderManager.reset(new VkShaderManager(this));
 	mDescriptorSetManager->Init();
@@ -207,7 +236,10 @@ void VulkanRenderDevice::Update()
 
 	GetPostprocess()->SetActiveRenderTarget();
 
+	const bool profileStages = IsGPUProfilingEnabled();
+	if (profileStages) mRenderState->BeginGPUProfile("draw2d");
 	Draw2D();
+	if (profileStages) mRenderState->EndGPUProfile();
 	twod->Clear();
 
 	mRenderState->EndRenderPass();
@@ -217,6 +249,8 @@ void VulkanRenderDevice::Update()
 
 	mCommands->WaitForCommands(true);
 	mCommands->UpdateGpuStats();
+	mPipelineFrameSlot = mCommands->GetFrameSlot();
+	mVertexData->SelectPipelineBuffer(mPipelineFrameSlot);
 
 	Super::Update();
 }
@@ -261,8 +295,29 @@ void VulkanRenderDevice::RenderTextureView(FCanvasTexture* tex, std::function<vo
 
 void VulkanRenderDevice::PostProcessScene(bool swscene, int fixedcm, float flash, const std::function<void()> &afterBloomDrawEndScene2D)
 {
-	if (!swscene) mPostprocess->BlitSceneToPostprocess(); // Copy the resulting scene to the current post process texture
+	auto buffers = GetBuffers();
+	const IntRect& view = mSceneViewport;
+	const bool fromScene = !swscene && r_pp_bloomcopy && hw_postprocess.bloom.WillRender(buffers->GetSceneWidth(), buffers->GetSceneHeight(), fixedcm) &&
+		buffers->GetSceneSamples() == VK_SAMPLE_COUNT_1_BIT && !hw_postprocess.customShaders.HasTarget("beforebloom") &&
+		view.left == 0 && view.top == 0 && view.width == buffers->GetWidth() && view.height == buffers->GetHeight();
+	hw_postprocess.bloom.FromScene = hw_postprocess.exposure.FromScene = fromScene;
+	// [Karto] The exposure must exist from an earlier frame: the shared extract thresholds with the previous one.
+	hw_postprocess.bloom.SharedExtract = fromScene && r_pp_sharedextract && r_pp_fused && hw_postprocess.exposure.HasExposure();
+	const IntRect& screenView = mScreenViewport;
+	hw_postprocess.bloom.AddInFXAA = fromScene && r_pp_fxaabloom && r_pp_weaponbloom && gl_fxaa != 0 &&
+		!hw_postprocess.tonemap.WillRender() && !PPColormap::WillRender(fixedcm, flash) && !gl_lens &&
+		!hw_postprocess.customShaders.HasTarget("scene") && screenView.left == 0 && screenView.top == 0 &&
+		screenView.width == buffers->GetWidth() && screenView.height == buffers->GetHeight();
+	hw_postprocess.fxaa.FromScene = !swscene && !fromScene && r_pp_fxaascene && r_pp_weaponbloom && gl_fxaa != 0 &&
+		!hw_postprocess.bloom.WillRender(buffers->GetSceneWidth(), buffers->GetSceneHeight(), fixedcm) &&
+		buffers->GetSceneSamples() == VK_SAMPLE_COUNT_1_BIT && !hw_postprocess.customShaders.HasTarget("beforebloom") &&
+		!hw_postprocess.tonemap.WillRender() && !PPColormap::WillRender(fixedcm, flash) && !gl_lens &&
+		screenView.left == 0 && screenView.top == 0 && screenView.width == buffers->GetWidth() && screenView.height == buffers->GetHeight();
+	if (fromScene || hw_postprocess.fxaa.FromScene) mPostprocess->PrepareSceneInput();
+	else if (!swscene) mPostprocess->BlitSceneToPostprocess(); // Copy the resulting scene to the current post process texture
 	mPostprocess->PostProcessScene(fixedcm, flash, afterBloomDrawEndScene2D);
+	hw_postprocess.bloom.FromScene = hw_postprocess.exposure.FromScene = false;
+	hw_postprocess.bloom.SharedExtract = hw_postprocess.bloom.AddInFXAA = hw_postprocess.fxaa.FromScene = false;
 }
 
 const char* VulkanRenderDevice::DeviceName() const
@@ -448,10 +503,45 @@ TArray<uint8_t> VulkanRenderDevice::GetScreenshotBuffer(int &pitch, ESSType &col
 	return ScreenshotBuffer;
 }
 
+void VulkanRenderDevice::UpdateShaderSpecialization()
+{
+	static FString lastMap;
+	static int content = 0;
+	if (!mShaderManager->IsCompileDone()) return;
+	int target = SF_All;
+	if (r_shader_specialize && primaryLevel)
+	{
+		if (lastMap.Compare(primaryLevel->MapName) != 0)
+		{
+			lastMap = primaryLevel->MapName;
+			content = 0;
+		}
+		content |= ShaderFeaturesSeen & ~(SF_DynamicLights | SF_Lightmap);
+		target = content;
+		for (auto Level : AllLevels())
+		{
+			if (Level->HasDynamicLights) target |= SF_DynamicLights;
+			if (Level->LMTextureCount > 0) target |= SF_Lightmap;
+		}
+	}
+	ShaderFeaturesSeen = 0;
+	if (target == mShaderManager->GetSpecializedFeatures()) return;
+	// [Karto] At frame start nothing of this frame is recorded; the frames in flight still use the old pipelines.
+	const uint64_t start = I_nsTime();
+	vkDeviceWaitIdle(device->device);
+	mRenderPassManager->RenderBuffersReset();
+	mShaderManager->RebuildSpecialized(target);
+	Printf("Scene shaders rebuilt for features 0x%02x (%.1f ms)\n", target, (I_nsTime() - start) / 1e6);
+}
+
 void VulkanRenderDevice::BeginFrame()
 {
+	UpdateShaderSpecialization();
 	SetViewportRects(nullptr);
 	mViewpoints->Clear();
+	// [Karto] Select this frame's light/bone copies before the HW buffer set is rebuilt from them below.
+	mLights->Clear();
+	mBones->Clear();
 	mCommands->BeginFrame();
 	mTextureManager->BeginFrame();
 	mScreenBuffers->BeginFrame(screen->mScreenViewport.width, screen->mScreenViewport.height, screen->mSceneViewport.width, screen->mSceneViewport.height);

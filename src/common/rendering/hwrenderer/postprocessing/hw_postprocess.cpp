@@ -30,6 +30,16 @@
 
 #include "stats.h"
 
+CVAR(Bool, r_pp_fused, true, 0)
+CVAR(Bool, r_pp_bloomcopy, true, 0)
+// [Karto] The extract thresholds with the previous frame's exposure (this frame's is computed from its output); the exposure
+// samples the quarter-resolution extract, a visible look change.
+CVAR(Bool, r_pp_sharedextract, true, 0)
+// [Karto] Needs the weapon drawn into the scene before the bloom (r_pp_weaponbloom): nothing is left between bloom and FXAA
+// to draw it into.
+CVAR(Bool, r_pp_fxaabloom, true, 0)
+CVAR(Bool, r_pp_fxaascene, true, 0)
+
 Postprocess hw_postprocess;
 
 PPResource *PPResource::First = nullptr;
@@ -73,10 +83,15 @@ void PPBloom::UpdateTextures(int width, int height)
 	lastHeight = height;
 }
 
+bool PPBloom::WillRender(int sceneWidth, int sceneHeight, int fixedcm) const
+{
+	return gl_bloom && fixedcm == CM_DEFAULT && !gl_ssao_debug && sceneWidth > 0 && sceneHeight > 0;
+}
+
 void PPBloom::RenderBloom(PPRenderState *renderstate, int sceneWidth, int sceneHeight, int fixedcm)
 {
 	// Only bloom things if enabled and no special fixed light mode is active
-	if (!gl_bloom || fixedcm != CM_DEFAULT || gl_ssao_debug || sceneWidth <= 0 || sceneHeight <= 0)
+	if (!WillRender(sceneWidth, sceneHeight, fixedcm))
 	{
 		return;
 	}
@@ -93,19 +108,34 @@ void PPBloom::RenderBloom(PPRenderState *renderstate, int sceneWidth, int sceneH
 
 	// Extract blooming pixels from scene texture:
 	renderstate->Clear();
-	renderstate->Shader = &BloomExtract;
+	renderstate->Shader = SharedExtract ? &BloomExtractLuma : &BloomExtract;
 	renderstate->Uniforms.Set(extractUniforms);
 	renderstate->Viewport = level0.Viewport;
-	renderstate->SetInputCurrent(0, PPFilterMode::Linear);
+	if (FromScene) renderstate->SetInputSceneColor(0, PPFilterMode::Linear);
+	else renderstate->SetInputCurrent(0, PPFilterMode::Linear);
 	renderstate->SetInputTexture(1, &hw_postprocess.exposure.CameraTexture);
 	renderstate->SetOutputTexture(&level0.VTexture);
 	renderstate->SetNoBlend();
 	renderstate->Draw();
+	if (SharedExtract) hw_postprocess.exposure.RenderFromBloom(renderstate, level0.VTexture, level0.Viewport);
 
 	const float blurAmount = gl_bloom_amount;
 	BlurUniforms blurUniforms;
 	ComputeBlurSamples(7, blurAmount, blurUniforms.SampleWeights);
 
+	if (r_pp_fused)
+	{
+		BlurStep(renderstate, blurUniforms, level0.VTexture, level0.HTexture, level0.Viewport, false);
+		BlurStep(renderstate, blurUniforms, level0.HTexture, level0.VTexture, level0.Viewport, true);
+		for (int i = 1; i < NumBloomLevels; i++)
+			FusedStep(renderstate, blurUniforms, levels[i - 1].VTexture, levels[i].VTexture, levels[i].Viewport, 0);
+		for (int i = NumBloomLevels - 2; i > 0; i--)
+			FusedStep(renderstate, blurUniforms, levels[i + 1].VTexture, levels[i].VTexture, levels[i].Viewport, 0);
+		FusedStep(renderstate, blurUniforms, levels[1].VTexture, level0.HTexture, level0.Viewport, 1);
+		BlurStep(renderstate, blurUniforms, level0.HTexture, level0.VTexture, level0.Viewport, true);
+	}
+	else
+	{
 	// Blur and downscale:
 	for (int i = 0; i < NumBloomLevels - 1; i++)
 	{
@@ -148,6 +178,29 @@ void PPBloom::RenderBloom(PPRenderState *renderstate, int sceneWidth, int sceneH
 
 	BlurStep(renderstate, blurUniforms, level0.VTexture, level0.HTexture, level0.Viewport, false);
 	BlurStep(renderstate, blurUniforms, level0.HTexture, level0.VTexture, level0.Viewport, true);
+	}
+
+	if (FromScene && AddInFXAA)
+	{
+		renderstate->PopGroup();
+		return;
+	}
+	if (FromScene)
+	{
+		// [Karto] The backend checked that the scene viewport is the whole image, so this covers every pixel the skipped blit
+		// would write.
+		renderstate->Clear();
+		renderstate->Shader = &BloomCopy;
+		renderstate->Uniforms.Clear();
+		renderstate->Viewport = screen->mSceneViewport;
+		renderstate->SetInputSceneColor(0);
+		renderstate->SetInputTexture(1, &level0.VTexture, PPFilterMode::Linear);
+		renderstate->SetOutputCurrent();
+		renderstate->SetNoBlend();
+		renderstate->Draw();
+		renderstate->PopGroup();
+		return;
+	}
 
 	// Add bloom back to scene texture:
 	renderstate->Clear();
@@ -271,6 +324,23 @@ void PPBloom::BlurStep(PPRenderState *renderstate, const BlurUniforms &blurUnifo
 	renderstate->Draw();
 }
 
+void PPBloom::FusedStep(PPRenderState *renderstate, const BlurUniforms &blurUniforms, PPTexture &input, PPTexture &output, PPViewport viewport, int mode)
+{
+	BloomFusedUniforms uniforms;
+	memcpy(uniforms.SampleWeights, blurUniforms.SampleWeights, sizeof(uniforms.SampleWeights));
+	uniforms.TargetSize = { float(viewport.width), float(viewport.height) };
+	uniforms.Mode = mode;
+	uniforms.Padding = 0;
+	renderstate->Clear();
+	renderstate->Shader = &BloomFused;
+	renderstate->Uniforms.Set(uniforms);
+	renderstate->Viewport = viewport;
+	renderstate->SetInputTexture(0, &input, PPFilterMode::Linear);
+	renderstate->SetOutputTexture(&output);
+	renderstate->SetNoBlend();
+	renderstate->Draw();
+}
+
 float PPBloom::ComputeBlurGaussian(float n, float theta) // theta = Blur Amount
 {
 	return (float)((1.0f / sqrtf(2 * (float)M_PI * theta)) * expf(-(n * n) / (2.0f * theta * theta)));
@@ -369,10 +439,24 @@ void PPFXAA::Render(PPRenderState *renderstate)
 	renderstate->PushGroup("fxaa");
 
 	renderstate->Clear();
-	renderstate->Shader = &FXAALuma;
 	renderstate->Uniforms.Clear();
 	renderstate->Viewport = screen->mScreenViewport;
-	renderstate->SetInputCurrent(0, PPFilterMode::Nearest);
+	if (hw_postprocess.bloom.AddInFXAA)
+	{
+		renderstate->Shader = &FXAALumaBloom;
+		renderstate->SetInputSceneColor(0, PPFilterMode::Nearest);
+		renderstate->SetInputTexture(1, &hw_postprocess.bloom.Level0(), PPFilterMode::Linear);
+	}
+	else if (FromScene)
+	{
+		renderstate->Shader = &FXAALuma;
+		renderstate->SetInputSceneColor(0, PPFilterMode::Nearest);
+	}
+	else
+	{
+		renderstate->Shader = &FXAALuma;
+		renderstate->SetInputCurrent(0, PPFilterMode::Nearest);
+	}
 	renderstate->SetOutputNext();
 	renderstate->SetNoBlend();
 	renderstate->Draw();
@@ -396,6 +480,7 @@ void PPFXAA::CreateShaders()
 		return;
 
 	FXAALuma = { "shaders/pp/fxaa.fp", "#define FXAA_LUMA_PASS\n", {} };
+	FXAALumaBloom = { "shaders/pp/fxaa.fp", "#define FXAA_LUMA_PASS\n#define BLOOM_ADD\n", {} };
 	FXAA = { "shaders/pp/fxaa.fp", GetDefines(), FXAAUniforms::Desc(), GetMaxVersion() };
 	LastQuality = gl_fxaa;
 }
@@ -444,12 +529,6 @@ void PPCameraExposure::Render(PPRenderState *renderstate, int sceneWidth, int sc
 	extractUniforms.Scale = screen->SceneScale();
 	extractUniforms.Offset = screen->SceneOffset();
 
-	ExposureCombineUniforms combineUniforms;
-	combineUniforms.ExposureBase = gl_exposure_base;
-	combineUniforms.ExposureMin = gl_exposure_min;
-	combineUniforms.ExposureScale = gl_exposure_scale;
-	combineUniforms.ExposureSpeed = gl_exposure_speed;
-
 	auto &level0 = ExposureLevels[0];
 
 	// Extract light blevel from scene texture:
@@ -457,11 +536,32 @@ void PPCameraExposure::Render(PPRenderState *renderstate, int sceneWidth, int sc
 	renderstate->Shader = &ExposureExtract;
 	renderstate->Uniforms.Set(extractUniforms);
 	renderstate->Viewport = level0.Viewport;
-	renderstate->SetInputCurrent(0, PPFilterMode::Linear);
+	if (FromScene) renderstate->SetInputSceneColor(0, PPFilterMode::Linear);
+	else renderstate->SetInputCurrent(0, PPFilterMode::Linear);
 	renderstate->SetOutputTexture(&level0.Texture);
 	renderstate->SetNoBlend();
 	renderstate->Draw();
 
+	if (r_pp_fused)
+	{
+		for (size_t i = 0; i + 1 < ExposureLevels.size();)
+		{
+			const size_t depth = std::min<size_t>(3, ExposureLevels.size() - 1 - i);
+			ExposureFusedUniforms uniforms;
+			uniforms.Depth = int(depth);
+			uniforms.Padding[0] = uniforms.Padding[1] = uniforms.Padding[2] = 0;
+			auto &next = ExposureLevels[i + depth];
+			renderstate->Shader = &ExposureFused;
+			renderstate->Uniforms.Set(uniforms);
+			renderstate->Viewport = next.Viewport;
+			renderstate->SetInputTexture(0, &ExposureLevels[i].Texture, PPFilterMode::Nearest);
+			renderstate->SetOutputTexture(&next.Texture);
+			renderstate->SetNoBlend();
+			renderstate->Draw();
+			i += depth;
+		}
+	}
+	else
 	// Find the average value:
 	for (size_t i = 0; i + 1 < ExposureLevels.size(); i++)
 	{
@@ -477,6 +577,18 @@ void PPCameraExposure::Render(PPRenderState *renderstate, int sceneWidth, int sc
 		renderstate->Draw();
 	}
 
+	Combine(renderstate, ExposureLevels.back().Texture);
+	renderstate->PopGroup();
+}
+
+void PPCameraExposure::Combine(PPRenderState *renderstate, PPTexture &last)
+{
+	ExposureCombineUniforms combineUniforms;
+	combineUniforms.ExposureBase = gl_exposure_base;
+	combineUniforms.ExposureMin = gl_exposure_min;
+	combineUniforms.ExposureScale = gl_exposure_scale;
+	combineUniforms.ExposureSpeed = gl_exposure_speed;
+
 	// Combine average value with current camera exposure:
 	renderstate->Shader = &ExposureCombine;
 	renderstate->Uniforms.Set(combineUniforms);
@@ -484,7 +596,7 @@ void PPCameraExposure::Render(PPRenderState *renderstate, int sceneWidth, int sc
 	renderstate->Viewport.top = 0;
 	renderstate->Viewport.width = 1;
 	renderstate->Viewport.height = 1;
-	renderstate->SetInputTexture(0, &ExposureLevels.back().Texture, PPFilterMode::Linear);
+	renderstate->SetInputTexture(0, &last, PPFilterMode::Linear);
 	renderstate->SetOutputTexture(&CameraTexture);
 	if (!FirstExposureFrame)
 		renderstate->SetAlphaBlend();
@@ -492,9 +604,53 @@ void PPCameraExposure::Render(PPRenderState *renderstate, int sceneWidth, int sc
 		renderstate->SetNoBlend();
 	renderstate->Draw();
 
-	renderstate->PopGroup();
-
 	FirstExposureFrame = false;
+}
+
+void PPCameraExposure::RenderFromBloom(PPRenderState *renderstate, PPTexture &source, const PPViewport &viewport)
+{
+	renderstate->PushGroup("exposure");
+	if (SharedLevels.empty() || SharedLevels[0].Viewport.width != max(viewport.width / 2, 1) || SharedLevels[0].Viewport.height != max(viewport.height / 2, 1))
+	{
+		SharedLevels.clear();
+		int width = viewport.width, height = viewport.height;
+		do
+		{
+			width = max(width / 2, 1);
+			height = max(height / 2, 1);
+			PPExposureLevel blevel;
+			blevel.Viewport.left = 0;
+			blevel.Viewport.top = 0;
+			blevel.Viewport.width = width;
+			blevel.Viewport.height = height;
+			blevel.Texture = { width, height, PixelFormat::R32f };
+			SharedLevels.push_back(std::move(blevel));
+		} while (width > 1 || height > 1);
+	}
+	PPTexture *input = &source;
+	int channel = 3;
+	for (size_t i = 0; i < SharedLevels.size();)
+	{
+		const size_t depth = std::min<size_t>(3, SharedLevels.size() - i);
+		ExposureFusedUniforms uniforms;
+		uniforms.Depth = int(depth);
+		uniforms.Padding[0] = channel;
+		uniforms.Padding[1] = uniforms.Padding[2] = 0;
+		auto &next = SharedLevels[i + depth - 1];
+		renderstate->Clear();
+		renderstate->Shader = &ExposureFused;
+		renderstate->Uniforms.Set(uniforms);
+		renderstate->Viewport = next.Viewport;
+		renderstate->SetInputTexture(0, input, PPFilterMode::Nearest);
+		renderstate->SetOutputTexture(&next.Texture);
+		renderstate->SetNoBlend();
+		renderstate->Draw();
+		input = &next.Texture;
+		channel = 0;
+		i += depth;
+	}
+	Combine(renderstate, SharedLevels.back().Texture);
+	renderstate->PopGroup();
 }
 
 void PPCameraExposure::UpdateTextures(int width, int height)
@@ -531,6 +687,11 @@ void PPCameraExposure::UpdateTextures(int width, int height)
 }
 
 /////////////////////////////////////////////////////////////////////////////
+
+bool PPColormap::WillRender(int fixedcm, float flash)
+{
+	return !(fixedcm < CM_FIRSTSPECIALCOLORMAP || fixedcm >= CM_MAXCOLORMAP) || flash != 1.f;
+}
 
 void PPColormap::Render(PPRenderState *renderstate, int fixedcm, float flash)
 {
@@ -596,6 +757,11 @@ void PPTonemap::UpdateTextures()
 
 		PaletteTexture = { 512, 512, PixelFormat::Rgba8, data };
 	}
+}
+
+bool PPTonemap::WillRender() const
+{
+	return ((level_tonemap != ETonemapMode::None) ? level_tonemap : ETonemapMode((int)gl_tonemap)) != ETonemapMode::None;
 }
 
 void PPTonemap::Render(PPRenderState *renderstate)
@@ -698,6 +864,7 @@ void PPAmbientOcclusion::CreateShaders()
 	BlurHorizontal = { "shaders/pp/depthblur.fp", "#define BLUR_HORIZONTAL\n", DepthBlurUniforms::Desc() };
 	Combine = { "shaders/pp/ssaocombine.fp", "", AmbientCombineUniforms::Desc() };
 	CombineMS = { "shaders/pp/ssaocombine.fp", "#define MULTISAMPLE\n", AmbientCombineUniforms::Desc() };
+	CombineNormalMS = { "shaders/pp/ssaocombine.fp", "#define MULTISAMPLE\n#define NORMAL_DEBUG_MS\n", AmbientCombineUniforms::Desc() };
 
 	LastQuality = gl_ssao;
 }
@@ -834,7 +1001,7 @@ void PPAmbientOcclusion::Render(PPRenderState *renderstate, float m5, int sceneW
 
 	// Add SSAO back to scene texture:
 	renderstate->Clear();
-	renderstate->Shader = gl_multisample > 1 ? &CombineMS : &Combine;
+	renderstate->Shader = gl_multisample > 1 ? (gl_ssao_debug >= 4 ? &CombineNormalMS : &CombineMS) : &Combine;
 	renderstate->Uniforms.Set(combineUniforms);
 	renderstate->Viewport = screen->mSceneViewport;
 	if (gl_ssao_debug < 4)
@@ -887,7 +1054,7 @@ void PPShadowMap::Update(PPRenderState* renderstate)
 	renderstate->Clear();
 	renderstate->Shader = &ShadowMap;
 	renderstate->Uniforms.Set(uniforms);
-	renderstate->Viewport = { 0, 0, gl_shadowmap_quality, 1024 };
+	renderstate->Viewport = { 0, 0, gl_shadowmap_quality, std::max(screen->mShadowMap.RowsUsed, 1) };
 	renderstate->SetShadowMapBuffers(true);
 	renderstate->SetOutputShadowMap();
 	renderstate->SetNoBlend();
@@ -899,6 +1066,14 @@ void PPShadowMap::Update(PPRenderState* renderstate)
 /////////////////////////////////////////////////////////////////////////////
 
 CVAR(Bool, gl_custompost, true, 0)
+
+bool PPCustomShaders::HasTarget(const char *target) const
+{
+	if (!gl_custompost) return false;
+	for (auto &desc : PostProcessShaders)
+		if (desc.Target.Compare(target) == 0 && desc.Enabled) return true;
+	return false;
+}
 
 void PPCustomShaders::Run(PPRenderState *renderstate, FString target)
 {
@@ -925,8 +1100,19 @@ void PPCustomShaders::Run(PPRenderState *renderstate, FString target)
 	}
 }
 
+// [Karto] Only custom post-process shaders read the previous frame's copy; one switched on later sees an older copy for its
+// first frame.
+CVAR(Bool, r_pp_lastinput_skip, true, 0)
+
 void PPCustomShaders::UpdateLastInputTexture(PPRenderState *renderstate)
 {
+	if (r_pp_lastinput_skip)
+	{
+		bool enabled = false;
+		for (unsigned i = 0; i < PostProcessShaders.Size() && !enabled; i++) enabled = PostProcessShaders[i].Enabled;
+		if (!enabled) return;
+	}
+
 	int width = renderstate->Viewport.width;
 	int height = renderstate->Viewport.height;
 
@@ -1195,7 +1381,7 @@ void PPCustomShaderInstance::AddUniformField(size_t &offset, const FString &name
 
 void Postprocess::Pass1(PPRenderState* state, int fixedcm, int sceneWidth, int sceneHeight)
 {
-	exposure.Render(state, sceneWidth, sceneHeight);
+	if (!bloom.SharedExtract) exposure.Render(state, sceneWidth, sceneHeight);
 	customShaders.Run(state, "beforebloom");
 	bloom.RenderBloom(state, sceneWidth, sceneHeight, fixedcm);
 }

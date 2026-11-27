@@ -20,6 +20,11 @@
 #include "g_levellocals.h"
 #include "p_maputl.h"
 #include "actor.h"
+#include "c_cvars.h"
+#include <optional>
+
+EXTERN_CVAR(Bool, p_linefreeskip)
+EXTERN_CVAR(Bool, p_linefreeskip_verify)
 
 //=============================================================================
 // phares 3/21/98
@@ -230,11 +235,23 @@ msecnode_t *P_CreateSecNodeList(AActor *thing, double radius, msecnode_t *sector
 	}
 
 	FBoundingBox box(thing->X(), thing->Y(), radius);
-	FBlockLinesIterator it(thing->Level, box);
+	const bool lineFree = p_linefreeskip && P_BoxBlocksLineFree(thing->Level, box);
+	std::optional<FBlockLinesIterator> it;
+	if (lineFree && !p_linefreeskip_verify)
+	{
+		validcount++;
+		LineFreeStats[2]++;
+	}
+	else
+	{
+		it.emplace(thing->Level, box);
+		LineFreeStats[3]++;
+	}
 	line_t *ld;
 
-	while ((ld = it.Next()))
+	while (it && (ld = it->Next()))
 	{
+		if (lineFree) LineFreeStats[4]++;
 		if (!inRange(box, ld) || BoxOnLineSide(box, ld) != -1)
 			continue;
 
@@ -461,6 +478,9 @@ FBlockNode *FBlockNode::Create(AActor *who, int x, int y, int group)
 	}
 	block->BlockIndex = x + y * who->Level->blockmap.bmapwidth;
 	block->Me = who;
+	block->X = who->X();
+	block->Y = who->Y();
+	block->Radius = who->radius;
 	block->NextActor = nullptr;
 	block->PrevActor = nullptr;
 	block->PrevBlock = nullptr;

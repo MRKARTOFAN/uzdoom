@@ -22,6 +22,7 @@
 */
 
 #include "hw_clipper.h"
+#include "hwrenderer/data/hw_clock.h"
 #include "g_levellocals.h"
 #include "basics.h"
 
@@ -120,6 +121,8 @@ void Clipper::SetSilhouette()
 
 bool Clipper::IsRangeVisible(angle_t startAngle, angle_t endAngle)
 {
+	const bool profile = ClipperProfiling;
+	if (profile) ++ClipperProfile.VisibilityCalls;
 	ClipNode *ci;
 	ci = cliphead;
 
@@ -127,6 +130,7 @@ bool Clipper::IsRangeVisible(angle_t startAngle, angle_t endAngle)
 
 	while (ci != NULL && ci->start < endAngle)
 	{
+		if (profile) ++ClipperProfile.VisibilityVisits;
 		if (startAngle >= ci->start && endAngle <= ci->end)
 		{
 			return false;
@@ -145,6 +149,8 @@ bool Clipper::IsRangeVisible(angle_t startAngle, angle_t endAngle)
 
 void Clipper::AddClipRange(angle_t start, angle_t end)
 {
+	const bool profile = ClipperProfiling;
+	if (profile) ++ClipperProfile.AddCalls;
 	ClipNode *node, *temp, *prevNode;
 
 	if (cliphead)
@@ -153,6 +159,7 @@ void Clipper::AddClipRange(angle_t start, angle_t end)
 		node = cliphead;
 		while (node != NULL && node->start < end)
 		{
+			if (profile) ++ClipperProfile.ContainmentVisits;
 			if (node->start >= start && node->end <= end)
 			{
 				temp = node;
@@ -173,6 +180,7 @@ void Clipper::AddClipRange(angle_t start, angle_t end)
 		node = cliphead;
 		while (node != NULL && node->start <= end)
 		{
+			if (profile) ++ClipperProfile.OverlapVisits;
 			if (node->end >= start)
 			{
 				// we found the first overlapping node
@@ -190,6 +198,7 @@ void Clipper::AddClipRange(angle_t start, angle_t end)
 				ClipNode *node2 = node->next;
 				while (node2 && node2->start <= node->end)
 				{
+					if (profile) ++ClipperProfile.MergeVisits;
 					if (node2->end > node->end) node->end = node2->end;
 					ClipNode *delnode = node2;
 					node2 = node2->next;
@@ -207,6 +216,7 @@ void Clipper::AddClipRange(angle_t start, angle_t end)
 
 		while (node != NULL && node->start < end)
 		{
+			if (profile) ++ClipperProfile.InsertVisits;
 			prevNode = node;
 			node = node->next;
 		}

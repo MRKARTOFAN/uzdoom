@@ -25,6 +25,8 @@
 
 EXTERN_CVAR(Int, r_distance_cull_type)
 
+FLightCallTrace* hw_LightTrace;
+
 //==========================================================================
 //
 // set current light color
@@ -32,9 +34,15 @@ EXTERN_CVAR(Int, r_distance_cull_type)
 //==========================================================================
 void SetColor(FRenderState &state, FLevelLocals* Level, ELightMode lightmode, int sectorlightlevel, int rellight, bool fullbright, const FColormap &cm, float alpha, bool weapon)
 {
+	if (hw_LightTrace)
+	{
+		hw_LightTrace->Color = { lightmode, sectorlightlevel, rellight, fullbright, weapon, cm, alpha };
+		hw_LightTrace->HasColor = true;
+		hw_LightTrace->FogLast = false;
+	}
 	if (fullbright)
 	{
-		state.SetColorAlpha(Color::str("#fff"), alpha, 0);
+		state.SetColorAlpha(Color::White, alpha, 0);
 		if (isSoftwareLighting(lightmode)) state.SetSoftLightLevel(255);
 		else state.SetNoSoftLightLevel();
 	}
@@ -92,6 +100,16 @@ void SetShaderLight(FRenderState &state, FLevelLocals* Level, float level, float
 
 void SetFog(FRenderState &state, FLevelLocals* Level, ELightMode lightmode, int lightlevel, int rellight, bool fullbright, const FColormap *cmap, bool isadditive)
 {
+	if (hw_LightTrace)
+	{
+		FColormap cm;
+		cm.Clear();
+		if (cmap) cm = *cmap;
+		hw_LightTrace->Fog = { lightmode, lightlevel, rellight, fullbright, cmap != nullptr, isadditive, cm };
+		hw_LightTrace->HasFog = true;
+		hw_LightTrace->FogLast = true;
+	}
+
 	PalEntry fogcolor;
 	float fogdensity;
 

@@ -68,6 +68,9 @@ void JitCompiler::EmitCALL()
 	pc += C; // Skip RESULTs
 }
 
+// [Karto] The JIT compiles at first call, so zs_direct_spawn only applies to code compiled afterwards.
+bool ZSDirectAllowed(const void* direct);
+
 void JitCompiler::EmitCALL_K()
 {
 	VMFunction *target = static_cast<VMFunction*>(konsta[A].v);
@@ -76,7 +79,7 @@ void JitCompiler::EmitCALL_K()
 	if (target && (target->VarFlags & VARF_Native))
 		ntarget = static_cast<VMNativeFunction *>(target);
 
-	if (ntarget && ntarget->DirectNativeCall)
+	if (ntarget && ntarget->DirectNativeCall && ZSDirectAllowed(ntarget->DirectNativeCall))
 	{
 		EmitNativeCall(ntarget);
 	}

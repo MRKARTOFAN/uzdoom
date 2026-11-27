@@ -34,15 +34,26 @@ inline int hw_ClampLight(int lightlevel)
 template<bool doClamp = true>
 inline int RescaleLightLevel(int lightlevel) // TODO/tidy: move out of hwrenderer namespace
 {
-	if constexpr(doClamp)
+	// [Karto] Fast-math inlining rounded the same sector differently in native walls and GPU source collection;
+	// integer scaling keeps truncation and exact identity at zero extra light.
+	const int level = doClamp ? clamp(lightlevel, 0, 255) : max(lightlevel, 0);
+	const int extra = r_extralight;
+	return max(int(int64_t(level) * (255 - extra) / 255) + extra, 0);
+}
+
+inline int CalcRelLight(int lightlevel, int orglightlevel, int rel)
+{
+	if (orglightlevel >= 253)			// with the software renderer fake contrast won't be visible above this.
 	{
-		//max is needed for negative r_extralight values
-		return max(int((clamp(lightlevel, 0, 255) / 255.0) * (255.0 - r_extralight)) + r_extralight, 0);
+		return 0;
+	}
+	else if (lightlevel - rel > 256)	// the brighter part of fake contrast will be clamped so also clamp the darker part by the same amount for better looks
+	{
+		return 256 - lightlevel + rel;
 	}
 	else
 	{
-		//max is needed for negative r_extralight values
-		return max(int((max(lightlevel, 0) / 255.0) * (255.0 - r_extralight)) + r_extralight, 0);
+		return rel;
 	}
 }
 

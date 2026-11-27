@@ -692,6 +692,9 @@ set( FASTMATH_SOURCES
 	rendering/hwrenderer/scene/hw_fakeflat.cpp
 	rendering/hwrenderer/scene/hw_decal.cpp
 	rendering/hwrenderer/scene/hw_drawinfo.cpp
+	rendering/hwrenderer/scene/hw_worldmode.cpp
+	rendering/hwrenderer/scene/hw_worldmode_walker.cpp
+	rendering/hwrenderer/scene/hw_spritecensus.cpp
 	rendering/hwrenderer/scene/hw_drawlist.cpp
 	rendering/hwrenderer/scene/hw_clipper.cpp
 	rendering/hwrenderer/scene/hw_flats.cpp
@@ -714,6 +717,7 @@ set (VULKAN_SOURCES
 	common/rendering/vulkan/system/vk_hwbuffer.cpp
 	common/rendering/vulkan/system/vk_buffer.cpp
 	common/rendering/vulkan/renderer/vk_renderstate.cpp
+	common/rendering/vulkan/renderer/vk_worldmode.cpp
 	common/rendering/vulkan/renderer/vk_renderpass.cpp
 	common/rendering/vulkan/renderer/vk_streambuffer.cpp
 	common/rendering/vulkan/renderer/vk_postprocess.cpp
@@ -778,6 +782,7 @@ else()
 endif()
 
 set (PCH_SOURCES
+	common/thirdparty/richpresence.cpp
 	am_map.cpp
 	playsim/bots/b_bot.cpp
 	playsim/bots/b_func.cpp
@@ -791,6 +796,11 @@ set (PCH_SOURCES
 	ct_chat.cpp
 	d_iwad.cpp
 	d_main.cpp
+	d_decoupleprobe.cpp
+	d_framestages.cpp
+	d_logiccensus.cpp
+	d_ticworkercheck.cpp
+	d_ticworker.cpp
 	d_defcvars.cpp
 	d_anonstats.cpp
 	d_net.cpp
@@ -878,6 +888,7 @@ set (PCH_SOURCES
 	playsim/p_secnodes.cpp
 	playsim/p_sectors.cpp
 	playsim/p_sight.cpp
+	playsim/p_islands.cpp
 	playsim/p_switch.cpp
 	playsim/p_tags.cpp
 	playsim/p_teleport.cpp
@@ -1246,7 +1257,6 @@ set( GAME_SOURCES
 	common/thirdparty/math/sqrt.c
 	common/thirdparty/math/tan.c
 	common/thirdparty/math/tanh.c
-	common/thirdparty/math/fastsin.cpp
 
 	common/filesystem/source/filesystem.cpp
 	common/filesystem/source/ancientzip.cpp

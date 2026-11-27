@@ -16,6 +16,8 @@
 #ifndef P_CHECKPOS_H
 #define P_CHECKPOS_H
 
+#include <memory>
+
 //============================================================================
 //
 // Used by P_CheckPosition and P_TryMove in place of the original
@@ -47,7 +49,13 @@ struct FCheckPosition
 	AActor			*stepthing;
 	// [RH] These are used by PIT_CheckThing and P_XYMovement to apply
 	// ripping damage once per tic instead of once per move.
-	TMap<AActor*, bool> LastRipped;
+	// [Karto] Created on first use: a TMap allocates when constructed, and P_Move builds an FCheckPosition per step.
+	std::unique_ptr<TMap<AActor*, bool>> LastRippedMap;
+	TMap<AActor*, bool>& LastRipped()
+	{
+		if (!LastRippedMap) LastRippedMap = std::make_unique<TMap<AActor*, bool>>();
+		return *LastRippedMap;
+	}
 	bool			DoRipping;
 	bool			portalstep;
 	bool			dropoffisportal;

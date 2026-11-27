@@ -221,6 +221,189 @@ struct StreamData
 	FVector4 padding1, padding2, padding3;
 };
 
+enum EShaderFeature
+{
+	SF_Desaturation = 1,
+	SF_TextureManipulation = 2,
+	SF_Doom64Colors = 4,
+	SF_Glow = 8,
+	SF_Lightmap = 16,
+	SF_DynamicLights = 32,
+	SF_All = 63
+};
+extern int ShaderFeaturesSeen;
+
+inline void NoteShaderFeatures(const StreamData &s, int lightIndex)
+{
+	int f = 0;
+	if (s.uDesaturationFactor != 0.0f) f |= SF_Desaturation;
+	if (s.uTextureAddColor.a != 0.0f) f |= SF_TextureManipulation;
+	if (s.uAddColor.r != 0.0f || s.uAddColor.g != 0.0f || s.uAddColor.b != 0.0f || s.uObjectColor2.a != 0.0f) f |= SF_Doom64Colors;
+	if (s.uGlowTopColor.W > 0.0f || s.uGlowBottomColor.W > 0.0f) f |= SF_Glow;
+	if (lightIndex >= 0) f |= SF_DynamicLights;
+	ShaderFeaturesSeen |= f;
+}
+
+struct HWWorldLightingState
+{
+	FVector4 VertexColor;
+	FVector4PalEntry FogColor;
+	FVector4 LightParameters;
+	PalEntry PackedFogColor;
+	float Desaturation;
+	uint8_t FogEnabled;
+
+	bool operator==(const HWWorldLightingState& other) const
+	{
+		return VertexColor == other.VertexColor && FogColor == other.FogColor &&
+			PackedFogColor == other.PackedFogColor && Desaturation == other.Desaturation &&
+			FogEnabled == other.FogEnabled && LightParameters.Z == other.LightParameters.Z &&
+			LightParameters.W == other.LightParameters.W && (!FogEnabled ||
+			(LightParameters.X == other.LightParameters.X && LightParameters.Y == other.LightParameters.Y));
+	}
+};
+
+// [Karto] Equal keys must produce identical fog/light state.
+struct FSharedAppearanceKey
+{
+	int LightMode;
+	int LightLevel;
+	int RelativeLight;
+	unsigned LightColor;
+	unsigned FadeColor;
+	int Desaturation;
+	int BlendFactor;
+	int FogDensity;
+	float Alpha;
+	int Additive;
+	int Fullbright;
+	int SoftwareLighting;
+	int FogMode;
+	int CullType;
+	int LevelFlags;
+	float CullDist;
+	unsigned CullColor;
+	unsigned OutsideFog;
+	int BrightFog;
+	int InSkybox;
+	const void* Level;
+	bool operator==(const FSharedAppearanceKey& other) const { return memcmp(this, &other, sizeof(*this)) == 0; }
+};
+
+struct FGpuStaticMaterial
+{
+	uint32_t TextureIDs[4] = {};
+	float TextureMatrix[16] = {};
+	float LightDistFactor[2] = {};
+	float Specular[2] = {};
+	float AlphaThreshold = 0.f;
+	float ShaderSpeed = 0.f;
+	uint32_t TextureMode = 0;
+	uint32_t FogEnabled = 0;
+	uint32_t Reserved = 0;
+	bool Valid = false;
+};
+
+struct FWorldCaptureDraw
+{
+	int Type = 0;
+	int Index = 0;
+	int Count = 0;
+	bool Indexed = false;
+	bool AlphaTest = false;
+	const void* Row = nullptr;
+	size_t RowBytes = 0;
+	int ScaleFlags = 0, ClampMode = 0, Translation = 0;
+	size_t TextureIDOffset = 0;	// where the row keeps its four texture IDs
+};
+
+struct FWorldCaptureSink
+{
+	enum ERefusal { RefuseMaterial, RefuseState, RefusePrimitive, RefuseVertexSource, RefuseCount };
+	virtual ~FWorldCaptureSink() = default;
+	virtual void Capture(const FWorldCaptureDraw& draw) = 0;
+	virtual void Refuse(ERefusal reason) = 0;
+};
+
+// [Karto] Opaque clusters precede alpha-tested ones.
+struct FWorldModeUpload
+{
+	const void* Vertices = nullptr;
+	size_t VertexCount = 0;
+	const float* SurfaceIDs = nullptr;
+	const uint32_t* Indices = nullptr;
+	size_t IndexCount = 0;
+	const void* Rows = nullptr;
+	size_t RowCount = 0;
+	size_t RowBytes = 0;
+	const uint32_t* ClusterFirstIndex = nullptr;
+	const uint32_t* ClusterIndexCount = nullptr;
+	uint32_t ClusterCount = 0;
+	uint32_t OpaqueClusters = 0;
+	const uint32_t* SurfaceRows = nullptr;
+	size_t SurfaceCount = 0;
+	uint32_t PoolClusterCapacity = 0;
+	// [Karto] Per surface: a parameter record index or UINT32_MAX. Record 0 holds the frame's interpolation fraction.
+	const uint32_t* SurfaceParams = nullptr;
+	const float* Params = nullptr;
+	size_t ParamCount = 0;
+	// [Karto] A surface reference with the top bit set names a sector plane's texture matrix instead.
+	const float* PlaneMatrices = nullptr;
+	size_t PlaneCount = 0;
+	const float* PlaneHeights = nullptr;
+	// [Karto] Per vertex: plane slots of its height and texture anchor, V scale and anchor z at production; UINT32_MAX =
+	// produced height.
+	const uint32_t* VertexRefs = nullptr;
+};
+
+struct FWorldModeLightPatch
+{
+	static constexpr int MaxRanges = 5;
+	struct { uint32_t Offset, Bytes; } Range[MaxRanges] = {};
+	uint8_t Data[64] = {};
+	int Count = 0;
+};
+
+constexpr uint32_t WorldModeLightCapacity = 1u << 20;
+
+struct FWorldModeWrite
+{
+	enum ETarget { Vertices, SurfaceIDs, Indices, Rows, SurfaceParams, Params, PlaneMatrices, PlaneHeights, VertexRefs, SurfaceLights,
+		WorldLights, TargetCount };
+	int Target = 0;
+	size_t Offset = 0;
+	size_t Bytes = 0;
+	const void* Data = nullptr;
+};
+
+struct FGpuParticleParams
+{
+	float ViewVector[2], TimeFrac, PixelStretch;
+	float Yaw, Pitch, ViewPos[2];
+	uint32_t Flags;			// 1 paused, 2 level frozen, 4 XY billboard, 8 face camera, 16 hw_force_cambbpref
+	int32_t Style;			// gl_particles_style
+	uint32_t EntryCount, Pad;	// Pad: 0 unlit, 1 lit with the entries' lights (5 words), 2 lit by the GPU light pass
+	uint32_t RecordCount, Spare;	// Pad 0 and 2: range records (FGpuParticleIndices)
+};
+
+// [Karto] Pad 1 entries carry their own particle indices; otherwise a record's first index, top bit set, reads the tic's
+// particle programs (re-uploaded only when ProgramVersion changes).
+struct FGpuParticleIndices
+{
+	const uint32_t* Program = nullptr;
+	uint32_t ProgramCount = 0;
+	uint64_t ProgramVersion = 0;
+	const uint16_t* Frame = nullptr;
+	uint32_t FrameCount = 0;
+};
+
+struct FGpuLightPack
+{
+	const uint32_t* Words = nullptr;
+	uint32_t Count = 0, Serial = 0;
+	bool Shadows = false;	// the pack asks for the shadow tree's ray test
+};
+
 class FRenderState
 {
 protected:
@@ -251,6 +434,9 @@ protected:
 
 	StreamData mStreamData = {};
 	PalEntry mFogColor;
+	const HWWorldLightingState* mDeferredWorldLighting = nullptr;
+	// [Karto] Shared-appearance row index; 0 means the legacy per-surface stream.
+	unsigned mAppearanceIndex = 0;
 
 	FRenderStyle mRenderStyle;
 
@@ -258,6 +444,7 @@ protected:
 	FDepthBiasState mBias;
 
 	IVertexBuffer *mVertexBuffer;
+	IVertexBuffer* mSecondaryVertexBuffer = nullptr;
 	int mVertexOffsets[2];	// one per binding point
 	IIndexBuffer *mIndexBuffer;
 
@@ -271,8 +458,70 @@ public:
 
 public:
 
+	HWWorldLightingState CaptureWorldLighting() const
+	{
+		if (mDeferredWorldLighting)
+		{
+			auto lighting = *mDeferredWorldLighting;
+			if (!lighting.FogEnabled)
+			{
+				lighting.LightParameters.X = mLightParms[0];
+				lighting.LightParameters.Y = mLightParms[1];
+			}
+			return lighting;
+		}
+		return { mStreamData.uVertexColor, mStreamData.uFogColor,
+			{ mLightParms[0], mLightParms[1], mLightParms[2], mLightParms[3] },
+			mFogColor, mStreamData.uDesaturationFactor, mFogEnabled };
+	}
+
+	void ApplyWorldLighting(const HWWorldLightingState& lighting)
+	{
+		ResolveWorldLighting();
+		mStreamData.uVertexColor = lighting.VertexColor;
+		mStreamData.uFogColor = lighting.FogColor;
+		mStreamData.uDesaturationFactor = lighting.Desaturation;
+		mFogColor = lighting.PackedFogColor;
+		mFogEnabled = lighting.FogEnabled;
+		// [Karto] Disabled fog leaves distance/factor untouched; replay must preserve that.
+		if (lighting.FogEnabled)
+		{
+			mLightParms[0] = lighting.LightParameters.X;
+			mLightParms[1] = lighting.LightParameters.Y;
+		}
+		mLightParms[2] = lighting.LightParameters.Z;
+		mLightParms[3] = lighting.LightParameters.W;
+	}
+
+	void DeferWorldLighting(const HWWorldLightingState& lighting)
+	{
+		if (!lighting.FogEnabled && mDeferredWorldLighting && mDeferredWorldLighting->FogEnabled)
+		{
+			mLightParms[0] = mDeferredWorldLighting->LightParameters.X;
+			mLightParms[1] = mDeferredWorldLighting->LightParameters.Y;
+		}
+		mDeferredWorldLighting = &lighting;
+	}
+
+	void ResolveWorldLighting()
+	{
+		if (!mDeferredWorldLighting) return;
+		const auto* lighting = mDeferredWorldLighting;
+		mDeferredWorldLighting = nullptr;
+		ApplyWorldLighting(*lighting);
+	}
+
+	void CopyWorldLighting(StreamData& stream) const
+	{
+		if (!mDeferredWorldLighting) return;
+		stream.uVertexColor = mDeferredWorldLighting->VertexColor;
+		stream.uFogColor = mDeferredWorldLighting->FogColor;
+		stream.uDesaturationFactor = mDeferredWorldLighting->Desaturation;
+	}
+
 	void Reset()
 	{
+		mDeferredWorldLighting = nullptr;
 		mTextureEnabled = true;
 		mBrightmapEnabled = mGradientEnabled = mFogEnabled = mGlowEnabled = false;
 		mFogColor = 0xffffffff;
@@ -307,6 +556,7 @@ public:
 		mColorMapFlash = 1;
 
 		mVertexBuffer = nullptr;
+		mSecondaryVertexBuffer = nullptr;
 		mVertexOffsets[0] = mVertexOffsets[1] = 0;
 		mIndexBuffer = nullptr;
 
@@ -339,14 +589,31 @@ public:
 		mStreamData.uVertexNormal = { x, y, z, 0.f };
 	}
 
+	void SetAppearanceIndex(unsigned index)
+	{
+		mAppearanceIndex = index;
+	}
+
+	virtual bool SelectSharedAppearance(const FSharedAppearanceKey& key) { return false; }
+	virtual void StoreSharedAppearance(const FSharedAppearanceKey& key) {}
+	virtual void UploadCoverage(const void* data, size_t bytes) {}
+	virtual void UploadStaticBake(const void* verts, size_t vertBytes, const void* indices, size_t indexBytes, const void* table, size_t tableBytes) {}
+	virtual void UploadPrimitiveGrid(const void* offsets, size_t offsetBytes, const void* refs, size_t refBytes) {}
+	virtual void UploadPrimitiveBounds(const void* bounds, size_t bytes) {}
+	virtual void UploadGpuCullAdmission(const void* rows, size_t bytes) {}
+	virtual void SetGpuCullPlanes(const float* planes24, uint32_t primCount, uint32_t expectedVisible, bool verify, bool forDraw, uint32_t commandCount = 0) {}
+	virtual void UploadPrimitiveMaterials(const void* rows, size_t bytes) {}
+
 	void SetColor(float r, float g, float b, float a = 1.f, int desat = 0)
 	{
+		ResolveWorldLighting();
 		mStreamData.uVertexColor = { r, g, b, a };
 		mStreamData.uDesaturationFactor = desat * (1.0f / 255.0f);
 	}
 
 	void SetColor(PalEntry pe, int desat = 0)
 	{
+		ResolveWorldLighting();
 		const float scale = 1.0f / 255.0f;
 		mStreamData.uVertexColor = { pe.r * scale, pe.g * scale, pe.b * scale, pe.a * scale };
 		mStreamData.uDesaturationFactor = desat * (1.0f / 255.0f);
@@ -354,6 +621,7 @@ public:
 
 	void SetColorAlpha(PalEntry pe, float alpha = 1.f, int desat = 0)
 	{
+		ResolveWorldLighting();
 		const float scale = 1.0f / 255.0f;
 		mStreamData.uVertexColor = { pe.r * scale, pe.g * scale, pe.b * scale, alpha };
 		mStreamData.uDesaturationFactor = desat * (1.0f / 255.0f);
@@ -361,6 +629,7 @@ public:
 
 	void ResetColor()
 	{
+		ResolveWorldLighting();
 		mStreamData.uVertexColor = { 1.0f, 1.0f, 1.0f, 1.0f };
 		mStreamData.uDesaturationFactor = 0.0f;
 	}
@@ -412,6 +681,7 @@ public:
 
 	void EnableFog(uint8_t on)
 	{
+		ResolveWorldLighting();
 		mFogEnabled = on;
 	}
 
@@ -468,12 +738,14 @@ public:
 
 	void SetSoftLightLevel(int llevel, int blendfactor = 0)
 	{
+		ResolveWorldLighting();
 		if (blendfactor == 0) mLightParms[3] = llevel / 255.f;
 		else mLightParms[3] = -1.f;
 	}
 
 	void SetNoSoftLightLevel()
 	{
+		ResolveWorldLighting();
 		 mLightParms[3] = -1.f;
 	}
 
@@ -550,6 +822,30 @@ public:
 			mStreamData.uTextureBlendColor = texfx->BlendColor;
 		}
 	}
+
+	bool CanBeginPreparedWallRun() const
+	{
+		// [Karto] A run may omit resets only when their exact post-state is already present.
+		static const FVector4PalEntry white = { 1.f, 1.f, 1.f, 1.f };
+		static const FVector4PalEntry zero = { 0.f, 0.f, 0.f, 0.f };
+		static const float disabled = 0.f;
+		if (!mTextureEnabled || mSpecialEffect != EFF_NONE || mGlowEnabled || mGradientEnabled || mSplitEnabled || mTextureClamp ||
+			memcmp(&mStreamData.uObjectColor, &white, sizeof(white)) ||
+			memcmp(&mStreamData.uObjectColor2, &zero, sizeof(zero)) ||
+			memcmp(&mStreamData.uAddColor, &zero, sizeof(zero)) ||
+			memcmp(&mStreamData.uTextureAddColor.a, &disabled, sizeof(disabled))) return false;
+#ifdef NPOT_EMULATION
+		static const FVector4 npot = { 0.f, 0.f, 0.f, 0.f };
+		if (memcmp(&mStreamData.uNpotEmulation, &npot, sizeof(npot))) return false;
+#endif
+		return true;
+	}
+
+	bool HasPreparedWallMaterial() const
+	{
+		return mMaterial.mMaterial && mMaterial.mOverrideShader <= 0 &&
+			mMaterial.mMaterial->GetShaderIndex() == 0 && !mMaterial.mMaterial->Source()->isHardwareCanvas();
+	}
 	void SetTextureColors(float* modColor, float* addColor, float* blendColor)
 	{
 		mStreamData.uTextureAddColor.SetFlt(addColor[0], addColor[1], addColor[2], addColor[3]);
@@ -559,6 +855,7 @@ public:
 
 	void SetFog(PalEntry c, float d)
 	{
+		ResolveWorldLighting();
 		const float LOG2E = 1.442692f;	// = 1/log(2)
 		mFogColor = c;
 		mStreamData.uFogColor = mFogColor;
@@ -567,13 +864,14 @@ public:
 
 	void SetLightParms(float f, float d)
 	{
+		ResolveWorldLighting();
 		mLightParms[1] = f;
 		mLightParms[0] = d;
 	}
 
 	PalEntry GetFogColor() const
 	{
-		return mFogColor;
+		return mDeferredWorldLighting ? mDeferredWorldLighting->PackedFogColor : mFogColor;
 	}
 
 	void AlphaFunc(int func, float thresh)
@@ -629,6 +927,7 @@ public:
 private:
 	void SetMaterial(FMaterial *mat, int clampmode, int translation, int overrideshader, PClass * cls)
 	{
+		mAppearanceIndex = 0;
 		mMaterial.mMaterial = mat;
 		mMaterial.mClampMode = clampmode;
 		mMaterial.mTranslation = translation;
@@ -680,10 +979,11 @@ public:
 		mClipSplit[1] = 1000000.f;
 	}
 
-	void SetVertexBuffer(IVertexBuffer *vb, int offset0, int offset1)
+	void SetVertexBuffer(IVertexBuffer *vb, int offset0, int offset1, IVertexBuffer* secondary = nullptr)
 	{
 		assert(vb);
 		mVertexBuffer = vb;
+		mSecondaryVertexBuffer = secondary;
 		mVertexOffsets[0] = offset0;
 		mVertexOffsets[1] = offset1;
 	}
@@ -741,7 +1041,75 @@ public:
 	// Draw commands
 	virtual void ClearScreen() = 0;
 	virtual void Draw(int dt, int index, int count, bool apply = true) = 0;
+	virtual void DrawOpaqueQuad(int index) { Draw(DT_TriangleFan, index, 4); }
+	virtual void DrawBatchedQuad(int index) { Draw(DT_TriangleFan, index, 4); }
+	// [Karto] Caller guarantees no state was set since its last DrawBatchedQuad.
+	virtual void DrawBatchedQuadSameState(int index) { DrawBatchedQuad(index); }
+	struct FIndirectFan
+	{
+		unsigned VertexIndex;
+		unsigned VertexCount;
+		int LightIndex;
+	};
+	virtual void DrawIndirectFans(const FIndirectFan* fans, int count)
+	{
+		for (int i = 0; i < count; ++i)
+		{
+			SetLightIndex(fans[i].LightIndex);
+			Draw(DT_TriangleFan, fans[i].VertexIndex, fans[i].VertexCount);
+		}
+	}
+	virtual void DrawRetainedQuad(int index) { Draw(DT_TriangleFan, index, 4); }
+	virtual void PrepareRetainedWallRun(bool changed, bool owned = false) {}
+	virtual bool SetRetainedWorldOwnership(bool enabled) { return false; }
+	virtual void DrawOwnedRetainedQuad(int index, uint64_t version) { DrawRetainedQuad(index); }
+	virtual void EndRetainedWallRun() {}
+	virtual void DrawRetainedTriangles(int index, int count, unsigned surface) { DrawIndexed(DT_Triangles, index, count); }
+	virtual bool DrawBakedPrimitive(uint32_t iboOffset, uint32_t indexCount) { return false; }
+	virtual bool BeginWorldCapture(FWorldCaptureSink* sink) { return false; }
+	virtual void EndWorldCapture() {}
+	virtual bool UploadWorldMode(const FWorldModeUpload& data) { return false; }
+	virtual void ReleaseWorldMode() {}
+	virtual bool SetWorldModeVisibility(const uint8_t* visible, uint32_t count) { return false; }
+	virtual bool SetWorldModePoolClusters(const uint32_t* firstIndex, const uint32_t* indexCount, uint32_t opaque, uint32_t total) { return false; }
+	virtual bool WriteWorldMode(const FWorldModeWrite* writes, size_t count) { return false; }
+	virtual bool GetWorldModeTextureIDs(const FMaterialState& state, uint32_t ids[4]) { return false; }
+	bool GetCurrentMaterialGpuIDs(uint32_t ids[4]) { return GetWorldModeTextureIDs(mMaterial, ids); }
+	virtual uint32_t AddSpriteRow() { return ~0u; }
+	virtual uint64_t GetGpuTextureEpoch() { return 0; }
+	virtual bool SupportsSpriteInstances() { return false; }
+	virtual bool ComputeSpriteLights(const uint32_t* instances, uint32_t instanceCount, uint32_t instanceWords, uint64_t instanceSerial,
+		const FGpuLightPack& pack) { return false; }
+	virtual bool DrawSpriteInstances(const uint32_t* instances, uint32_t instanceCount, uint32_t instanceWords, uint64_t instanceSerial,
+		const uint32_t* visible, uint32_t count, const uint32_t* frames, uint32_t frameWords, uint64_t frameVersion, const float* params,
+		uint32_t paramVec4s) { return false; }
+	// [Karto] The compute runs before this frame's draws; false leaves target unusable for this frame.
+	virtual bool SupportsParticleExpansion() { return false; }
+	virtual bool ExpandParticles(IVertexBuffer* target, const float* particles, uint32_t particleCount, uint64_t serial,
+		const uint32_t* entries, const float* ranges, uint32_t rangeCount, const FGpuParticleParams& params, const FGpuParticleIndices& indices,
+		const FGpuLightPack* lights) { return false; }
+	virtual void DrawWorldMode(bool alphaTest) {}
+	virtual bool DrawWorldModeVisibility() { return false; }
+	virtual bool GetWorldModeVisibility(const uint32_t*& stamps, size_t& count, uint32_t& stamp) { return false; }
+	virtual uint32_t PeekWorldModeStamp() { return 0; }
+	virtual bool GetWorldModeLightPatch(FWorldModeLightPatch& patch) { return false; }
+	// [Karto] Texture teardown invalidates baked bindless IDs; the bake must then be redone.
+	virtual bool IsWorldModeStale() { return false; }
+	virtual bool BeginGpuDrivenWalls() { return false; }
+	virtual void CaptureGpuStaticMaterial(FGpuStaticMaterial& out) {}
+	virtual bool DrawGpuDrivenWall(uint32_t slot, uint32_t bakeRow = UINT32_MAX) { return false; }
+	virtual bool HasGpuResidentAppearance(uint32_t id, uint64_t revision) const { return false; }
+	virtual void SetGpuResidentCapture(uint32_t id, uint64_t revision) {}
+	virtual bool DrawGpuResidentWall(uint32_t slot, uint32_t id, uint64_t revision) { return false; }
+	virtual void EndGpuResidentBatch() {}
+	virtual uint64_t GpuResidentDrawCount() const { return 0; }
+	virtual void EndGpuDrivenWalls() {}
+	virtual bool DrawGpuDrivenGeometry(uint32_t drawCount) { return false; }
+	virtual uint32_t GpuDrivenGeometryCount() const { return 0; }
 	virtual void DrawIndexed(int dt, int index, int count, bool apply = true) = 0;
+	virtual void DrawModelIndexed(int index, int count) { DrawIndexed(DT_Triangles, index, count); }
+	virtual void BeginGPUProfile(const char* name) {}
+	virtual void EndGPUProfile() {}
 
 	// Immediate render state change commands. These only change infrequently and should not clutter the render state.
 	virtual bool SetDepthClamp(bool on) = 0;					// Deactivated only by skyboxes.

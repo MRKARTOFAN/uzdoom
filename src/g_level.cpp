@@ -2407,6 +2407,7 @@ void FLevelLocals::Mark()
 
 	GC::Mark(SectorMarker);
 	GC::Mark(SpotState);
+	for (auto& candidate : RecreateCandidates) GC::Mark(candidate);
 	GC::Mark(FraggleScriptThinker);
 	GC::Mark(ACSThinker);
 	GC::Mark(ClientSideACSThinker);

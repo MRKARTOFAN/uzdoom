@@ -28,6 +28,36 @@
 #include "vulkan/renderer/vk_renderstate.h"
 #include "vulkan/renderer/vk_descriptorset.h"
 #include "engineerrors.h"
+#include "c_cvars.h"
+#include "c_dispatch.h"
+#include "printf.h"
+#include "i_time.h"
+
+CVAR(Bool, vk_streampool, true, 0)
+
+// [Karto] Transfer and draw command buffers share a queue but submission order alone does not publish copied indices to index
+// fetch.
+static void PublishIndexUpload(VulkanCommandBuffer* commands, VulkanBuffer* buffer, VkBufferUsageFlags type)
+{
+	if (type & VK_BUFFER_USAGE_INDEX_BUFFER_BIT)
+	{
+		PipelineBarrier()
+			.AddBuffer(buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_INDEX_READ_BIT)
+			.Execute(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT);
+	}
+	if (type & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
+	{
+		PipelineBarrier()
+			.AddBuffer(buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT)
+			.Execute(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT);
+	}
+	if (type & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+	{
+		PipelineBarrier()
+			.AddBuffer(buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT)
+			.Execute(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+	}
+}
 
 VkHardwareBuffer::VkHardwareBuffer(VulkanRenderDevice* fb) : fb(fb)
 {
@@ -60,6 +90,23 @@ void VkHardwareBuffer::SetData(size_t size, const void *data, BufferUsageType us
 {
 	size_t bufsize = max(size, (size_t)16); // For supporting zero byte buffers
 
+	// [Karto] Uniform buffers stay unpooled: a rounded-up size could exceed maxUniformBufferRange.
+	const bool pooled = usage == BufferUsageType::Stream && vk_streampool && !(mBufferType & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+	if (pooled && mBuffer && mStaging && !mPersistent)
+	{
+		VkBufferManager::StreamPair pair;
+		pair.Buffer = std::move(mBuffer);
+		pair.Staging = std::move(mStaging);
+		pair.Usage = mBufferType;
+		fb->GetBufferManager()->RetireStream(std::move(pair));
+	}
+	// [Karto] A persistent buffer stays mapped from its creation; retiring it mapped leaves its allocation's map count up,
+	// which VMA asserts on when the delete list frees it.
+	if (mBuffer && mPersistent && map)
+	{
+		mBuffer->Unmap();
+		map = nullptr;
+	}
 	// If SetData is called multiple times we have to keep the old buffers alive as there might still be draw commands referencing them
 	if (mBuffer)
 	{
@@ -76,17 +123,32 @@ void VkHardwareBuffer::SetData(size_t size, const void *data, BufferUsageType us
 
 		mPersistent = false;
 
-		mBuffer = BufferBuilder()
-			.Usage(VK_BUFFER_USAGE_TRANSFER_DST_BIT | mBufferType, VMA_MEMORY_USAGE_GPU_ONLY)
-			.Size(bufsize)
-			.DebugName(usage == BufferUsageType::Static ? "VkHardwareBuffer.Static" : "VkHardwareBuffer.Stream")
-			.Create(fb->device.get());
+		VkBufferManager::StreamPair pair;
+		if (pooled && fb->GetBufferManager()->AcquireStream(mBufferType, bufsize, pair))
+		{
+			mBuffer = std::move(pair.Buffer);
+			mStaging = std::move(pair.Staging);
+		}
+		else
+		{
+			size_t allocsize = bufsize;
+			if (pooled)
+			{
+				allocsize = 4096;
+				while (allocsize < bufsize) allocsize *= 2;
+			}
+			mBuffer = BufferBuilder()
+				.Usage(VK_BUFFER_USAGE_TRANSFER_DST_BIT | mBufferType, VMA_MEMORY_USAGE_GPU_ONLY)
+				.Size(allocsize)
+				.DebugName(usage == BufferUsageType::Static ? "VkHardwareBuffer.Static" : "VkHardwareBuffer.Stream")
+				.Create(fb->device.get());
 
-		mStaging = BufferBuilder()
-			.Usage(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY)
-			.Size(bufsize)
-			.DebugName(usage == BufferUsageType::Static ? "VkHardwareBuffer.Staging.Static" : "VkHardwareBuffer.Staging.Stream")
-			.Create(fb->device.get());
+			mStaging = BufferBuilder()
+				.Usage(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY)
+				.Size(allocsize)
+				.DebugName(usage == BufferUsageType::Static ? "VkHardwareBuffer.Staging.Static" : "VkHardwareBuffer.Staging.Stream")
+				.Create(fb->device.get());
+		}
 
 		if (data)
 		{
@@ -95,7 +157,8 @@ void VkHardwareBuffer::SetData(size_t size, const void *data, BufferUsageType us
 			mStaging->Unmap();
 		}
 
-		fb->GetCommands()->GetTransferCommands()->copyBuffer(mStaging.get(), mBuffer.get());
+		fb->GetCommands()->GetTransferCommands()->copyBuffer(mStaging.get(), mBuffer.get(), 0, 0, bufsize);
+		PublishIndexUpload(fb->GetCommands()->GetTransferCommands(), mBuffer.get(), mBufferType);
 	}
 	else if (usage == BufferUsageType::Persistent)
 	{
@@ -142,6 +205,9 @@ void VkHardwareBuffer::SetSubData(size_t offset, size_t size, const void *data)
 {
 	size = max(size, (size_t)16); // For supporting zero byte buffers
 
+	// [Karto] Both paths rewrite storage in place that a parked frame may still read.
+	fb->GetCommands()->WaitForPendingFrame();
+
 	if (mStaging)
 	{
 		void *dst = mStaging->Map(offset, size);
@@ -149,6 +215,7 @@ void VkHardwareBuffer::SetSubData(size_t offset, size_t size, const void *data)
 		mStaging->Unmap();
 
 		fb->GetCommands()->GetTransferCommands()->copyBuffer(mStaging.get(), mBuffer.get(), offset, offset, size);
+		PublishIndexUpload(fb->GetCommands()->GetTransferCommands(), mBuffer.get(), mBufferType);
 	}
 	else
 	{
@@ -181,6 +248,7 @@ void VkHardwareBuffer::Resize(size_t newsize)
 
 	// Transfer data from old to new
 	fb->GetCommands()->GetTransferCommands()->copyBuffer(oldBuffer.get(), mBuffer.get(), 0, 0, oldsize);
+	PublishIndexUpload(fb->GetCommands()->GetTransferCommands(), mBuffer.get(), mBufferType);
 	fb->GetCommands()->TransferDeleteList->Add(std::move(oldBuffer));
 	fb->GetCommands()->WaitForCommands(false);
 	fb->GetDescriptorSetManager()->UpdateHWBufferSet(); // Old buffer may be part of the bound descriptor set
@@ -217,6 +285,8 @@ void *VkHardwareBuffer::Lock(unsigned int size)
 	}
 	else if (!mPersistent)
 	{
+		// [Karto] Relocking maps the live buffer in place; the parked frame may still read it.
+		fb->GetCommands()->WaitForPendingFrame();
 		map = mBuffer->Map(0, size);
 	}
 	return map;

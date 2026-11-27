@@ -27,6 +27,8 @@
 #include "hw_weapon.h"
 #include "hw_drawlist.h"
 
+bool hw_IsLineDistanceCulled(const line_t* line, const DVector2& viewpoint, double cullDistanceSquared);
+
 enum EDrawMode
 {
 	DM_MAINVIEW,
@@ -108,10 +110,55 @@ enum DrawListType
 
 	GLDL_TRANSLUCENT,
 	GLDL_TRANSLUCENTBORDER,
+	GLDL_SOLIDSPRITES,
+	GLDL_ADDSPRITES,
+	GLDL_ALPHASPRITES,
+	GLDL_PARTICLES,
+	GLDL_SOLIDPARTICLES,
+	GLDL_ADDPARTICLES,
 
 	GLDL_TYPES,
 };
 
+
+bool WorldModeActive(FLevelLocals* level);
+int WorldModeCullMode();
+bool WorldModeSnapshotThings(FLevelLocals* level, const sector_t* sector, const struct FSnapshotThing*& listed, uint32_t& listedCount,
+	AActor* const*& portal, uint32_t& portalCount);
+AActor* WorldModeLiveActor(AActor* actor);
+player_t* WorldModeRenderPlayer(int pnum);
+int WorldModePlayerIndex(const player_t* player);
+struct FPlayerBob;
+const FPlayerBob& WorldModePlayerBob(const player_t* player);
+sector_t* WorldModePublishedSector(sector_t* sector);
+int WorldModeInterpolationSkip(FLevelLocals* level);
+void WorldModeMarkLine(FLevelLocals* level, int index);
+void WorldModeMarkSubsector(FLevelLocals* level, int index);
+void WorldModeMarkSector(FLevelLocals* level, int index);
+void WorldModeApplyMapFlags(FLevelLocals* level);
+int WorldModeFrameTic(FLevelLocals* level);
+struct FLightGrid;
+struct FDynamicLight;
+struct particle_t;
+class DVisualThinker;
+FLightGrid* WorldModeLightGrid(FLevelLocals* level);
+int WorldModeFrameTimer(FLevelLocals* level);
+void WorldModePublishedLights(FLevelLocals* level, FDynamicLight* const*& lights, int& count);
+uint32_t WorldModeGpuSpriteSerial();
+FDynamicLight* WorldModePublishedLight(FDynamicLight* light);
+constexpr uint32_t GpuParticleWords = 12;
+bool WorldModeGpuParticleData(FLevelLocals* level, const float*& data, uint32_t& count, uint64_t& serial);
+bool WorldModeSubsectorParticles(FLevelLocals* level, const subsector_t* sub, particle_t*& particles, int& first,
+	DVisualThinker* const*& visuals, unsigned& visualCount);
+bool WorldModeSideEffectsDue(FLevelLocals* level, bool mainView);
+void WorldModeWalkerWait();
+void WorldModeWalkerStop();
+bool WorldModeAutomapFromWalker();
+bool WorldModeOpenSectors(FLevelLocals* level, const uint8_t*& open, DVector2& from);
+bool WorldModeWalkSectors(FLevelLocals* level, const uint8_t*& entered);
+void ForgetWorldMode();
+struct FGpuParticleIndices;
+void GpuParticleProgramStore(FGpuParticleIndices& out);
 
 struct HWDrawInfo
 {
@@ -151,6 +198,8 @@ struct HWDrawInfo
 	bool isNightvision() const { return !!(FullbrightFlags & Nightvision); }
 	bool isStealthVision() const { return !!(FullbrightFlags & StealthVision); }
 
+	unsigned OwnedNextOrder = 1;
+	bool OwnOpaqueWalls = false;
 	HWDrawList drawlists[GLDL_TYPES];
 	int vpIndex;
 	ELightMode lightmode;
@@ -161,6 +210,18 @@ struct HWDrawInfo
 	std::atomic<int> spriteindex;
 	HWPortal *mClipPortal;
 	HWPortal *mCurrentPortal;
+	bool GpuSprites = false;
+	// [Karto] Instances the BSP traversal reached (filled by the render job thread), per blend class.
+	std::vector<int32_t> GpuSpriteVisible[3];
+	bool UseGpuSprites();
+	struct FGpuParticleRange { uint32_t First, Count; };
+	static constexpr uint32_t GpuParticleProgramRange = 1u << 31;
+	bool GpuParticles = false;
+	uint64_t GpuParticleSerial = 0;	// the published particles' serial this scene draws
+	std::vector<FGpuParticleRange> GpuParticleRanges;
+	std::vector<uint16_t> GpuParticleIndices;	// per range, First..First+Count: the leader, then its followers
+	bool UseGpuParticles();
+	void DrawGpuSprites(FRenderState &state, int blend);
 	//FRotator mAngles;
 	Clipper *mClipper;
 	Clipper *vClipper; // Vertical clipper
@@ -201,6 +262,7 @@ struct HWDrawInfo
 	area_t	in_area;
 	fixed_t viewx, viewy;	// since the nodes are still fixed point, keeping the view position  also fixed point for node traversal is faster.
 	bool multithread;
+	const void* BakeSweptLevel = nullptr;
 
 private:
 	// For ProcessLowerMiniseg
@@ -223,8 +285,10 @@ private:
 	void AddLines(subsector_t * sub, sector_t * sector);
 	void AddSpecialPortalLines(subsector_t * sub, sector_t * sector, linebase_t *line);
 	public:
+	bool UseActorSnapshot = false;
 	void RenderThings(subsector_t * sub, sector_t * sector);
 	void RenderParticles(subsector_t *sub, sector_t *front);
+	void RenderGpuParticles(particle_t* particles, int first, sector_t* front, subsector_t* sub);
 	void DoSubsector(subsector_t * sub);
 	int SetupLightsForOtherPlane(subsector_t * sub, FDynLightData &lightdata, const secplane_t *plane);
 	int CreateOtherPlaneVertices(subsector_t *sub, const secplane_t *plane);
@@ -258,6 +322,17 @@ public:
 	void RenderBSPNode(void *node);
 	void RenderOrthoNoFog();
 	void RenderBSP(void *node, bool drawpsprites);
+	void GPUBakeSweepWalls();
+	void BakeWorldMode();
+	void UpdateWorldMode(bool publish = false);
+	void ReplayWorldModeSky();
+	void ReplayWorldModeHorizons();
+	void ReplayWorldModeTranslucentWalls();
+	void CullWorldMode(FRenderState& state);
+	void CollectWorldModeSprites();
+	void CollectWorldModeMissingTextures();
+	void DrawWorldModeVisibilityPass(FRenderState& state);
+	void WorldModeWalkerFrame();
 
 	static HWDrawInfo *StartDrawInfo(FLevelLocals *lev, HWDrawInfo *parent, FRenderViewpoint &parentvp, HWViewpointUniforms *uniforms);
 	void StartScene(FRenderViewpoint &parentvp, HWViewpointUniforms *uniforms);
@@ -271,6 +346,7 @@ public:
 	void RenderScene(FRenderState &state);
 	void RenderTranslucent(FRenderState &state);
 	void RenderPortal(HWPortal *p, FRenderState &state, bool usestencil);
+	void RenderLateSkyPortal(HWPortal *p, FRenderState &state);
 	void EndDrawScene(sector_t * viewsector, FRenderState &state);
 	void DrawEndScene2D(sector_t * viewsector, FRenderState &state);
 	void Set3DViewport(FRenderState &state);
@@ -311,6 +387,7 @@ public:
 
 	void GetDynSpriteLight(AActor *self, float x, float y, float z, FSection *sec, int portalgroup, float *out);
 	void GetDynSpriteLight(AActor *thing, particle_t *particle, float *out);
+	void GetDynSpriteLight(const struct FSpriteRecord& record, float *out);
 
 	void PreparePlayerSprites(sector_t * viewsector, area_t in_area);
 	void PrepareTargeterSprites(double ticfrac);
@@ -330,7 +407,7 @@ public:
 	void ProcessLowerMinisegs(TArray<seg_t *> &lowersegs);
 	void AddSubsectorToPortal(FSectorPortalGroup *portal, subsector_t *sub);
 
-	void AddWall(HWWall *w);
+	void AddWall(HWWall *w, bool retained = false, unsigned order = 0, unsigned part = 0, bool ownedBatch = false);
 	void AddMirrorSurface(HWWall *w);
 	void AddFlat(HWFlat *flat, bool fog);
 	void AddSprite(HWSprite *sprite, bool translucent);
@@ -378,3 +455,11 @@ bool CheckFog(FLevelLocals* Level, sector_t* frontsector, sector_t* backsector, 
 void SetColor(FRenderState& state, FLevelLocals* Level, ELightMode lightmode, int sectorlightlevel, int rellight, bool fullbright, const FColormap& cm, float alpha, bool weapon = false);
 void SetShaderLight(FRenderState& state, FLevelLocals* Level, float level, float olight);
 void SetFog(FRenderState& state, FLevelLocals* Level, ELightMode lightmode, int lightlevel, int rellight, bool fullbright, const FColormap* cmap, bool isadditive);
+
+struct FLightCallTrace
+{
+	struct { ELightMode Mode; int Level, Rel; bool Fullbright, Weapon; FColormap Cm; float Alpha; } Color = {};
+	struct { ELightMode Mode; int Level, Rel; bool Fullbright, HasCm, Additive; FColormap Cm; } Fog = {};
+	bool HasColor = false, HasFog = false, FogLast = false;
+};
+extern FLightCallTrace* hw_LightTrace;

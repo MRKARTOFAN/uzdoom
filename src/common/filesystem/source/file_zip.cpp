@@ -22,6 +22,8 @@
 **
 */
 
+#include <atomic>
+#include <mutex>
 #include <time.h>
 #include <stdexcept>
 #include <cstdint>
@@ -344,6 +346,12 @@ FCompressedBuffer FZipFile::GetRawData(uint32_t entry)
 //
 //==========================================================================
 
+extern thread_local bool mainThread;
+
+// [Karto] The tic worker opens lumps too; skipping the local header seeks the archive's shared handle, which would
+// corrupt a concurrent main-thread read, and two first-time openers could both add the header length.
+static std::mutex ZipEntryAddressLock;
+
 void FZipFile::SetEntryAddress(uint32_t entry)
 {
 	// This file is inside a zip and has not been opened before.
@@ -352,10 +360,27 @@ void FZipFile::SetEntryAddress(uint32_t entry)
 	FZipLocalFileHeader localHeader;
 	int skiplen;
 
-	Reader.Seek(Entries[entry].Position, FileReader::SeekSet);
-	Reader.Read(&localHeader, sizeof(localHeader));
+	std::lock_guard<std::mutex> lock(ZipEntryAddressLock);
+	if (!(Entries[entry].Flags & RESFF_NEEDFILESTART)) return;
+	if (mainThread)
+	{
+		Reader.Seek(Entries[entry].Position, FileReader::SeekSet);
+		Reader.Read(&localHeader, sizeof(localHeader));
+	}
+	else if (auto buf = Reader.GetBuffer())
+	{
+		memcpy(&localHeader, buf + Entries[entry].Position, sizeof(localHeader));
+	}
+	else
+	{
+		FileReader own;
+		own.OpenFile(FileName, Entries[entry].Position, sizeof(localHeader));
+		own.Read(&localHeader, sizeof(localHeader));
+	}
 	skiplen = LittleShort(localHeader.NameLength) + LittleShort(localHeader.ExtraLength);
 	Entries[entry].Position += sizeof(localHeader) + skiplen;
+	// [Karto] A thread that finds the flag clear without the lock must also see the position.
+	std::atomic_thread_fence(std::memory_order_release);
 	Entries[entry].Flags &= ~RESFF_NEEDFILESTART;
 }
 

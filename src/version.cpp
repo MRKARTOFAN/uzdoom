@@ -92,7 +92,10 @@ int GetGitDistance()
 VersionInfo GetCurrentVersionForUpdater()
 {
 	static VersionInfo version = ([]() {
-		VersionInfo v = VersionInfo{GIT_DESCRIPTION};
+		// [Karto] Fork tags carry a name prefix (acid-5.1.0-pre); the version number starts at the first digit.
+		const char* description = GIT_DESCRIPTION;
+		while (*description && (*description < '0' || *description > '9')) description++;
+		VersionInfo v = VersionInfo{description};
 		assert(v.major == VER_MAJOR);
 		assert(v.minor == VER_MINOR);
 		assert(v.revision == VER_REVISION);

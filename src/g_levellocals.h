@@ -50,6 +50,121 @@
 
 EXTERN_CVAR(Bool, sv_autocompat)
 
+// Light grid stuff
+constexpr double CELL_SIZE = 256;
+constexpr int MAX_CELL_LIGHTS = 50;
+constexpr int RESERVE_CELLS = 64; // The average Doom map is ~4000x4000 DU. Reserve about double.
+
+struct FLightGridCell
+{
+	TArray<FDynamicLight*> lights;
+
+	void AddLight(FDynamicLight *light)
+	{
+		if (!light || lights.Size() >= MAX_CELL_LIGHTS)
+			return;
+
+		lights.AddUnique(light);
+	}
+
+	void RemoveLight(FDynamicLight *light)
+	{
+		if (!light)
+			return;
+
+		unsigned index = lights.Find(light);
+		if (index != lights.Size())
+		{
+			lights.Delete(index);
+		}
+	}
+};
+
+struct FLightGrid
+{
+	absl::flat_hash_map<uint64_t, FLightGridCell> cells;
+
+	FLightGrid()
+	{
+		cells.reserve(RESERVE_CELLS);
+	}
+
+	static int WorldToCell(double coord)
+	{
+		return static_cast<int32_t>(std::floor(coord / CELL_SIZE));
+	}
+
+	static uint64_t MakeCellKey(int x, int y)
+	{
+		return (uint64_t(uint32_t(x)) << 32) | uint32_t(y);
+	}
+
+
+	FLightGridCell* GetCellAtXY(double x, double y)
+	{
+		int cellX = WorldToCell(x);
+		int cellY = WorldToCell(y);
+
+		auto it = cells.find(MakeCellKey(cellX, cellY));
+		if (it == cells.end())
+			return nullptr;
+
+		return &it->second;
+	}
+	FLightGridCell* GetOrCreateCellAtXY(double x, double y)
+	{
+		int cellX = WorldToCell(x);
+		int cellY = WorldToCell(y);
+
+		auto [it, inserted] =
+			cells.try_emplace(MakeCellKey(cellX, cellY));
+
+		return &it->second;
+	}
+
+
+	FLightGridCell* GetCellFromKey(uint64_t cellKey)
+	{
+		auto it = cells.find(cellKey);
+		if (it == cells.end())
+			return nullptr;
+
+		return &it->second;
+	}
+	FLightGridCell* GetOrCreateCellFromKey(uint64_t cellKey)
+	{
+		auto [it, inserted] =
+			cells.try_emplace(cellKey);
+
+		return &it->second;
+	}
+
+
+	void AddLightToCell(uint64_t cellKey, FDynamicLight *light)
+	{
+		FLightGridCell *cell = GetOrCreateCellFromKey(cellKey);
+
+		if (cell)
+		{
+			cell->AddLight(light);
+		}
+	}
+	void RemoveLightFromCell(uint64_t cellKey, FDynamicLight *light)
+	{
+		FLightGridCell *cell = GetCellFromKey(cellKey);
+
+		if (cell)
+		{
+			cell->RemoveLight(light);
+
+			if (!cell->lights.Size())
+			{
+				cells.erase(cellKey);
+			}
+		}
+	}
+};
+
 //============================================================================
 //
 // This is used to mark processed portals for some collection functions.
@@ -491,6 +606,9 @@ public:
 	TArray<seg_t *> segbuffer;	// contains the seg links for the sidedefs.
 	TArray<seg_t> segs;
 	TArray<subsector_t> subsectors;
+	int IslandCount = 0;
+	TArray<uint8_t> ClosetIslands;
+	bool SightIslands = false;
 	TArray<node_t> nodes;
 	TArray<subsector_t> gamesubsectors;
 	TArray<node_t> gamenodes;
@@ -737,7 +855,7 @@ public:
 	uint32_t			InactiveParticles;
 	TArray<particle_t>	Particles;
 	TArray<uint16_t>	ParticlesInSubsec;
-	FThinkerCollection Thinkers;
+	FThinkerCollection Thinkers { true };
 	FThinkerCollection ClientSideThinkers;
 	TArray<DThinker*> TravellingThinkers;
 
@@ -772,6 +890,16 @@ public:
 
 	int                LocalWorldTimer = 0;	// For client-sided actions that are still bound to world processing.
 	int                LocalTimer = 0;		// For client-sided actions independent of any world state.
+	// [Karto] Actors that may need the end-of-tic light/effect pass. Not saved: invalid after a load, then the pass walks every actor.
+	TArray<TObjPtr<AActor*>> RecreateCandidates;
+	uint32_t RecreateSerial = 1;
+	bool RecreateListValid = false;
+	bool RecreateTicked = false;
+	// [Karto] Candidates of the last ticked pass for the client passes after it; dropped so it never outlives a GC step.
+	TArray<TObjPtr<AActor*>> RecreateReplay;
+	uint32_t RecreateReplaySerial = 0;
+	bool RecreateReplayValid = false;
+	FLightGrid         lightgrid;
 
 	FDynamicLight *lights;
 	DVisualThinker* VisualThinkerHead = nullptr;

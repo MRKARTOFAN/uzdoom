@@ -159,6 +159,8 @@ FSerializer &Serialize(FSerializer &arc, const char *key, side_t &side, side_t *
 			//("index", side.Index)
 			("attacheddecals", side.AttachedDecals)
 			.EndObject();
+		// [Karto] The runtime invalidation counter is never serialized, so reading bumps it.
+		if (arc.isReading()) ++side.TextureTransformVersion;
 	}
 	return arc;
 }
@@ -908,6 +910,7 @@ void FLevelLocals::SpawnExtraPlayers()
 void FLevelLocals::Serialize(FSerializer &arc, bool hubload)
 {
 	int i = totaltime;
+	if (arc.isReading()) RecreateListValid = RecreateReplayValid = false;
 
 	if (arc.isWriting())
 	{
@@ -1046,6 +1049,7 @@ void FLevelLocals::Serialize(FSerializer &arc, bool hubload)
 		localEventManager->SetOwnerForHandlers();	// This cannot be automated.
 		RecreateAllAttachedLights();
 		InitPortalGroups(this);
+		blockmap.DropMirrorUnless(Displacements.size <= 1);
 
 		auto it = GetThinkerIterator<DImpactDecal>(NAME_None, STAT_AUTODECAL);
 		ImpactDecalCount = 0;

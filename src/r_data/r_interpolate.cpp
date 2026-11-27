@@ -46,6 +46,8 @@ class DSectorPlaneInterpolation : public DInterpolation
 	bool ceiling;
 	TArray<DInterpolation *> attached;
 
+	friend bool R_PlaneInterpolationStart(sector_t* sector, bool ceiling, double& d, double& texz);
+
 
 public:
 
@@ -55,6 +57,7 @@ public:
 	void UpdateInterpolation();
 	void Restore();
 	void Interpolate(double smoothratio);
+	bool Retired() override;
 
 	virtual void Serialize(FSerializer &arc);
 	size_t PropagateMark();
@@ -74,6 +77,7 @@ class DSectorScrollInterpolation : public DInterpolation
 	double oldx, oldy;
 	double bakx, baky;
 	bool ceiling;
+	friend bool R_ScrollInterpolationStart(sector_t* sector, bool ceiling, double& x, double& y);
 
 public:
 
@@ -83,6 +87,7 @@ public:
 	void UpdateInterpolation();
 	void Restore();
 	void Interpolate(double smoothratio);
+	bool Retired() override;
 
 	virtual void Serialize(FSerializer &arc);
 };
@@ -111,6 +116,7 @@ public:
 	void UpdateInterpolation();
 	void Restore();
 	void Interpolate(double smoothratio);
+	bool Retired() override;
 
 	virtual void Serialize(FSerializer &arc);
 };
@@ -233,23 +239,59 @@ void FInterpolator::RemoveInterpolation(DInterpolation *interp)
 //
 //==========================================================================
 
-void FInterpolator::DoInterpolations(double smoothratio)
+bool SideRenderInterpolating = false;
+
+bool R_PlaneInterpolationStart(sector_t* sector, bool ceiling, double& d, double& texz)
+{
+	DInterpolation* interp = sector->interpolations[ceiling ? sector_t::CeilingMove : sector_t::FloorMove].ForceGet();
+	if (interp == nullptr || !interp->IsKindOf(RUNTIME_CLASS(DSectorPlaneInterpolation))) return false;
+	auto plane = static_cast<DSectorPlaneInterpolation*>(interp);
+	d = plane->oldheight;
+	texz = plane->oldtexz;
+	return true;
+}
+
+bool R_ScrollInterpolationStart(sector_t* sector, bool ceiling, double& x, double& y)
+{
+	DInterpolation* interp = sector->interpolations[ceiling ? sector_t::CeilingScroll : sector_t::FloorScroll].ForceGet();
+	if (interp == nullptr || !interp->IsKindOf(RUNTIME_CLASS(DSectorScrollInterpolation))) return false;
+	auto scroll = static_cast<DSectorScrollInterpolation*>(interp);
+	x = scroll->oldx;
+	y = scroll->oldy;
+	return true;
+}
+
+static int InterpolationKind(DInterpolation* probe)
+{
+	if (probe->IsKindOf(RUNTIME_CLASS(DSectorPlaneInterpolation))) return ISKIP_Planes;
+	if (probe->IsKindOf(RUNTIME_CLASS(DSectorScrollInterpolation))) return ISKIP_FlatScroll;
+	if (probe->IsKindOf(RUNTIME_CLASS(DWallScrollInterpolation))) return ISKIP_WallScroll;
+	if (probe->IsKindOf(RUNTIME_CLASS(DPolyobjInterpolation))) return ISKIP_Polyobj;
+	return ISKIP_Other;
+}
+
+void FInterpolator::DoInterpolations(double smoothratio, int skip)
 {
 	if (smoothratio >= 1.)
 	{
 		didInterp = false;
+		frac = 1.;
 		return;
 	}
 
 	didInterp = true;
+	frac = smoothratio;
 
+	SideRenderInterpolating = true;
 	DInterpolation *probe = Head;
 	while (probe != nullptr)
 	{
 		DInterpolation *next = probe->Next;
-		probe->Interpolate(smoothratio);
+		probe->Skipped = skip != 0 && (InterpolationKind(probe) & skip) != 0;
+		if (!probe->Skipped) probe->Interpolate(smoothratio);
 		probe = next;
 	}
+	SideRenderInterpolating = false;
 }
 
 //==========================================================================
@@ -258,15 +300,29 @@ void FInterpolator::DoInterpolations(double smoothratio)
 //
 //==========================================================================
 
+void FInterpolator::RetireSkipped(int skip)
+{
+	for (DInterpolation *probe = Head; probe != nullptr;)
+	{
+		DInterpolation *next = probe->Next;
+		if (InterpolationKind(probe) & skip) probe->Retired();
+		probe = next;
+	}
+}
+
 void FInterpolator::RestoreInterpolations()
 {
 	if (didInterp)
 	{
 		didInterp = false;
+		frac = 1.;
+		SideRenderInterpolating = true;
 		for (DInterpolation *probe = Head; probe != nullptr; probe = probe->Next)
 		{
-			probe->Restore();
+			if (probe->Skipped) probe->Skipped = false;
+			else probe->Restore();
 		}
+		SideRenderInterpolating = false;
 	}
 }
 
@@ -467,6 +523,20 @@ void DSectorPlaneInterpolation::Restore()
 //
 //==========================================================================
 
+bool DSectorPlaneInterpolation::Retired()
+{
+	const int pos = ceiling ? sector_t::ceiling : sector_t::floor;
+	bakheight = (ceiling ? sector->ceilingplane : sector->floorplane).fD();
+	baktexz = sector->GetPlaneTexZ(pos);
+	if (refcount == 0 && oldheight == bakheight)
+	{
+		UnlinkFromMap();
+		Destroy();
+		return true;
+	}
+	return false;
+}
+
 void DSectorPlaneInterpolation::Interpolate(double smoothratio)
 {
 	secplane_t *pplane;
@@ -483,15 +553,7 @@ void DSectorPlaneInterpolation::Interpolate(double smoothratio)
 		pos = sector_t::ceiling;
 	}
 
-	bakheight = pplane->fD();
-	baktexz = sector->GetPlaneTexZ(pos);
-
-	if (refcount == 0 && oldheight == bakheight)
-	{
-		UnlinkFromMap();
-		Destroy();
-	}
-	else
+	if (!Retired())
 	{
 		pplane->setD(oldheight + (bakheight - oldheight) * smoothratio);
 		sector->SetPlaneTexZ(pos, oldtexz + (baktexz - oldtexz) * smoothratio, true);
@@ -606,17 +668,22 @@ void DSectorScrollInterpolation::Restore()
 //
 //==========================================================================
 
-void DSectorScrollInterpolation::Interpolate(double smoothratio)
+bool DSectorScrollInterpolation::Retired()
 {
 	bakx = sector->GetXOffset(ceiling);
 	baky = sector->GetYOffset(ceiling, false);
-
 	if (refcount == 0 && oldx == bakx && oldy == baky)
 	{
 		UnlinkFromMap();
 		Destroy();
+		return true;
 	}
-	else
+	return false;
+}
+
+void DSectorScrollInterpolation::Interpolate(double smoothratio)
+{
+	if (!Retired())
 	{
 		sector->SetXOffset(ceiling, oldx + (bakx - oldx) * smoothratio);
 		sector->SetYOffset(ceiling, oldy + (baky - oldy) * smoothratio);
@@ -706,17 +773,22 @@ void DWallScrollInterpolation::Restore()
 //
 //==========================================================================
 
-void DWallScrollInterpolation::Interpolate(double smoothratio)
+bool DWallScrollInterpolation::Retired()
 {
 	bakx = side->GetTextureXOffset(part);
 	baky = side->GetTextureYOffset(part);
-
 	if (refcount == 0 && oldx == bakx && oldy == baky)
 	{
 		UnlinkFromMap();
 		Destroy();
+		return true;
 	}
-	else
+	return false;
+}
+
+void DWallScrollInterpolation::Interpolate(double smoothratio)
+{
+	if (!Retired())
 	{
 		side->SetTextureXOffset(part, oldx + (bakx - oldx) * smoothratio);
 		side->SetTextureYOffset(part, oldy + (baky - oldy) * smoothratio);

@@ -23,6 +23,8 @@
 
 // HEADER FILES ------------------------------------------------------------
 
+#include <chrono>
+#include <thread>
 #include "c_cvars.h"
 #include "i_net.h"
 #include "i_soundinternal.h"
@@ -118,6 +120,11 @@
 #include "wi_stuff.h"
 #include "wipe.h"
 #include "zwidget/window/window.h"
+#include "d_framestages.h"
+#include "r_data/r_interpolate.h"
+#include "d_ticworker.h"
+
+void SpriteDumpEndFrame();
 
 #ifdef __unix__
 #include "i_system.h"  // for SHARE_DIR
@@ -359,6 +366,7 @@ void M_SaveDefaultsFinal();
 void R_Shutdown();
 void I_ShutdownInput();
 void SetConsoleNotifyBuffer();
+void I_UpdateDiscordPresence(bool SendPresence, const char* details, const char* state, const char* largetext, const char* appid);
 bool M_SetSpecialMenu(FName& menu, int param);	// game specific checks
 
 const FIWADInfo *D_FindIWAD(TArray<FString> &wadfiles, const char *iwad, const char *basewad);
@@ -507,14 +515,14 @@ CVAR(Bool, autoloadbrightmaps, true, CVAR_ARCHIVE | CVAR_NOINITCALL | CVAR_GLOBA
 CVAR(Bool, autoloadlights, true, CVAR_ARCHIVE | CVAR_NOINITCALL | CVAR_GLOBALCONFIG)
 CVAR(Bool, autoloadwidescreen, true, CVAR_ARCHIVE | CVAR_NOINITCALL | CVAR_GLOBALCONFIG)
 CVAR(Bool, r_debug_disable_vis_filter, false, 0)
+CVAR(Int, r_gpu_driven_test_phase_ms, -1, 0)
 CVAR(Int, vid_showpalette, 0, 0)
 
-/*
-CUSTOM_CVAR (Bool, i_discordrpc, false, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
+// [Karto] Not i_discordrpc: UZDoom builds that still read it crash with it on, and they share this global config.
+CUSTOM_CVAR (Bool, i_discordpresence, true, CVAR_ARCHIVE | CVAR_GLOBALCONFIG | CVAR_NOINITCALL)
 {
 	I_UpdateWindowTitle();
 }
-*/
 
 CUSTOM_CVAR(Int, I_FriendlyWindowTitle, 1, CVAR_GLOBALCONFIG|CVAR_ARCHIVE|CVAR_NOINITCALL)
 {
@@ -609,6 +617,10 @@ CVAR(Float, m_yaw, 1.f, CVAR_GLOBALCONFIG | CVAR_ARCHIVE)
 //
 //==========================================================================
 
+// [Karto] Frames of a publish skip DoInterpolations, which writes interpolator.frac, so they set the fraction
+// themselves.
+CVAR(Bool, r_worldmode_blendfrac, true, 0)
+
 void D_Render(std::function<void()> action, bool interpolate)
 {
 	for (auto Level : AllLevels())
@@ -619,15 +631,24 @@ void D_Render(std::function<void()> action, bool interpolate)
 			Level->HasDynamicLights = Level->lights || Level->LightProbes.Size() > 0;
 		}
 		else Level->HasDynamicLights = false;	// lights are off so effectively we have none.
-		if (interpolate) Level->interpolator.DoInterpolations(I_GetTimeFrac());
-		P_FindParticleSubsectors(Level);
-		PO_LinkToSubsectors(Level);
+		const int skip = WorldModeInterpolationSkip(Level);
+		// [Karto] A frame that skips every kind would apply nothing, so it does not walk the interpolator's
+		// list at all (the worker adds and removes interpolations while the frame draws).
+		if (interpolate && skip != ISKIP_All) Level->interpolator.DoInterpolations(R_RenderTicFrac(), skip);
+		else if (skip == ISKIP_All && r_worldmode_blendfrac) Level->interpolator.frac = interpolate ? std::min(R_RenderTicFrac(), 1.0) : 1.0;
+		// [Karto] Frames of a published tic draw the particle lists linked at publish, and polyobjects are
+		// relinked at the publish too (TryRunTics), not while the worker moves them.
+		if (skip == 0)
+		{
+			P_FindParticleSubsectors(Level);
+			PO_LinkToSubsectors(Level);
+		}
 	}
 	action();
 
 	if (interpolate) for (auto Level : AllLevels())
 	{
-		Level->interpolator.RestoreInterpolations();
+		if (WorldModeInterpolationSkip(Level) != ISKIP_All) Level->interpolator.RestoreInterpolations();
 	}
 }
 
@@ -1114,6 +1135,7 @@ static void DrawOverlays()
 
 static void End2DAndUpdate()
 {
+	FFrameStageScope stage(FS_Update);
 	twod->End();
 	CheckBench();
 	screen->Update();
@@ -1259,13 +1281,98 @@ STAT_OFF(rendergraph_center)
 //
 //==========================================================================
 
+static void D_DrawHudLayer(double ticFrac)
+{
+	if (!automapactive || viewactive)
+	{
+		StatusBar->RefreshViewBorder ();
+	}
+	if (hud_althud && viewheight == SCREENHEIGHT && screenblocks > 10)
+	{
+		StatusBar->DrawBottomStuff (HUD_AltHud);
+		if (DrawFSHUD || automapactive) StatusBar->DrawAltHUD();
+		if (players[consoleplayer].camera && players[consoleplayer].camera->player && !automapactive)
+		{
+			StatusBar->DrawCrosshair(ticFrac);
+		}
+		StatusBar->CallDraw (HUD_AltHud, ticFrac);
+		StatusBar->DrawTopStuff (HUD_AltHud);
+	}
+	else if (viewheight == SCREENHEIGHT && (viewactive || (am_match_statusbar && automapactive)) && screenblocks > 10)
+	{
+		EHudState state = DrawFSHUD ? HUD_Fullscreen : HUD_None;
+		StatusBar->DrawBottomStuff (state);
+		StatusBar->CallDraw (state, ticFrac);
+		StatusBar->DrawTopStuff (state);
+	}
+	else
+	{
+		StatusBar->DrawBottomStuff (HUD_StatusBar);
+		StatusBar->CallDraw (HUD_StatusBar, ticFrac);
+		StatusBar->DrawTopStuff (HUD_StatusBar);
+	}
+}
+
+// [Karto] Drawn once per publish, while play state is the tic's; frames replay it instead of running HUD code against
+// live state.
+static F2DDrawer HudRecord;
+static FLevelLocals* HudLevel = nullptr;
+static int HudStartTime = -1, HudMapTime = -1, HudWidth = 0, HudHeight = 0;
+EXTERN_CVAR(Bool, r_worldmode_snapshot)
+
+extern bool DecouplePublishHeld;
+
+void D_RecordHud()
+{
+	if (DecouplePublishHeld) return;
+	HudLevel = nullptr;
+	if (!r_worldmode_snapshot || gamestate != GS_LEVEL || StatusBar == nullptr || primaryLevel == nullptr || screen == nullptr ||
+		hud_toggled || automapactive) return;
+	const player_t* player = &players[consoleplayer];
+	// [Karto] Status bars read the rendered view's camera (DrawCrosshair: r_viewpoint.camera->health). A publish can come
+	// before any view of the level was set up, which crashed a mod's HUD with r_worldmode 0.
+	if (gameaction != ga_nothing || gametic == 0 || primaryLevel->maptime == 0 || player->mo == nullptr || player->camera == nullptr ||
+		StatusBar->CPlayer != player || r_viewpoint.camera == nullptr) return;
+	F2DDrawer* frameDrawer = twod;
+	HudRecord.Clear();
+	twod = &HudRecord;
+	twod->ClearClipRect();
+	twod->Begin(screen->GetWidth(), screen->GetHeight());
+	D_DrawHudLayer(1.0);
+	twod->End();
+	twod = frameDrawer;
+	HudLevel = primaryLevel;
+	HudStartTime = primaryLevel->starttime;
+	HudMapTime = primaryLevel->maptime;
+	HudWidth = screen->GetWidth();
+	HudHeight = screen->GetHeight();
+}
+
+static bool D_ReplayHud()
+{
+	if (HudLevel != primaryLevel || HudLevel == nullptr || HudStartTime != primaryLevel->starttime || HudMapTime != WorldModeFrameTic(primaryLevel) ||
+		HudWidth != screen->GetWidth() || HudHeight != screen->GetHeight() || automapactive) return false;
+	const int vertexBase = twod->mVertices.Size(), indexBase = twod->mIndices.Size();
+	twod->mVertices.Append(HudRecord.mVertices);
+	for (int index : HudRecord.mIndices) twod->mIndices.Push(index + vertexBase);
+	for (auto command : HudRecord.mData)
+	{
+		command.mVertIndex += vertexBase;
+		command.mIndexIndex += indexBase;
+		twod->mData.Push(command);
+	}
+	return true;
+}
+
 void D_Display ()
 {
 	FTexture *wipestart = nullptr;
 	int wipe_type;
 	sector_t *viewsec;
 
-	GC::CheckGC();
+	// [Karto] A frame drawn from the publish must not step the GC (it rewrites object links and colours
+	// of play objects); TryRunTics steps it every loop iteration anyway, at the publish side of the frame.
+	if (primaryLevel == nullptr || WorldModeInterpolationSkip(primaryLevel) == 0) GC::CheckGC();
 
 	SetDeltaTime();
 
@@ -1296,7 +1403,7 @@ void D_Display ()
 		DAngle fov = DAngle::fromDeg(90.);
 		AActor *cam = players[consoleplayer].camera;
 		if (cam)
-			fov = DAngle::fromDeg(cam->GetFOV(I_GetTimeFrac()));
+			fov = DAngle::fromDeg(cam->GetFOV(R_RenderTicFrac()));
 
 		R_SetFOV(vp, fov);
 	}
@@ -1367,8 +1474,17 @@ void D_Display ()
 	}
 
 	screen->FrameTime = I_msTimeFS();
+	static uint64_t testFrameEpoch = 0;
+	static bool testFrameClock = false;
+	if (r_gpu_driven_test_phase_ms >= 0 && gamestate == GS_LEVEL)
+	{
+		if (!testFrameClock) testFrameEpoch = screen->FrameTime;
+		testFrameClock = true;
+		screen->FrameTime = std::min<uint64_t>(screen->FrameTime, testFrameEpoch + uint64_t(r_gpu_driven_test_phase_ms));
+	}
+	else testFrameClock = false;
 	TexAnim.UpdateAnimations(screen->FrameTime);
-	R_UpdateSky(I_GetTimeFrac());
+	R_UpdateSky(R_RenderTicFrac());
 	screen->BeginFrame();
 	twod->ClearClipRect();
 	if ((gamestate == GS_LEVEL || gamestate == GS_TITLELEVEL) && gametic != 0)
@@ -1377,9 +1493,18 @@ void D_Display ()
 		//E_RenderFrame();
 		//
 
+		const bool drawAutomap = automapactive && !hud_toggled;
+		const int automapBottom = !drawAutomap ? 0 : viewheight == SCREENHEIGHT && (hud_althud || am_match_statusbar) ? viewheight :
+			StatusBar->GetTopOfStatusbar();
 		D_Render([&]()
 		{
-			viewsec = RenderView(&players[consoleplayer]);
+			player_t* player = WorldModeRenderPlayer(consoleplayer);
+			if (drawAutomap && !viewactive && automapBottom >= viewwindowy + viewheight)
+			{
+				R_SetupFrame(r_viewpoint, r_viewwindow, player->camera);
+				viewsec = r_viewpoint.sector;
+			}
+			else viewsec = RenderView(player);
 		}, true);
 
 		twod->Begin(screen->GetWidth(), screen->GetHeight());
@@ -1387,52 +1512,12 @@ void D_Display ()
 		{
 			V_DrawBlend(viewsec);
 
-			if (automapactive)
+			if (drawAutomap)
 			{
-				if (viewheight == SCREENHEIGHT && (hud_althud || am_match_statusbar))
-				{
-					primaryLevel->automap->Drawer (viewheight);
-				}
-				else
-				{
-					primaryLevel->automap->Drawer (StatusBar->GetTopOfStatusbar());
-				}
+				primaryLevel->automap->Drawer(automapBottom);
 			}
 
-			// for timing the statusbar code.
-			//cycle_t stb;
-			//stb.Reset();
-			//stb.Clock();
-			if (!automapactive || viewactive)
-			{
-				StatusBar->RefreshViewBorder ();
-			}
-			if (hud_althud && viewheight == SCREENHEIGHT && screenblocks > 10)
-			{
-				StatusBar->DrawBottomStuff (HUD_AltHud);
-				if (DrawFSHUD || automapactive) StatusBar->DrawAltHUD();
-				if (players[consoleplayer].camera && players[consoleplayer].camera->player && !automapactive)
-				{
-					StatusBar->DrawCrosshair(vp.TicFrac);
-				}
-				StatusBar->CallDraw (HUD_AltHud, vp.TicFrac);
-				StatusBar->DrawTopStuff (HUD_AltHud);
-			}
-			else if (viewheight == SCREENHEIGHT && (viewactive || (am_match_statusbar && automapactive)) && screenblocks > 10)
-			{
-				EHudState state = DrawFSHUD ? HUD_Fullscreen : HUD_None;
-				StatusBar->DrawBottomStuff (state);
-				StatusBar->CallDraw (state, vp.TicFrac);
-				StatusBar->DrawTopStuff (state);
-			}
-			else
-			{
-				StatusBar->DrawBottomStuff (HUD_StatusBar);
-				StatusBar->CallDraw (HUD_StatusBar, vp.TicFrac);
-				StatusBar->DrawTopStuff (HUD_StatusBar);
-			}
-			//stb.Unclock();
-			//Printf("Stbar = %f\n", stb.TimeMS());
+			if (!D_ReplayHud()) D_DrawHudLayer(vp.TicFrac);
 		}
 	}
 	else
@@ -1594,6 +1679,41 @@ void D_ErrorCleanup ()
 //
 //==========================================================================
 
+void TicWorkerSettleForEvents();
+void TicWorkerRequeueEvents();
+
+CVAR(Int, r_test_framedelay, 0, 0)
+CVAR(Float, m_test_turn, 0.f, 0)
+EXTERN_CVAR(Float, m_yaw)
+
+static void TestMouseTurn()
+{
+	static uint64_t lastNS = 0;
+	static double carry = 0;
+	const uint64_t now = I_nsTime();
+	if (m_test_turn == 0 || lastNS == 0 || gamestate != GS_LEVEL || menuactive != MENU_Off || paused)
+	{
+		lastNS = now;
+		carry = 0;
+		return;
+	}
+	// [Karto] Carried in G_AddViewAngle's units: whole mouse units stall the turn at high frame rates.
+	carry += m_test_turn * m_yaw * 16.0 * double(now - lastNS) / 1e9;
+	lastNS = now;
+	const int turn = int(carry);
+	carry -= turn;
+	if (turn != 0) G_AddViewAngle(turn, true);
+}
+
+CCMD(test_key)
+{
+	if (argv.argc() != 3) return;
+	event_t ev{};
+	ev.type = atoi(argv[2]) ? EV_KeyDown : EV_KeyUp;
+	ev.data1 = atoi(argv[1]);
+	D_PostEvent(&ev);
+}
+
 void D_DoomLoop ()
 {
 	int lasttic = 0;
@@ -1619,13 +1739,23 @@ void D_DoomLoop ()
 				I_StartFrame ();
 			}
 			I_SetFrameTime();
+			FrameStagesFrameStart();
 
 			TryRunTics (); // will run at least one tic
 			// Update display, next frame, with current state.
 			I_StartTic ();
+			TicWorkerSettleForEvents();
 			D_ProcessEvents();
-			D_Display ();
+			TicWorkerRequeueEvents();
+			TestMouseTurn();
+			{
+				FFrameStageScope stage(FS_Display);
+				D_Display ();
+			}
+			SpriteDumpEndFrame();
+			if (r_test_framedelay > 0) std::this_thread::sleep_for(std::chrono::milliseconds(*r_test_framedelay));
 			S_UpdateMusic();
+			FrameStagesFrameEnd();
 
 			if (gameloop_abort)
 			{
@@ -2315,9 +2445,9 @@ static FString ParseGameInfo(std::vector<FileSys::ResourceName> &pwads, const ch
 			GameStartupInfo.LoadWidescreen = !!sc.Number;
 		}
 		else if (!nextKey.CompareNoCase("DISCORDAPPID"))
-		{ // TODO readd discordrpc with better library
+		{
 			sc.MustGetString();
-			//GameStartupInfo.DiscordAppId = sc.String;
+			GameStartupInfo.DiscordAppId = sc.String;
 		}
 		else if (!nextKey.CompareNoCase("STEAMAPPID"))
 		{
@@ -3884,6 +4014,7 @@ static int D_InitGame(const FIWADInfo* iwad_info, std::vector<FileSys::ResourceN
 	InitActorNumsFromMapinfo();
 	InitSpawnablesFromMapinfo();
 	PClassActor::StaticSetActorNums();
+	FState::StaticBuildStateOwnerTable();
 
 	//Added by MC:
 	primaryLevel->BotInfo.getspawned.Clear();
@@ -4290,7 +4421,6 @@ static int D_DoomMain_Internal (void)
 		}
 		lastIWAD = iwad;
 
-		/*
 		if (GameStartupInfo.DiscordAppId.GetChars())
 		{
 			const char* check = GameStartupInfo.DiscordAppId.GetChars();
@@ -4308,7 +4438,6 @@ static int D_DoomMain_Internal (void)
 			if (failedcheck)
 				GameStartupInfo.DiscordAppId = "";
 		}
-		*/
 
 		if (GameStartupInfo.SteamAppId.GetChars())
 		{
@@ -4381,8 +4510,135 @@ void SignalHandler(int signal)
 	}
 }
 
+#ifdef _WIN32
+// [Karto] Test-only (UZDOOM_HEAPTRACE=<file>): records the thread that detects heap corruption, using kernel calls only
+// because the heap is no longer usable.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <csignal>
+
+static wchar_t HeapTraceFile[MAX_PATH];
+
+static void HeapTraceWrite(HANDLE file, const char* text)
+{
+	DWORD written;
+	WriteFile(file, text, DWORD(strlen(text)), &written, nullptr);
+}
+
+static void HeapTraceStack(HANDLE file)
+{
+	char line[160];
+	void* frames[62];
+	const USHORT count = CaptureStackBackTrace(0, 62, frames, nullptr);
+	for (USHORT i = 0; i < count; i++)
+	{
+		HMODULE owner = nullptr;
+		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)frames[i], &owner);
+		char path[MAX_PATH] = "";
+		if (owner != nullptr) GetModuleFileNameA(owner, path, MAX_PATH);
+		wsprintfA(line, "frame %u %p module=%p ", unsigned(i), frames[i], (void*)owner);
+		HeapTraceWrite(file, line);
+		HeapTraceWrite(file, path);
+		HeapTraceWrite(file, "\r\n");
+	}
+}
+
+// [Karto] abort() (an uncaught exception's terminate, a CRT check) ends the process with code 3 and raises no
+// exception for the handler below; its stack is all there is to go on.
+static void HeapTraceAbort(int)
+{
+	HANDLE file = CreateFileW(HeapTraceFile, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE) return;
+	char line[160];
+	wsprintfA(line, "HEAPTRACE abort thread=%lu base=%p\r\n", GetCurrentThreadId(), (void*)GetModuleHandleW(nullptr));
+	HeapTraceWrite(file, line);
+	HeapTraceStack(file);
+	CloseHandle(file);
+}
+
+static LONG CALLBACK HeapTraceHandler(EXCEPTION_POINTERS* info)
+{
+	const DWORD code = info->ExceptionRecord->ExceptionCode;
+	// [Karto] Every error-class exception and breakpoints (an inlined assert): the engine's own crash catcher turns any
+	// of them into ExitFatally, whose shutdown can fail on its own and hide the first one.
+	if (code < 0xC0000000 && code != 0x80000003) return EXCEPTION_CONTINUE_SEARCH;
+	HANDLE file = CreateFileW(HeapTraceFile, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE) return EXCEPTION_CONTINUE_SEARCH;
+	char line[160];
+	const HMODULE module = GetModuleHandleW(nullptr);
+	wsprintfA(line, "HEAPTRACE code=%08lx thread=%lu base=%p at=%p\r\n", code, GetCurrentThreadId(), (void*)module,
+		info->ExceptionRecord->ExceptionAddress);
+	HeapTraceWrite(file, line);
+	HeapTraceStack(file);
+	for (DWORD i = 0; i < info->ExceptionRecord->NumberParameters && i < 4; i++)
+	{
+		wsprintfA(line, "param %lu %p\r\n", i, (void*)info->ExceptionRecord->ExceptionInformation[i]);
+		HeapTraceWrite(file, line);
+	}
+	if (code == 0xC0000374 && info->ExceptionRecord->NumberParameters > 0)
+	{
+		const void* const* record = (const void* const*)info->ExceptionRecord->ExceptionInformation[0];
+		for (int i = 0; i < 16; i++)
+		{
+			wsprintfA(line, "failure%02d %p\r\n", i, record[i]);
+			HeapTraceWrite(file, line);
+		}
+		HANDLE heaps[64];
+		const DWORD heapCount = GetProcessHeaps(64, heaps);
+		for (DWORD i = 0; i < heapCount && i < 64; i++)
+		{
+			HMODULE owner = nullptr;
+			wsprintfA(line, "heap %lu %p%s\r\n", i, heaps[i], heaps[i] == GetProcessHeap() ? " (process)" : "");
+			HeapTraceWrite(file, line);
+		}
+	}
+	PROCESS_HEAP_ENTRY entry{}, last{};
+	unsigned entries = 0;
+	while (HeapWalk(GetProcessHeap(), &entry))
+	{
+		if (entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) last = entry;
+		++entries;
+	}
+	wsprintfA(line, "heapwalk entries=%u error=%lu last_busy=%p size=%lu\r\n", entries, GetLastError(), last.lpData, DWORD(last.cbData));
+	HeapTraceWrite(file, line);
+	if (last.lpData)
+	{
+		const uint8_t* bytes = (const uint8_t*)last.lpData;
+		const DWORD dump = DWORD(last.cbData < 96 ? last.cbData + 32 : 128);
+		for (DWORD i = 0; i < dump; i += 16)
+		{
+			wsprintfA(line, "  +%03lx %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\r\n", i,
+				bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3], bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7],
+				bytes[i + 8], bytes[i + 9], bytes[i + 10], bytes[i + 11], bytes[i + 12], bytes[i + 13], bytes[i + 14], bytes[i + 15]);
+			HeapTraceWrite(file, line);
+		}
+		const void* const* words = (const void* const*)last.lpData;
+		for (DWORD i = 0; i < 4 && i * sizeof(void*) < last.cbData; i++)
+		{
+			wsprintfA(line, "  word%lu %p\r\n", i, words[i]);
+			HeapTraceWrite(file, line);
+		}
+	}
+	CloseHandle(file);
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void InstallHeapTrace()
+{
+	const DWORD n = GetEnvironmentVariableW(L"UZDOOM_HEAPTRACE", HeapTraceFile, MAX_PATH);
+	if (n == 0 || n >= MAX_PATH) return;
+	AddVectoredExceptionHandler(1, HeapTraceHandler);
+	signal(SIGABRT, HeapTraceAbort);
+}
+#else
+static void InstallHeapTrace() {}
+#endif
+
 int GameMain()
 {
+	InstallHeapTrace();
 	// On Windows, prefer the native win32 backend.
 	// On other platforms, use SDL until the other backends are more mature.
 	auto zwidget = DisplayBackend::TryCreateWin32();
@@ -4423,6 +4679,9 @@ int GameMain()
 		I_ShowFatalError(error.what());
 		ret = -1;
 	}
+	// [Karto] Cleanup frees the level and the renderer; the tic worker must not be inside a tic then. A quit normally
+	// arrives between tics, but nothing else guarantees it, so the join makes sure.
+	TicWorkerShutdown();
 	// Unless something really bad happened, the game should only exit through this single point in the code.
 	// No more 'exit', please.
 	D_Cleanup();
@@ -4503,7 +4762,7 @@ void D_Cleanup()
 	GameStartupInfo.Name = "";
 	GameStartupInfo.BkColor = GameStartupInfo.FgColor = GameStartupInfo.Type = 0;
 	GameStartupInfo.LoadWidescreen = GameStartupInfo.LoadLights = GameStartupInfo.LoadBrightmaps = -1;
-	//GameStartupInfo.DiscordAppId = "";
+	GameStartupInfo.DiscordAppId = "";
 	GameStartupInfo.SteamAppId = "";
 
 	GC::FullGC();					// clean up before taking down the object list.
@@ -4521,6 +4780,7 @@ void D_Cleanup()
 		p.PendingWeapon = nullptr;
 	}
 	PClassActor::AllActorClasses.Clear();
+	FState::StaticClearStateOwnerTable();
 	ScriptUtil::Clear();
 	PClass::StaticShutdown();
 
@@ -4576,31 +4836,9 @@ DEFINE_FIELD_X(InputEventData, event_t, data3)
 DEFINE_FIELD_X(InputEventData, event_t, x)
 DEFINE_FIELD_X(InputEventData, event_t, y)
 
-void I_UpdateWindowTitle()
+// Strip out any color escape sequences
+static void StripColorEscapes(char* dstp, const char* srcp)
 {
-	FString titlestr;
-	switch (I_FriendlyWindowTitle)
-	{
-	case 1:
-		if (level.LevelName.IsNotEmpty())
-		{
-			titlestr.Format("%s - %s", level.LevelName.GetChars(), GameStartupInfo.Name.GetChars());
-			break;
-		}
-		[[fallthrough]];
-	case 2:
-		titlestr = GameStartupInfo.Name;
-		break;
-	default:
-		I_SetWindowTitle(NULL);
-		return;
-	}
-
-	// Strip out any color escape sequences before setting a window title
-	TArray<char> copy(titlestr.Len() + 1);
-	const char* srcp = titlestr.GetChars();
-	char* dstp = copy.Data();
-
 	while (*srcp != 0)
 	{
 
@@ -4621,6 +4859,62 @@ void I_UpdateWindowTitle()
 		}
 	}
 	*dstp = 0;
+}
+
+// [Karto] Fixed buffers, not FString temporaries: level loads on the tic worker call this, and FString copies share a refcount.
+static void D_UpdateDiscordPresence()
+{
+	if (!i_discordpresence)
+	{
+		I_UpdateDiscordPresence(false, nullptr, nullptr, nullptr, nullptr);
+		return;
+	}
+
+	char raw[512], game[512], details[512], state[512] = "";
+	snprintf(raw, sizeof(raw), "%s", GameStartupInfo.Name.GetChars());
+	StripColorEscapes(game, raw);
+	if ((gamestate == GS_LEVEL || gamestate == GS_INTERMISSION) && level.MapName.IsNotEmpty())
+	{
+		if (level.LevelName.IsNotEmpty())
+			snprintf(raw, sizeof(raw), "%s: %s", level.MapName.GetChars(), level.LevelName.GetChars());
+		else
+			snprintf(raw, sizeof(raw), "%s", level.MapName.GetChars());
+		StripColorEscapes(details, raw);
+
+		const char* wad = level.lumpnum >= 0 ? fileSystem.GetResourceFileName(fileSystem.GetFileContainer(level.lumpnum)) : nullptr;
+		snprintf(state, sizeof(state), "%s", wad ? wad : "");
+	}
+	else
+	{
+		strcpy(details, game);
+	}
+	I_UpdateDiscordPresence(true, details, state, game, GameStartupInfo.DiscordAppId.GetChars());
+}
+
+void I_UpdateWindowTitle()
+{
+	D_UpdateDiscordPresence();
+
+	FString titlestr;
+	switch (I_FriendlyWindowTitle)
+	{
+	case 1:
+		if (level.LevelName.IsNotEmpty())
+		{
+			titlestr.Format("%s - %s", level.LevelName.GetChars(), GameStartupInfo.Name.GetChars());
+			break;
+		}
+		[[fallthrough]];
+	case 2:
+		titlestr = GameStartupInfo.Name;
+		break;
+	default:
+		I_SetWindowTitle(NULL);
+		return;
+	}
+
+	TArray<char> copy(titlestr.Len() + 1);
+	StripColorEscapes(copy.Data(), titlestr.GetChars());
 	I_SetWindowTitle(copy.Data());
 }
 

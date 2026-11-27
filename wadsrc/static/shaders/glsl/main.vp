@@ -25,6 +25,10 @@ BonesResult ApplyBones();
 
 void main()
 {
+	#ifdef RETAINED_WORLD
+		retainedSurfaceID = uint(aSurfaceID) + uint(retainedPush.uDataIndex);
+		vRetainedSurfaceID = retainedSurfaceID;
+	#endif
 	float ClipDistance0, ClipDistance1, ClipDistance2, ClipDistance3, ClipDistance4;
 
 	vec2 parmTexCoord;
@@ -167,7 +171,11 @@ void AddWeightedBone(uint boneIndex, float weight, inout vec4 position, inout ve
 BonesResult ApplyBones()
 {
 	BonesResult result;
+	#ifdef MODEL_INSTANCES
+	if (false)
+	#else
 	if (uBoneIndexBase >= 0 && aBoneWeight != vec4(0.0))
+	#endif
 	{
 		result.Position = vec4(0.0);
 		result.Normal = vec3(0.0);

@@ -128,6 +128,10 @@ function(query_repo_info)
 		message(STATUS "Not a git repo! Set version tag by setting GIT_DESCRIBE env var")
 	endif()
 
+	if(DEFINED ENV{GIT_DESCRIBE_SUFFIX})
+		set(Description "${Description}$ENV{GIT_DESCRIBE_SUFFIX}")
+	endif()
+
 	ret_var(Description)
 	ret_var(Tag)
 	ret_var(Distance)

@@ -108,6 +108,10 @@ bool IsOpenALPresent()
 
 ReverbContainer *ForcedEnvironment;
 
+static struct { bool On = false, Valid = false; struct FSoundChan* Channel = nullptr; } LowestCache;
+void S_SetLowestChannelCache(bool on) { LowestCache.On = on; LowestCache.Valid = false; }
+static inline void MarkLowestDirty() { LowestCache.Valid = false; }
+
 #ifndef NO_OPENAL
 
 EXTERN_CVAR (Int, snd_channels)
@@ -250,7 +254,7 @@ class OpenALSoundStream : public SoundStream
 			if(Renderer->FreeSfx.Size() == 0)
 				return false;
 		}
-		Renderer->FreeSfx.Pop(Source);
+		Renderer->FreeSfx.Pop(Source); MarkLowestDirty();
 
 		/* Set the default properties for localized playback */
 		alSource3f(Source, AL_DIRECTION, 0.f, 0.f, 0.f);
@@ -310,7 +314,7 @@ public:
 			alSourceRewind(Source);
 			alSourcei(Source, AL_BUFFER, 0);
 
-			Renderer->FreeSfx.Push(Source);
+			Renderer->FreeSfx.Push(Source); MarkLowestDirty();
 			Source = 0;
 		}
 
@@ -1364,7 +1368,7 @@ FISoundChannel *OpenALSoundRenderer::StartSound(SoundHandle sfx, float vol, floa
 	if(!(chanflags&SNDF_NOPAUSE))
 		PausableSfx.Push(source);
 	SfxGroup.Push(source);
-	FreeSfx.Pop();
+	FreeSfx.Pop(); MarkLowestDirty();
 
 	FISoundChannel *chan = reuse_chan;
 	if(!chan) chan = soundEngine->GetChannel(MAKE_PTRID(source));
@@ -1539,14 +1543,14 @@ FISoundChannel *OpenALSoundRenderer::StartSound3D(SoundHandle sfx, SoundListener
 	if(!(chanflags&SNDF_NOPAUSE))
 		PausableSfx.Push(source);
 	SfxGroup.Push(source);
-	FreeSfx.Pop();
+	FreeSfx.Pop(); MarkLowestDirty();
 
 	FISoundChannel *chan = reuse_chan;
 	if(!chan) chan = soundEngine->GetChannel(MAKE_PTRID(source));
 	else chan->SysChannel = MAKE_PTRID(source);
 
 	chan->Rolloff = *rolloff;
-	chan->DistanceSqr = dist_sqr;
+	chan->DistanceSqr = dist_sqr; MarkLowestDirty();
 	chan->ManualRolloff = manualRolloff;
 
 	return chan;
@@ -1601,7 +1605,7 @@ void OpenALSoundRenderer::StopChannel(FISoundChannel *chan)
 	if (!(chan->ChanFlags & CHANF_EVICTED))
 		soundEngine->SoundDone(chan);
 
-	FreeSfx.Push(source);
+	FreeSfx.Push(source); MarkLowestDirty();
 }
 
 
@@ -1712,7 +1716,7 @@ void OpenALSoundRenderer::UpdateSoundParams3D(SoundListener *listener, FISoundCh
 		return;
 
 	float dist_sqr = (float)(pos - listener->position).LengthSquared();
-	chan->DistanceSqr = dist_sqr;
+	chan->DistanceSqr = dist_sqr; MarkLowestDirty();
 
 	alDeferUpdatesSOFT();
 	ALuint source = GET_PTRID(chan->SysChannel);
@@ -1748,6 +1752,7 @@ void OpenALSoundRenderer::UpdateListener(SoundListener *listener)
 	float angle = listener->angle;
 	ALfloat orient[6];
 	// forward
+	// [Karto] listener->angle is in radians; the degree-based fast trig would turn the listener the wrong way.
 	orient[0] = cosf(angle);
 	orient[1] = 0.f;
 	orient[2] = -sinf(angle);
@@ -2135,8 +2140,14 @@ void OpenALSoundRenderer::LoadReverb(const ReverbContainer *env)
 	getALError();
 }
 
+CVAR(Bool, snd_lowest_cache, true, 0)
+EXTERN_CVAR(Bool, snd_index_verify)
+extern uint64_t SoundIndexChecks[4], SoundIndexMismatches[4];
+
 FSoundChan *OpenALSoundRenderer::FindLowestChannel()
 {
+	const bool cache = LowestCache.On || snd_lowest_cache;
+	if (cache && LowestCache.Valid && !snd_index_verify) return LowestCache.Channel;
 	FSoundChan *schan = soundEngine->GetChannels();
 	FSoundChan *lowest = NULL;
 	while(schan)
@@ -2149,6 +2160,17 @@ FSoundChan *OpenALSoundRenderer::FindLowestChannel()
 				lowest = schan;
 		}
 		schan = schan->NextChan;
+	}
+	if (cache && LowestCache.Valid)
+	{
+		++SoundIndexChecks[2];
+		SoundIndexMismatches[2] += lowest != LowestCache.Channel;
+		return lowest;
+	}
+	if (cache)
+	{
+		LowestCache.Channel = lowest;
+		LowestCache.Valid = true;
 	}
 	return lowest;
 }

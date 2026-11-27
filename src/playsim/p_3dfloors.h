@@ -25,6 +25,7 @@
 #define __SECTORE_H
 
 #include "r_data/colormaps.h"
+#include <shared_mutex>
 
 // 3D floor flags. Most are the same as in Legacy but I added some for EDGE's and Vavoom's features as well.
 typedef enum
@@ -141,6 +142,9 @@ void P_ActorOnSpecial3DFloor(AActor* victim);
 bool P_CheckFor3DFloorHit(AActor * mo, double z, bool trigger);
 bool P_CheckFor3DCeilingHit(AActor * mo, double z, bool trigger);
 void P_Recalculate3DFloors(sector_t *);
+// [Karto] Held while P_Recalculate3DFloors rebuilds a sector's 3D floor and light lists, which frees what a reader holds;
+// frames drawn during a worker tic read those lists under it shared instead of waiting for the whole tic.
+extern std::shared_mutex XFloorRebuildLock;
 void P_RecalculateAttached3DFloors(sector_t * sec);
 void P_RecalculateLights(sector_t *sector);
 void P_RecalculateAttachedLights(sector_t *sector);

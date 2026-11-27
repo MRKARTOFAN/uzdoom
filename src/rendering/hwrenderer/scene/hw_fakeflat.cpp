@@ -30,6 +30,9 @@
 static sector_t **fakesectorbuffer;
 
 extern thread_local bool isWorkerThread;
+// [Karto] The world-mode automap walker runs beside the main thread, which frees this cache every frame; with this set,
+// lookups neither read nor fill the shared cache and always build into the caller's copy.
+thread_local bool hw_FakeFlatPrivate = false;
 
 //==========================================================================
 //
@@ -211,7 +214,7 @@ sector_t * hw_FakeFlat(sector_t * sec, area_t in_area, bool back, sector_t *loca
 		// visual glitches because upper amd lower textures overlap.
 		if (back && (sec->MoreFlags & SECMF_OVERLAPPING))
 		{
-			if (fakesectorbuffer && fakesectorbuffer[sec->sectornum]) return fakesectorbuffer[sec->sectornum];
+			if (!hw_FakeFlatPrivate && fakesectorbuffer && fakesectorbuffer[sec->sectornum]) return fakesectorbuffer[sec->sectornum];
 			auto dest = localcopy? localcopy : allocateSector(sec);
 			*dest = *sec;
 			dest->floorplane = sec->ceilingplane;
@@ -231,11 +234,12 @@ sector_t * hw_FakeFlat(sector_t * sec, area_t in_area, bool back, sector_t *loca
 	}
 #endif
 
-	if (fakesectorbuffer && fakesectorbuffer[sec->sectornum])
+	if (!hw_FakeFlatPrivate && fakesectorbuffer && fakesectorbuffer[sec->sectornum])
 	{
 		return fakesectorbuffer[sec->sectornum];
 	}
 	assert(!(isWorkerThread && localcopy == nullptr));
+	assert(!(hw_FakeFlatPrivate && localcopy == nullptr));
 
 	if (in_area==area_above)
 	{

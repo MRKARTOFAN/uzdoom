@@ -428,7 +428,12 @@ STBSP__PUBLICDEF int STB_SPRINTF_DECORATE(vsprintfcb)(STBSP_SPRINTFCB *callback,
 
       // fast copy everything up to the next % (or end of string)
       for (;;) {
+#if defined(__SANITIZE_ADDRESS__)
+         // [Karto] ASAN builds only: the word-at-a-time scan reads past the string end on purpose; MSVC instruments it anyway.
+         while (1) {
+#else
          while (((stbsp__uintptr)f) & 3) {
+#endif
          schk1:
             if (f[0] == '%')
                goto scandd;

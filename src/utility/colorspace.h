@@ -53,6 +53,10 @@ T("#fff", "#ffffff", 0xffffff);
 static_assert(str("#7f7f7f") == 0x7f7f7f, "");
 #undef T
 
+// [Karto] Force constant evaluation even when the MSVC workaround makes str only constexpr.
+inline constexpr uint32_t Black = str("#000");
+inline constexpr uint32_t White = str("#fff");
+
 enum ColorSpace {
 	SRGB, OKLAB, OKLCH
 };

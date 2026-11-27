@@ -28,10 +28,18 @@
 #include "v_font.h"
 #include "types.h"
 #include "utf8.h"
+#include "c_cvars.h"
+#include "c_dispatch.h"
+#include "printf.h"
+#include "stb_sprintf.h"
+#include <atomic>
+#include <cstdarg>
+#include "i_time.h"
+#include <string>
 
 
 
-FString FStringFormat(VM_ARGS, int offset)
+static FString FStringFormatOriginal(VM_ARGS, int offset)
 {
 	PARAM_VA_POINTER(va_reginfo)	// Get the hidden type information array
 	assert(va_reginfo[offset] == REGT_STRING);
@@ -231,6 +239,270 @@ FString FStringFormat(VM_ARGS, int offset)
 	}
 
 	return output;
+}
+
+CVAR(Bool, p_stringformat_buffer, true, 0)
+CVAR(Bool, p_stringformat_verify, false, 0)
+CVAR(Bool, p_stringformat_time, false, 0)
+static std::atomic<uint64_t> StringFormatChecks = 0, StringFormatMismatches = 0, StringFormatCalls = 0, StringFormatNS = 0;
+
+CCMD(stringformat_stats)
+{
+	const uint64_t calls = StringFormatCalls;
+	Printf("STRINGFORMAT buffer=%d time=%d calls=%llu ns_per_call=%.1f checks=%llu mismatches=%llu\n", int(p_stringformat_buffer), int(p_stringformat_time),
+		(unsigned long long)calls, calls ? double(StringFormatNS) / calls : 0.0, (unsigned long long)StringFormatChecks,
+		(unsigned long long)StringFormatMismatches);
+	if (argv.argc() == 2 && stricmp(argv[1], "reset") == 0) StringFormatChecks = StringFormatMismatches = StringFormatCalls = StringFormatNS = 0;
+}
+
+static char* StringFormatAppend(const char* chunk, void* data, int len)
+{
+	static_cast<std::string*>(data)->append(chunk, size_t(len));
+	return const_cast<char*>(chunk);
+}
+
+static void StringFormatAppendf(std::string& out, const char* fmt, ...)
+{
+	char workbuf[STB_SPRINTF_MIN];
+	va_list arglist;
+	va_start(arglist, fmt);
+	stbsp_vsprintfcb(StringFormatAppend, &out, workbuf, fmt, arglist);
+	va_end(arglist);
+}
+
+struct FStringFormatSpec
+{
+	char text[32];
+	size_t len = 0;
+	bool overflow = false;
+
+	size_t size() const { return len; }
+	char operator[](size_t i) const { return text[i]; }
+	char back() const { return text[len - 1]; }
+	const char* c_str() { text[len] = 0; return text; }
+	void operator+=(char c) { if (len + 1 < sizeof(text)) text[len++] = c; else overflow = true; }
+	void reset() { text[0] = '%'; len = 1; }
+};
+
+static bool FStringFormatBuffered(VM_ARGS, int offset, FString& result)
+{
+	PARAM_VA_POINTER(va_reginfo)	// Get the hidden type information array
+	assert(va_reginfo[offset] == REGT_STRING);
+
+	const FString& fmtstring = param[offset].s();
+	const size_t fmtlen = fmtstring.Len();
+	const char* fmtchars = fmtstring.GetChars();
+
+	param += offset;
+	numparam -= offset;
+	va_reginfo += offset;
+
+	thread_local std::string output;
+	output.clear();
+	bool in_fmt = false;
+	FStringFormatSpec fmt_current;
+	int argnum = 1;
+	int argauto = 1;
+	bool haveargnums = false;
+	for (size_t i = 0; i < fmtlen; i++)
+	{
+		if (fmt_current.overflow) return false;
+		char c = fmtchars[i];
+		if (in_fmt)
+		{
+			if (c == '*' && (fmt_current.size() == 1 || (fmt_current.size() == 2 && fmt_current[1] == '0')))
+			{
+				fmt_current += c;
+			}
+			else if ((c >= '0' && c <= '9') ||
+				c == '-' || c == '+' || (c == ' ' && fmt_current.back() != ' ') || c == '#' || c == '.')
+			{
+				fmt_current += c;
+			}
+			else if (c == '$') // %number$format
+			{
+				if (!haveargnums && argauto > 1)
+					ThrowAbortException(X_FORMAT_ERROR, "Cannot mix explicit and implicit arguments.");
+				FString argnumstr = FString(fmt_current.c_str()).Mid(1);
+				if (!argnumstr.IsInt()) ThrowAbortException(X_FORMAT_ERROR, "Expected a numeric value for argument number, got '%s'.", argnumstr.GetChars());
+				auto argnum64 = argnumstr.ToLong();
+				if (argnum64 < 1 || argnum64 >= numparam) ThrowAbortException(X_FORMAT_ERROR, "Not enough arguments for format (tried to access argument %d, %d total).", argnum64, numparam);
+				fmt_current.reset();
+				haveargnums = true;
+				argnum = int(argnum64);
+			}
+			else
+			{
+				fmt_current += c;
+				if (fmt_current.overflow) return false;
+
+				switch (c)
+				{
+					// string
+				case 's':
+				{
+					if (argnum < 0 && haveargnums)
+						ThrowAbortException(X_FORMAT_ERROR, "Cannot mix explicit and implicit arguments.");
+					in_fmt = false;
+					// fail if something was found, but it's not a string
+					if (argnum >= numparam) ThrowAbortException(X_FORMAT_ERROR, "Not enough arguments for format.");
+					if (va_reginfo[argnum] != REGT_STRING) ThrowAbortException(X_FORMAT_ERROR, "Expected a string for format %s.", fmt_current.c_str());
+					// append
+					StringFormatAppendf(output, fmt_current.c_str(), param[argnum].s().GetChars());
+					if (!haveargnums) argnum = ++argauto;
+					else argnum = -1;
+					break;
+				}
+
+				// pointer
+				case 'p':
+				{
+					if (argnum < 0 && haveargnums)
+						ThrowAbortException(X_FORMAT_ERROR, "Cannot mix explicit and implicit arguments.");
+					in_fmt = false;
+					// fail if something was found, but it's not a string
+					if (argnum >= numparam) ThrowAbortException(X_FORMAT_ERROR, "Not enough arguments for format.");
+					if (va_reginfo[argnum] != REGT_POINTER) ThrowAbortException(X_FORMAT_ERROR, "Expected a pointer for format %s.", fmt_current.c_str());
+					// append
+					StringFormatAppendf(output, fmt_current.c_str(), param[argnum].a);
+					if (!haveargnums) argnum = ++argauto;
+					else argnum = -1;
+					break;
+				}
+
+				// int formats (including char)
+				case 'd':
+				case 'i':
+				case 'u':
+				case 'x':
+				case 'X':
+				case 'o':
+				case 'c':
+				case 'B':
+				{
+					if (argnum < 0 && haveargnums)
+						ThrowAbortException(X_FORMAT_ERROR, "Cannot mix explicit and implicit arguments.");
+					in_fmt = false;
+					// append
+					if ((fmt_current.size() > 1 && fmt_current[1] == '*')
+						|| (fmt_current.size() > 2 && fmt_current[2] == '*'))
+					{
+						// fail if something was found, but it's not an int
+						if (argnum+1 >= numparam) ThrowAbortException(X_FORMAT_ERROR, "Not enough arguments for format.");
+						if (va_reginfo[argnum] != REGT_INT &&
+							va_reginfo[argnum] != REGT_FLOAT) ThrowAbortException(X_FORMAT_ERROR, "Expected a numeric value for format %s.", fmt_current.c_str());
+						if (va_reginfo[argnum+1] != REGT_INT &&
+							va_reginfo[argnum+1] != REGT_FLOAT) ThrowAbortException(X_FORMAT_ERROR, "Expected a numeric value for format %s.", fmt_current.c_str());
+
+						StringFormatAppendf(output, fmt_current.c_str(), param[argnum].ToInt(va_reginfo[argnum]), param[argnum + 1].ToInt(va_reginfo[argnum + 1]));
+						argauto++;
+					}
+					else
+					{
+						// fail if something was found, but it's not an int
+						if (argnum >= numparam) ThrowAbortException(X_FORMAT_ERROR, "Not enough arguments for format.");
+						if (va_reginfo[argnum] != REGT_INT &&
+							va_reginfo[argnum] != REGT_FLOAT) ThrowAbortException(X_FORMAT_ERROR, "Expected a numeric value for format %s.", fmt_current.c_str());
+						StringFormatAppendf(output, fmt_current.c_str(), param[argnum].ToInt(va_reginfo[argnum]));
+					}
+					if (!haveargnums) argnum = ++argauto;
+					else argnum = -1;
+					break;
+				}
+
+				// double formats
+				case 'f':
+				case 'F':
+				case 'e':
+				case 'E':
+				case 'g':
+				case 'G':
+				case 'a':
+				case 'A':
+				{
+					if (argnum < 0 && haveargnums)
+						ThrowAbortException(X_FORMAT_ERROR, "Cannot mix explicit and implicit arguments.");
+					in_fmt = false;
+					if ((fmt_current.size() > 1 && fmt_current[1] == '*')
+						|| (fmt_current.size() > 2 && fmt_current[2] == '*'))
+					{
+						// fail if something was found, but it's not an int
+						if (argnum + 1 >= numparam) ThrowAbortException(X_FORMAT_ERROR, "Not enough arguments for format.");
+						if (va_reginfo[argnum] != REGT_INT &&
+							va_reginfo[argnum] != REGT_FLOAT) ThrowAbortException(X_FORMAT_ERROR, "Expected a numeric value for format %s.", fmt_current.c_str());
+						if (va_reginfo[argnum + 1] != REGT_INT &&
+							va_reginfo[argnum + 1] != REGT_FLOAT) ThrowAbortException(X_FORMAT_ERROR, "Expected a numeric value for format %s.", fmt_current.c_str());
+
+						StringFormatAppendf(output, fmt_current.c_str(), param[argnum].ToInt(va_reginfo[argnum]), param[argnum + 1].ToDouble(va_reginfo[argnum + 1]));
+						argauto++;
+					}
+					else
+					{
+						// fail if something was found, but it's not a float
+						if (argnum >= numparam) ThrowAbortException(X_FORMAT_ERROR, "Not enough arguments for format.");
+						if (va_reginfo[argnum] != REGT_INT &&
+							va_reginfo[argnum] != REGT_FLOAT) ThrowAbortException(X_FORMAT_ERROR, "Expected a numeric value for format %s.", fmt_current.c_str());
+						// append
+						StringFormatAppendf(output, fmt_current.c_str(), param[argnum].ToDouble(va_reginfo[argnum]));
+					}
+					if (!haveargnums) argnum = ++argauto;
+					else argnum = -1;
+					break;
+				}
+
+				default:
+					// invalid character
+					output.append(fmt_current.c_str(), fmt_current.size());
+					in_fmt = false;
+					break;
+				}
+			}
+		}
+		else
+		{
+			if (c == '%')
+			{
+				if (i + 1 < fmtlen && fmtchars[i + 1] == '%')
+				{
+					output += '%';
+					i++;
+				}
+				else
+				{
+					in_fmt = true;
+					fmt_current.reset();
+				}
+			}
+			else
+			{
+				output += c;
+			}
+		}
+	}
+
+	if (fmt_current.overflow) return false;
+	result = FString(output.data(), output.size());
+	return true;
+}
+
+FString FStringFormat(VM_ARGS, int offset)
+{
+	const bool timed = p_stringformat_time;
+	const uint64_t start = timed ? I_nsTime() : 0;
+	FString result;
+	if (!p_stringformat_buffer || !FStringFormatBuffered(VM_ARGS_NAMES, offset, result)) result = FStringFormatOriginal(VM_ARGS_NAMES, offset);
+	if (timed)
+	{
+		StringFormatNS += I_nsTime() - start;
+		++StringFormatCalls;
+	}
+	if (p_stringformat_verify && p_stringformat_buffer)
+	{
+		++StringFormatChecks;
+		const FString original = FStringFormatOriginal(VM_ARGS_NAMES, offset);
+		StringFormatMismatches += original.Len() != result.Len() || memcmp(original.GetChars(), result.GetChars(), result.Len()) != 0;
+	}
+	return result;
 }
 
 DEFINE_ACTION_FUNCTION(FStringStruct, Format)

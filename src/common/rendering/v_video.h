@@ -159,6 +159,7 @@ public:
 	float mSceneClearColor[4]{ 0,0,0,255 };
 
 	int mPipelineNbr = 1;						// Number of HW buffers to pipeline
+	int mPipelineFrameSlot = -1;
 	int mPipelineType = 0;
 
 public:

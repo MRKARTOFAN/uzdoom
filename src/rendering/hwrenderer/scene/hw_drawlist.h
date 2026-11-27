@@ -18,6 +18,7 @@
 #pragma once
 
 #include "memarena.h"
+#include <cstdint>
 
 extern FMemArena RenderDataAllocator;
 void ResetRenderDataAllocator();
@@ -75,6 +76,14 @@ struct SortNode
 //
 //==========================================================================
 
+struct HWOwnedWallDraw
+{
+	HWWall* Wall = nullptr;
+	uint64_t Version = 0;
+	unsigned Order = 0;
+	unsigned Part = 0;
+};
+
 struct HWDrawList
 {
 	//private:
@@ -82,6 +91,10 @@ struct HWDrawList
 	TArray<HWFlat*> flats;
 	TArray<HWSprite*> sprites;
 	TArray<HWDrawItem> drawitems;
+	TArray<HWOwnedWallDraw> OwnedWalls;
+	TArray<HWOwnedWallDraw> FallbackWalls;
+	TArray<HWOwnedWallDraw> VisibleWalls;
+	bool UseOwnedOrder = false;
 	int SortNodeStart;
 	float SortZ;
 	SortNode * sorted;
@@ -105,11 +118,16 @@ public:
 		return drawitems.Size();
 	}
 
-	HWWall *NewWall();
+	HWWall *NewWall(HWWall* retained = nullptr);
 	HWFlat *NewFlat();
 	HWSprite *NewSprite();
 	void Reset();
+	void PrepareOwnedWalls(HWDrawInfo* di);
 	void SortWalls();
+	void SortSolidSprites();
+	void DrawAdditiveSprites(HWDrawInfo *di, FRenderState &state);
+	void DrawParticleBuckets(HWDrawInfo *di, FRenderState &state);
+	void DrawSolidSprites(HWDrawInfo *di, FRenderState &state);
 	void SortFlats();
 
 
@@ -128,6 +146,8 @@ public:
 
 	void DoDraw(HWDrawInfo *di, FRenderState &state, bool translucent, int i);
 	void Draw(HWDrawInfo *di, FRenderState &state, bool translucent);
+	void PrepareGpuDrivenWalls();
+	bool DrawGpuDrivenWalls(HWDrawInfo* di, FRenderState& state);
 	void DrawWalls(HWDrawInfo *di, FRenderState &state, bool translucent);
 	void DrawFlats(HWDrawInfo *di, FRenderState &state, bool translucent);
 

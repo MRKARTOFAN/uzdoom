@@ -72,7 +72,7 @@ FNullStringData FString::NullString =
 {
 	0,			// Length of string
 	2,			// Size of character buffer
-	2,			// RefCount; it must never be modified, so keep it above 1 user at all times
+	FStringData::StaticRefs,
 	"\0"
 };
 

@@ -50,6 +50,7 @@ enum
 	VATTR_LIGHTMAP,
 	VATTR_BONEWEIGHT,
 	VATTR_BONESELECTOR,
+	VATTR_SURFACEID,
 	VATTR_MAX
 };
 
@@ -70,6 +71,7 @@ struct FVertexBufferAttribute
 	int location;
 	int format;
 	int offset;
+	size_t BindingStride = 0;
 };
 
 enum class BufferUsageType

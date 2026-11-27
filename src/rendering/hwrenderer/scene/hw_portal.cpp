@@ -30,6 +30,13 @@
 #include "texturemanager.h"
 #include "hw_viewpointbuffer.h"
 
+// [Karto] The sky surfaces' alpha mark is read only by SSAO (lineardepth.fp treats alpha 0 as far). Without the G-buffer
+// pass the restore draws depth alone, skipping the read-modify-write of a 16-bit float target.
+CVAR(Bool, r_portal_depthonly, true, 0)
+// [Karto] World mode only: a plain dome sky is shaded after the opaque world, only where its surfaces stayed visible. A
+// few pixels on the wall/floor line can differ, which world mode accepts.
+CVAR(Bool, r_sky_late, true, 0)
+
 void SetPlaneTextureRotation(FRenderState& state, HWSectorPlane* plane, FGameTexture* texture);
 
 //-----------------------------------------------------------------------------
@@ -86,7 +93,7 @@ void FPortalSceneState::EndFrame(HWDrawInfo *di, FRenderState &state)
 		{
 			Printf("%sProcessing %s, depth = %d\n", indent.GetChars(), p->GetName(), renderdepth);
 		}
-		if (p->lines.Size() > 0)
+		if (p->LineCount() > 0)
 		{
 			RenderPortal(p, state, true, di);
 		}
@@ -123,12 +130,12 @@ bool FPortalSceneState::RenderFirstSkyPortal(int recursion, HWDrawInfo *outer_di
 	for (int i = portals.Size() - 1; i >= 0; --i)
 	{
 		auto p = portals[i];
-		if (p->lines.Size() > 0 && p->IsSky())
+		if (p->LineCount() > 0 && p->IsSky())
 		{
 			// Cannot clear the depth buffer inside a portal recursion
 			if (recursion && p->NeedDepthBuffer()) continue;
 
-			if (!best || p->lines.Size() > best->lines.Size())
+			if (!best || p->LineCount() > best->LineCount())
 			{
 				best = p;
 				bestindex = i;
@@ -147,11 +154,25 @@ bool FPortalSceneState::RenderFirstSkyPortal(int recursion, HWDrawInfo *outer_di
 	if (best)
 	{
 		portals.Delete(bestindex);
+		if (r_sky_late && recursion == 0 && !usestencil && gl_portals && LateSky == nullptr && !best->NeedDepthBuffer() &&
+			!outer_di->Viewpoint.bDoOrtho && state.GetPassType() != GBUFFER_PASS && WorldModeActive(outer_di->Level))
+		{
+			LateSky = best;
+			return true;
+		}
 		RenderPortal(best, state, usestencil, outer_di);
 		delete best;
 		return true;
 	}
 	return false;
+}
+
+void FPortalSceneState::RenderLateSky(HWDrawInfo *outer_di, FRenderState &state)
+{
+	auto sky = LateSky;
+	LateSky = nullptr;
+	outer_di->RenderLateSkyPortal(sky, state);
+	delete sky;
 }
 
 
@@ -188,8 +209,9 @@ void HWPortal::DrawPortalStencil(FRenderState &state, int pass)
 			mPrimIndices[i * 2] = lines[i].vertindex;
 			mPrimIndices[i * 2 + 1] = lines[i].vertcount;
 		}
+		mPrimIndices.Append(mSkyPrims);
 
-		if (NeedCap() && lines.Size() > 1 && planesused != 0)
+		if (NeedCap() && LineCount() > 1 && planesused != 0)
 		{
 			screen->mVertexData->Map();
 			if (planesused & (1 << sector_t::floor))
@@ -221,7 +243,7 @@ void HWPortal::DrawPortalStencil(FRenderState &state, int pass)
 	{
 		state.Draw(DT_TriangleFan, mPrimIndices[i], mPrimIndices[i + 1], i == 0);
 	}
-	if (NeedCap() && lines.Size() > 1)
+	if (NeedCap() && LineCount() > 1)
 	{
 		// The cap's depth handling needs special treatment so that it won't block further portal caps.
 		if (pass == STP_DepthRestore) state.SetDepthRange(1, 1);
@@ -325,6 +347,47 @@ void HWPortal::SetupStencil(HWDrawInfo *di, FRenderState &state, bool usestencil
 }
 
 
+void HWPortal::DrawLateSkySurfaces(HWDrawInfo *di, FRenderState &state, ELateSkyStep step)
+{
+	state.ResetColor();
+	state.SetEffect(EFF_STENCIL);
+	state.EnableTexture(false);
+	state.SetRenderStyle(STYLE_Source);
+	state.EnableDepthTest(true);
+	state.SetDepthRange(0, 1);
+	state.SetDepthFunc(DF_LEqual);
+	if (step == LSS_Depth)
+	{
+		state.SetDepthMask(true);
+		if (r_portal_depthonly) state.SetColorMask(false);
+		else state.SetColorMask(0, 0, 0, 1); // mark portal in alpha channel but don't touch color
+		DrawPortalStencil(state, STP_DepthRestore);
+	}
+	else
+	{
+		// [Karto] Same geometry and pipeline as the depth draw, so equal depth passes only where a sky surface is still nearest.
+		state.SetDepthMask(false);
+		state.SetColorMask(false);
+		// [Karto] Nothing to reset here: the full-screen quad before it cleared every mark.
+		if (step == LSS_Mark)
+		{
+			state.SetStencil(0, SOP_Increment);
+			DrawPortalStencil(state, STP_DepthRestore);
+			state.SetStencil(0, SOP_Keep);
+		}
+	}
+	state.SetEffect(EFF_NONE);
+	state.EnableTexture(true);
+	state.SetColorMask(true);
+	state.SetDepthMask(true);
+	state.SetDepthFunc(DF_Less);
+	if (step == LSS_Reset)
+	{
+		auto &vp = di->Viewpoint;
+		if (vp.camera != nullptr) vp.camera->renderflags = (vp.camera->renderflags & ~RF_MAYBEINVISIBLE) | savedvisibility;
+	}
+}
+
 //-----------------------------------------------------------------------------
 //
 // End
@@ -405,7 +468,8 @@ void HWPortal::RemoveStencil(HWDrawInfo *di, FRenderState &state, bool usestenci
 		state.ResetColor();
 		state.SetDepthFunc(DF_LEqual);
 		state.SetDepthRange(0, 1);
-		state.SetColorMask(0, 0, 0, 1); // mark portal in alpha channel but don't touch color
+		if (r_portal_depthonly && state.GetPassType() != GBUFFER_PASS) state.SetColorMask(false);
+		else state.SetColorMask(0, 0, 0, 1); // mark portal in alpha channel but don't touch color
 		state.SetEffect(EFF_STENCIL);
 		state.EnableTexture(false);
 		state.SetRenderStyle(STYLE_Source);

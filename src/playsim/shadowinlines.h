@@ -95,7 +95,7 @@ inline AActor* CheckForShadows(AActor* self, AActor* other, DVector3 pos, double
 {
 	if ((other && (other->flags & MF_SHADOW)) || (self->flags9 & MF9_DOSHADOWBLOCK))
 	{
-		AActor* shadowBlock = P_CheckForShadowBlock(self, other, pos, penaltyFactor);
+		AActor* shadowBlock = ShadowBlockPossible ? P_CheckForShadowBlock(self, other, pos, penaltyFactor) : nullptr;
 		if (other && !(other->flags & MF_SHADOW)) other = nullptr; //Other doesn't have MF_SHADOW, so don't count them as a valid return.
 		return shadowBlock ? shadowBlock : other;
 	}

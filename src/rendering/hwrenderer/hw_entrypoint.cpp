@@ -17,6 +17,7 @@
 
 #include "gi.h"
 #include "a_dynlight.h"
+#include "c_dispatch.h"
 #include "m_png.h"
 #include "doomstat.h"
 #include "r_data/r_interpolate.h"
@@ -43,6 +44,7 @@
 #include "hw_vrmodes.h"
 
 EXTERN_CVAR(Bool, cl_capfps)
+CVAR(Bool, r_pp_weaponbloom, true, 0)
 extern bool NoInterpolateView;
 
 static SWSceneDrawer *swdrawer;
@@ -57,16 +59,46 @@ void CleanSWDrawer()
 #include "a_dynlight.h"
 
 
+CVAR(Int, r_shadowmap_cap, IShadowMap::Rows, 0)
+static int ShadowmapProcessed, ShadowmapRowsUsed, ShadowmapLeftOut;
+
+CCMD(shadowmap_rows)
+{
+	Printf("SHADOWMAPROWS processed=%d rows=%d left_out=%d cap=%d\n", ShadowmapProcessed, ShadowmapRowsUsed, ShadowmapLeftOut, int(r_shadowmap_cap));
+}
+
 void CollectLights(FLevelLocals* Level)
 {
 	IShadowMap* sm = &screen->mShadowMap;
 	int lightindex = 0;
+	const int cap = std::clamp(int(r_shadowmap_cap), 0, IShadowMap::Rows);
 
+	// [Karto] Frames of a published tic use the published light copies, not the live lights.
+	FDynamicLight* const* published;
+	int publishedCount;
+	WorldModePublishedLights(Level, published, publishedCount);
+	static uint32_t collectedStamp = 0;
+	static int collectedCap = -1;
+	static FLevelLocals* collectedLevel = nullptr;
+	if (publishedCount >= 0)
+	{
+		const uint32_t stamp = WorldModeGpuSpriteSerial();
+		if (stamp == collectedStamp && cap == collectedCap && Level == collectedLevel) return;
+		collectedStamp = stamp;
+		collectedCap = cap;
+		collectedLevel = Level;
+	}
+	else collectedStamp = 0;
+	ShadowmapProcessed = ShadowmapLeftOut = 0;
+	int publishedIndex = 0;
 	// Todo: this should go through the blockmap in a spiral pattern around the player so that closer lights are preferred.
-	for (auto light = Level->lights; light; light = light->next)
+	for (auto light = publishedCount >= 0 ? (publishedCount > 0 ? published[0] : nullptr) : Level->lights; light;
+		light = publishedCount >= 0 ? (++publishedIndex < publishedCount ? published[publishedIndex] : nullptr) : light->next)
 	{
 		IShadowMap::LightsProcessed++;
-		if (light->IsShadowMapped() && light->IsActive() && lightindex < 1024)
+		++ShadowmapProcessed;
+		ShadowmapLeftOut += light->IsShadowMapped() && light->IsActive() && lightindex >= cap;
+		if (light->IsShadowMapped() && light->IsActive() && lightindex < cap)
 		{
 			IShadowMap::LightsShadowmapped++;
 
@@ -76,12 +108,13 @@ void CollectLights(FLevelLocals* Level)
 		}
 		else
 		{
-			light->mShadowmapIndex = 1024;
+			light->mShadowmapIndex = IShadowMap::Rows;
 		}
 
 	}
 
-	for (; lightindex < 1024; lightindex++)
+	sm->RowsUsed = ShadowmapRowsUsed = lightindex;
+	for (; lightindex < IShadowMap::Rows; lightindex++)
 	{
 		sm->SetLight(lightindex, 0, 0, 0, 0);
 	}
@@ -163,12 +196,17 @@ sector_t* RenderViewpoint(FRenderViewpoint& mainvp, AActor* camera, IntRect* bou
 		vp.Pos += eye.GetViewShift(vp.HWAngles.Yaw.Degrees());
 		di->SetupView(RenderState, vp.Pos.X, vp.Pos.Y, vp.Pos.Z, false, false);
 
+		const bool profileStages = mainview && toscreen && IsGPUProfilingEnabled();
+		if (profileStages) RenderState.BeginGPUProfile("process_scene");
 		di->ProcessScene(toscreen);
+		if (profileStages) RenderState.EndGPUProfile();
 
 		if (mainview)
 		{
 			PostProcess.Clock();
+			if (profileStages) RenderState.BeginGPUProfile("end_scene");
 			if (toscreen) di->EndDrawScene(mainvp.sector, RenderState); // do not call this for camera textures.
+			if (profileStages) RenderState.EndGPUProfile();
 
 			if (RenderState.GetPassType() == GBUFFER_PASS) // Turn off ssao draw buffers
 			{
@@ -176,7 +214,15 @@ sector_t* RenderViewpoint(FRenderViewpoint& mainvp, AActor* camera, IntRect* bou
 				RenderState.EnableDrawBuffers(1);
 			}
 
-			screen->PostProcessScene(false, cm, flash, [&]() { di->DrawEndScene2D(mainvp.sector, RenderState); });
+			const bool weaponInScene = r_pp_weaponbloom;
+			auto drawWeapon = [&]()
+			{
+				if (profileStages) RenderState.BeginGPUProfile("end_scene_2d");
+				di->DrawEndScene2D(mainvp.sector, RenderState);
+				if (profileStages) RenderState.EndGPUProfile();
+			};
+			if (weaponInScene) drawWeapon();
+			screen->PostProcessScene(false, cm, flash, [&]() { if (!weaponInScene) drawWeapon(); });
 			PostProcess.Unclock();
 		}
 		// Reset colormap so 2D drawing isn't affected
@@ -341,7 +387,7 @@ sector_t* RenderView(player_t* player)
 
 		// Get this before everything else
 		if (cl_capfps || r_NoInterpolate) r_viewpoint.TicFrac = 1.;
-		else r_viewpoint.TicFrac = I_GetTimeFrac();
+		else r_viewpoint.TicFrac = R_RenderTicFrac();
 
 		screen->mLights->Clear();
 		screen->mBones->Clear();

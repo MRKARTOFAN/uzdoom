@@ -52,6 +52,8 @@ class VulkanRenderDevice : public SystemBaseFrameBuffer
 
 public:
 	std::shared_ptr<VulkanDevice> device;
+	bool DescriptorIndexingSupported = false;
+	bool ShaderDrawParametersSupported = false;
 
 	VkCommandBufferManager* GetCommands() { return mCommands.get(); }
 	VkShaderManager *GetShaderManager() { return mShaderManager.get(); }
@@ -77,6 +79,7 @@ public:
 
 	void InitializeState() override;
 	bool CompileNextShader() override;
+	void UpdateShaderSpecialization();
 	void PrecacheMaterial(FMaterial *mat, int translation) override;
 	void UpdatePalette() override;
 	const char* DeviceName() const override;

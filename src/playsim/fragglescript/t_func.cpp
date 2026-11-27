@@ -2713,6 +2713,7 @@ void FParser::SF_MoveCamera(void)
 		bool finishedangle = false;
 
 		cam->radius = 1 / 8192.;
+		cam->UpdateBlockNodes();
 		cam->Height = 1 / 8192.;
 
 		if (campos != targpos)
@@ -3278,6 +3279,7 @@ void FParser::SF_Resurrect()
 		mo->SetState(state);
 		mo->Height = mo->GetDefault()->Height;
 		mo->radius = mo->GetDefault()->radius;
+		mo->UpdateBlockNodes();
 		mo->Revive();
 		mo->target = nullptr;
 	}
@@ -3561,7 +3563,10 @@ void FParser::SF_MobjRadius(void)
 		if(t_argc > 1)
 		{
 			if(mo)
+			{
 				mo->radius = floatvalue(t_argv[1]);
+				mo->UpdateBlockNodes();
+			}
 		}
 		t_return.setDouble(mo ? mo->radius : 0.);
 	}

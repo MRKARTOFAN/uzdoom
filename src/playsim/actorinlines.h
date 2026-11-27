@@ -84,11 +84,17 @@ inline double BobSin(double fb)
 
 inline double AActor::GetBobOffset(double ticfrac) const
 {
+	return GetBobOffsetAt(Level->maptime, ticfrac);
+}
+
+// [Karto] Frames drawn from a publish must bob with the published tic, not the live maptime.
+inline double AActor::GetBobOffsetAt(int tic, double ticfrac) const
+{
 	if (!(flags2 & MF2_FLOATBOB))
 	{
 		return 0;
 	}
-	return BobSin(FloatBobPhase + Level->maptime * FloatBobFactor + ticfrac) * FloatBobStrength;
+	return BobSin(FloatBobPhase + tic * FloatBobFactor + ticfrac) * FloatBobStrength;
 }
 
 inline double AActor::GetCameraHeight() const

@@ -280,8 +280,13 @@ void FLevelLocals::ClearPortals()
 //
 //==========================================================================
 
+// [Karto] The world-mode automap walker reads level geometry on its own thread; it must be stopped before the data goes.
+void WorldModeWalkerStop();
+void P_DropDeferredLights();
+
 void FLevelLocals::ClearLevelData(bool fullgc)
 {
+	WorldModeWalkerStop();
 	{
 		// Make sure map data gets cleared appropriately so any leftover Objects aren't pointing
 		// towards anything invalid.
@@ -291,6 +296,7 @@ void FLevelLocals::ClearLevelData(bool fullgc)
 	}
 
 	TravellingThinkers.Clear();
+	P_DropDeferredLights();
 	interpolator.ClearInterpolations();	// [RH] Nothing to interpolate on a fresh level.
 	Thinkers.DestroyAllThinkers(fullgc);
 	ClientSideThinkers.DestroyAllThinkers(fullgc);

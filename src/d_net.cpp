@@ -57,6 +57,11 @@
 #include "screenjob.h"
 #include "version.h"
 #include "vm.h"
+#include "d_framestages.h"
+#include "d_ticworkercheck.h"
+#include "d_ticworker.h"
+#include "po_man.h"
+#include "s_soundinternal.h"
 
 void P_RunClientSideLogic();
 
@@ -78,6 +83,20 @@ extern FString	savegamefile;
 extern bool AppActive;
 
 void P_ClearLevelInterpolation();
+void WorldModePublishActors(FLevelLocals* level);
+bool WorldModePrepareWorkerPublish(FLevelLocals* level);
+void WorldModeWorkerPublish();
+void WorldModePublishActorsAfterWorker(FLevelLocals* level, bool predicted);
+bool P_PredictClientSkips();
+void P_WorkerRecreateLights(FLevelLocals* Level);
+static bool TicPublishOnWorker = false;
+int WorldModeInterpolationSkip(FLevelLocals* level);
+void WorldModeApplyMapFlags(FLevelLocals* level);
+void P_TickerOnMainBeforeWorker();
+bool P_CheckTickerPaused();
+void P_TickerOnMainAfterWorker();
+void C_FlushWorkerPrints();
+void D_RecordHud();
 
 enum ELevelStartStatus
 {
@@ -523,7 +542,12 @@ double Net_ModifyFrac(double ticFrac)
 
 double Net_ModifyObjectFrac(DObject* obj, double ticFrac)
 {
-	return LagState == LAG_NONE || LagState == LAG_SKIPPING || obj->IsClientSide() ? ticFrac : 1.0;
+	return Net_ModifyFrac(obj->IsClientSide(), ticFrac);
+}
+
+double Net_ModifyFrac(bool clientSide, double ticFrac)
+{
+	return LagState == LAG_NONE || LagState == LAG_SKIPPING || clientSide ? ticFrac : 1.0;
 }
 
 double Net_ModifyParticleFrac(particle_t* part, double ticFrac)
@@ -1310,6 +1334,9 @@ static bool Net_UpdateStatus()
 	return true;
 }
 
+CVAR(Int, r_sp_maxahead, 2, 0)
+static int SPOwedTics = 0;
+
 void NetUpdate(int tics)
 {
 	GetPackets();
@@ -1384,15 +1411,21 @@ void NetUpdate(int tics)
 	bool netGood = Net_UpdateStatus();
 	const int startTic = ClientTic;
 	tics = min<int>(tics, MAXSENDTICS * TicDup);
-	if ((startTic + tics - gametic) / TicDup > BACKUPTICS / 2)
+	// [Karto] r_sp_maxahead: in single player the queue stops a few tics ahead, so input still reaches a world that
+	// cannot keep up.
+	const int ahead = (r_sp_maxahead > 0 && !netgame && !demoplayback && !demorecording) ? std::min<int>(r_sp_maxahead, BACKUPTICS / 2) : BACKUPTICS / 2;
+	const bool spCap = ahead < BACKUPTICS / 2;
+	const int requested = tics;
+	if ((startTic + tics - gametic) / TicDup > ahead)
 	{
-		tics = (gametic + BACKUPTICS / 2 * TicDup) - startTic;
+		tics = (gametic + ahead * TicDup) - startTic;
 		if (tics <= 0)
 		{
 			tics = 1;
 			netGood = false;
 		}
 	}
+	if (spCap) SPOwedTics = std::min(SPOwedTics + requested - (netGood ? tics : 0), ahead);
 
 	for (int i = 0; i < tics; ++i)
 	{
@@ -2191,9 +2224,568 @@ static void CalculateNetStabilityBuffer(int diff)
 //
 // TryRunTics
 //
+// [Karto] The tic on a worker thread (d_ticworker.h): main runs each tic's prologue and finish, the worker the world
+// tick. The order of operations stays the serial order.
+CVAR(Bool, r_tic_worker, true, 0)
+CVAR(Bool, r_tic_worker_check, true, 0)
+
+static struct FTicBatch
+{
+	int Remaining = 0;
+	int TotalTics = 0;
+	int WorldTimer = 0;
+	int Carry = 0;
+	int CarryTotal = 0;
+} TicBatch;
+
+// [Karto] r_tic_chain: when tics cost more than frames, each due tic goes to the worker as its own batch so frames keep
+// drawing. Splitting moves only client logic, prediction and the publish, which game state never depends on.
+CVAR(Int, r_tic_chain, 1, 0)
+static double TicCostMs = 0, FrameCostMs = 0, MainTicMs = 0, WorkerTicMs = 0;
+static uint64_t FrameEnterNS = 0;
+static uint64_t TicChained = 0;
+// [Karto] While events settle the worker only finishes its tic; the carried batches wait for the next frame, or a key
+// press would run the whole backlog at once.
+static bool TicSettling = false;
+
+static void NoteCost(double& average, double ms)
+{
+	average += (ms - average) * 0.125;
+}
+
+// [Karto] r_tic_steadyclock: while the game keeps up, a finished tic is shown from its slot start plus a learned
+// latency, so every tic gets one tic of motion at even spacing.
+CVAR(Bool, r_tic_steadyclock, true, 0)
+static bool TicBatchSingle = false;		// the batch was the one tic due at its slot
+static bool TicSteadyPending = false;	// the tic with the worker shows at TicDueNS + TicLatencyNS
+static bool TicSteadyApplied = false;	// the publish being made starts its motion at TicSteadyStartNS
+static uint64_t TicDueNS = 0, TicSteadyStartNS = 0;
+static double TicLatencyNS = 0;
+static uint64_t TicFrameOffsetNS = 0;	// I_nsTime() - I_GetTimeNS() at the frame's start of TryRunTics
+static uint64_t TicWorkerDoneNS = 0;	// I_nsTime() when the worker finished its tic
+static uint64_t TicSteadyShown = 0, TicSteadyLate = 0;
+CVAR(Int, r_tic_steadypct, 95, 0)
+static double TicDelays[35];
+static unsigned TicDelayCount = 0, TicDelayNext = 0;
+CVAR(Bool, r_tic_steadyseen, true, 0)
+static uint64_t TicSeenNS = 0;	// I_GetTimeNS() of the first frame that found the steady tic finished (0: not yet)
+
+static uint64_t TicWorkerTics, TicSerialTics, TicWorkerWaitFrames, TicWorkerSettles, TicEventDefers;
+
+// [Karto] r_tic_handoff: when the world is behind and the worker finishes within half a frame, wait for it instead of
+// starting a frame. Only when the tic is collected changes, never game state.
+CVAR(Bool, r_tic_handoff, true, 0)
+static uint64_t TicWorkerStartNS = 0, TicWorkerJobEndNS = 0;
+static double TicJobCostMs = 0;	// running average of a whole worker job: the world tick and the worker publish
+static uint64_t TicHandoffWaits = 0;
+static double TicHandoffMs = 0;
+
+// [Karto] r_tic_runahead: the worker runs the next tic itself when its command is built and nothing between needs the
+// main thread. Same commands in the same order, so play is unchanged.
+CVAR(Int, r_tic_runahead, 2, 0)
+static int TicRunAheadLimit = 0;		// set at the hand-over: tics the worker may add
+static int TicRunAheadDone = 0;			// tics it added (read once the job is collected)
+static unsigned TicRunAheadQueued = 0;	// delayed commands queued at the hand-over
+static uint64_t TicRunAheadTics = 0;
+static std::atomic<bool> TicMainWaiting{ false };
+
+CCMD(tic_worker_stats)
+{
+	Printf("TICWORKERSTATS worker_tics=%llu serial_tics=%llu frames_while_busy=%llu event_settles=%llu chained=%llu tic_ms=%.2f frame_ms=%.2f steady=%llu steady_late=%llu latency_ms=%.2f commands_ahead=%d handoff_waits=%llu handoff_ms=%.1f job_ms=%.2f runahead=%llu event_defers=%llu\n",
+		(unsigned long long)TicWorkerTics, (unsigned long long)TicSerialTics, (unsigned long long)TicWorkerWaitFrames,
+		(unsigned long long)TicWorkerSettles, (unsigned long long)TicChained, TicCostMs, FrameCostMs,
+		(unsigned long long)TicSteadyShown, (unsigned long long)TicSteadyLate, TicLatencyNS / 1e6, ClientTic - gametic,
+		(unsigned long long)TicHandoffWaits, TicHandoffMs, TicJobCostMs, (unsigned long long)TicRunAheadTics,
+		(unsigned long long)TicEventDefers);
+}
+
+CVAR(Bool, r_tic_worker_uiserial, true, 0)
+
+static bool TicWorkerEligible()
+{
+	// [Karto] Serial whenever anything outside plain single-player play is going on, and until a publish exists for
+	// the level (the first tic after a load): frames must have published state to draw while the worker ticks.
+	// [Karto] Demos run on the worker too; their commands are read and written in G_TickerPrologue on the
+	// main thread, and the world tick only reads the demo flags.
+	// [Karto] r_tic_worker_uiserial: non-pausing menus and script UI handlers run on the main thread every frame and
+	// touch objects, so their tics stay serial.
+	if (r_tic_worker_uiserial && (menuactive == MENU_OnNoPause || staticEventManager.CheckUiProcessors() ||
+		(primaryLevel != nullptr && primaryLevel->localEventManager->CheckUiProcessors()))) return false;
+	return r_tic_worker && !netgame && gamestate == GS_LEVEL && gameaction == ga_nothing &&
+		!paused && !P_CheckTickerPaused() && primaryLevel != nullptr && WorldModeInterpolationSkip(primaryLevel) != 0;
+}
+
+static void MakeConsistencies();
+
+static bool TicRunAheadStillAllowed(bool committed)
+{
+	if (TicRunAheadDone >= TicRunAheadLimit || (TicMainWaiting && !committed) || gameaction != ga_nothing || gamestate != GS_LEVEL ||
+		paused || P_CheckTickerPaused()) return false;
+	for (auto client : NetworkClients)
+	{
+		if (players[client].playerstate != PST_LIVE && players[client].playerstate != PST_DEAD) return false;
+	}
+	return true;
+}
+
+extern bool WorldModeSkipParticleStage;
+
+static void TicWorkerJob()
+{
+	for (;;)
+	{
+		const uint64_t start = I_nsTime();
+		const bool committed = TicRunAheadStillAllowed(false);
+		WorldModeSkipParticleStage = committed;
+		G_TickerWorld();
+		WorldModeSkipParticleStage = false;
+		TicWorkerDoneNS = I_nsTime();
+		WorkerTicMs = double(TicWorkerDoneNS - start) / 1e6;
+		// [Karto] A tic the worker follows with another is never shown, so it is not published.
+		const bool more = committed ? TicRunAheadStillAllowed(true) : TicRunAheadStillAllowed(false);
+		if (TicPublishOnWorker && !more)
+		{
+			// [Karto] Light owners must carry their recreated lights when the build copies them.
+			P_WorkerRecreateLights(primaryLevel);
+			WorldModeWorkerPublish();
+		}
+		TicWorkerJobEndNS = I_nsTime();
+		if (!more) break;
+		// [Karto] Only the serial steps between two tics that touch play state run here; the rest waits for the main
+		// thread.
+		MakeConsistencies();
+		++gametic;
+		G_TickerPlayerCommands();
+		++TicRunAheadDone;
+	}
+}
+
+// [Karto] Only tics whose commands are built and carry nothing but movement may follow; anything else runs main-thread
+// code.
+static int TicRunAheadAllowed()
+{
+	if (r_tic_runahead <= 0 || TicBatch.Carry > 0 || netgame || demoplayback || demorecording || TicDup != 1) return 0;
+	int limit = std::min<int>(r_tic_runahead, ClientTic - (gametic + 1));
+	for (int k = 1; k <= limit; ++k)
+	{
+		for (auto client : NetworkClients)
+		{
+			if (ClientStates[client].Tics[(gametic + k) % BACKUPTICS].Data.GetTArrayView().Size() != 0)
+			{
+				limit = k - 1;
+				break;
+			}
+		}
+	}
+	while (limit > 0 && !C_DelayedCommandsQuiet(limit)) --limit;
+	return std::max(limit, 0);
+}
+
+static void FinishTic()
+{
+	{
+		FFrameStageScope stage(FS_Net);
+		MakeConsistencies();
+	}
+	++gametic;
+}
+
+// Runs the remaining tics of the batch; false when one was handed to the worker (the batch continues once it is done).
+static bool RunBatchTics()
+{
+	while (TicBatch.Remaining > 0)
+	{
+		--TicBatch.Remaining;
+		const bool worker = r_tic_worker;
+		// [Karto] The worker never runs in netgames (TicWorkerEligible), so they keep the stock tic stability.
+		const bool stabilize = (!worker || netgame) && ShouldStabilizeTick();
+		if (stabilize)
+			TicStabilityBegin();
+
+		if (advancedemo)
+			D_DoAdvanceDemo();
+
+		{
+			FFrameStageScope stage(FS_Tic);
+			G_TickerPrologue();
+			// [Karto] Only a batch's last tic goes to the worker; catch-up tics run here, as on the serial path.
+			const int runAhead = TicWorkerEligible() ? TicRunAheadAllowed() : 0;
+			const bool chain = runAhead == 0 && r_tic_chain > 0 && TicBatch.Remaining > 0 && (r_tic_chain >= 2 || TicCostMs > FrameCostMs);
+			if ((TicBatch.Remaining == 0 || chain || runAhead > 0) && TicWorkerEligible())
+			{
+				if (chain)
+				{
+					TicBatch.Carry = TicBatch.Remaining;
+					TicBatch.CarryTotal = std::max(TicBatch.TotalTics - 1, 0);
+					TicBatch.TotalTics = std::min(TicBatch.TotalTics, 1);
+					TicBatch.Remaining = 0;
+					++TicChained;
+				}
+				TicSteadyPending = r_tic_steadyclock && TicBatchSingle && !chain;
+				TicSeenNS = 0;
+				if (TicSteadyPending)
+				{
+					const double tic = 1e9 / GameTicRate;
+					TicDueNS = I_GetTimeNS() - uint64_t(std::clamp(I_GetTimeFrac(), 0.0, 1.0) * tic);
+				}
+				P_TickerOnMainBeforeWorker();
+				TicPublishOnWorker = WorldModePrepareWorkerPublish(primaryLevel);
+				TicWorkerCheckArmed = r_tic_worker_check;
+				TicRunAheadDone = 0;
+				TicRunAheadLimit = runAhead;
+				TicRunAheadQueued = C_DelayedCommandCount();
+				TicWorkerStartNS = I_nsTime();
+				TicWorkerStart(TicWorkerJob);
+				++TicWorkerTics;
+				return false;
+			}
+			const uint64_t start = I_nsTime();
+			G_TickerWorld();
+			const double ms = double(I_nsTime() - start) / 1e6;
+			MainTicMs += ms;
+			NoteCost(TicCostMs, ms);
+			++TicSerialTics;
+		}
+		FinishTic();
+
+		if (stabilize)
+			TicStabilityEnd();
+
+		if (bCommandsReset)
+		{
+			bCommandsReset = false;
+			TicBatch.Remaining = 0;
+			TicBatch.Carry = TicBatch.CarryTotal = 0;
+		}
+	}
+	return true;
+}
+
+static uint64_t TicPublishNS = 0;
+static int TicPublishCount = 0;
+static int TicPublishGametic = 0;
+// [Karto] First command whose turn the shown publish's angle does not include: gametic, or ClientTic when the publish
+// carries the predicted local player (always in netgames), else TicPendingView adds predicted turn a second time.
+static int TicPublishCmdTic = 0;
+static int TicPublishSpan = 1;
+CVAR(Bool, r_tic_spanfrac, true, 0)
+static bool TicPublishValid = false;
+
+static struct FTicFracStats
+{
+	uint64_t LastFrameNS = 0, Frames = 0, Held = 0, Backward = 0;
+	double LastShown = 0, ErrorSum = 0, ErrorMax = 0;
+	bool Started = false;
+} TicFracStats;
+
+static void TicPublished()
+{
+	TicPublishNS = TicSteadyApplied ? TicSteadyStartNS : I_GetTimeNS();
+	TicSteadyApplied = false;
+	++TicPublishCount;
+	TicPublishSpan = TicPublishValid ? std::clamp(gametic - TicPublishGametic, 1, 4) : 1;
+	TicPublishGametic = gametic;
+	TicPublishCmdTic = P_PredictClientSkips() ? gametic : ClientTic;
+	TicPublishValid = true;
+}
+
+// [Karto] Measured from the publish, not the schedule: a publish lands a worker tic after its slot began.
+bool TicPublishFrac(double& frac)
+{
+	if (!r_tic_worker || !TicPublishValid) return false;
+	const uint64_t now = I_GetTimeNS();
+	// [Karto] A publish of several tics plays over that many tics.
+	const double elapsed = now >= TicPublishNS ? double(now - TicPublishNS) * GameTicRate / 1e9 / (r_tic_spanfrac ? TicPublishSpan : 1) : 0.0;
+	frac = elapsed < 0 ? 0.0 : elapsed > 1 ? 1.0 : elapsed;
+	auto& st = TicFracStats;
+	if (!st.Started || now != st.LastFrameNS)
+	{
+		const double shown = TicPublishCount + frac;
+		if (st.Started)
+		{
+			const double step = shown - st.LastShown, real = double(now - st.LastFrameNS) * GameTicRate / 1e9;
+			const double error = fabs(step - real);
+			st.ErrorSum += error;
+			st.ErrorMax = std::max(st.ErrorMax, error);
+			st.Held += step == 0;
+			st.Backward += step < 0;
+			++st.Frames;
+		}
+		st.Started = true;
+		st.LastFrameNS = now;
+		st.LastShown = shown;
+	}
+	return true;
+}
+
+// [Karto] On the worker clock the view's tic counter must be the publish count, or the camera steps before the new
+// publish arrives.
+// [Karto] Adds the turn of commands built but not yet in the shown publish; otherwise that turn is missing for a worker
+// tic.
+bool TicPendingView(int& yaw, int& pitch)
+{
+	if (!r_tic_worker || !TicPublishValid) return false;
+	yaw = pitch = 0;
+	const int first = std::max(TicPublishCmdTic, ClientTic - LOCALCMDTICS);
+	for (int i = first; i < ClientTic; ++i)
+	{
+		yaw += int(LocalCmds[i % LOCALCMDTICS].yaw) * 65536;
+		pitch += int(LocalCmds[i % LOCALCMDTICS].pitch) * 65536;
+	}
+	return true;
+}
+
+int TicPublishedGametic()
+{
+	return TicPublishGametic;
+}
+
+bool TicPublishIndex(int& index)
+{
+	if (!r_tic_worker || !TicPublishValid) return false;
+	index = TicPublishCount;
+	return true;
+}
+
+CCMD(tic_frac_stats)
+{
+	auto& st = TicFracStats;
+	Printf("TICFRACSTATS frames=%llu mean_error_tics=%.4f max_error_tics=%.3f held=%llu backward=%llu\n",
+		(unsigned long long)st.Frames, st.Frames ? st.ErrorSum / st.Frames : 0.0, st.ErrorMax, (unsigned long long)st.Held,
+		(unsigned long long)st.Backward);
+	if (argv.argc() == 2 && stricmp(argv[1], "reset") == 0) st = FTicFracStats();
+}
+
+void P_DropRecreateReplay();
+
+static void FinishBatch()
+{
+	// [Karto] Publish on the worker: a worker-built publish predates prediction, so a batch that predicts publishes here.
+	const bool predicted = TicPublishOnWorker && !P_PredictClientSkips();
+	{
+		FFrameStageScope stage(FS_Predict);
+		P_PredictClient();
+	}
+
+	// These should use the actual tics since they're not actually tied to the gameplay logic.
+	// Make sure it always comes after so the HUD has the correct game state when updating.
+	{
+		FFrameStageScope stage(FS_ClientLogic);
+		for (int i = 0; i < TicBatch.TotalTics; ++i)
+			P_RunClientSideLogic();
+		P_DropRecreateReplay();
+	}
+
+	{
+		FFrameStageScope stage(FS_Publish);
+		if (TicPublishOnWorker)
+		{
+			TicPublishOnWorker = false;
+			WorldModePublishActorsAfterWorker(primaryLevel, predicted);
+		}
+		else WorldModePublishActors(primaryLevel);
+		D_RecordHud();
+		TicPublished();
+		// [Karto] Interpolations frames skip retire here, where the next tic cannot overlap.
+		if (const int skip = WorldModeInterpolationSkip(primaryLevel))
+		{
+			primaryLevel->interpolator.RetireSkipped(skip);
+			// [Karto] Frames drawn from the publish do not relink polyobjects (the worker moves them).
+			PO_LinkToSubsectors(primaryLevel);
+		}
+	}
+
+	// Since the level could get reset mid-tick, make sure the smaller of the two values is used
+	// since it should only go up otherwise.
+	FFrameStageScope stage(FS_Sounds);
+	S_UpdateSounds(players[consoleplayer].camera, primaryLevel->LocalWorldTimer - min<int>(primaryLevel->LocalWorldTimer, TicBatch.WorldTimer));
+	NetworkEntityManager::VerifyPredictedEntities();
+}
+
+static bool ContinueCarry();
+
+static bool ContinueWorkerTic()
+{
+	if (TicSteadyPending && TicSeenNS == 0 && !TicWorkerBusy) TicSeenNS = I_GetTimeNS();
+	if (TicSteadyPending && !TicSettling && I_GetTimeNS() < TicDueNS + uint64_t(TicLatencyNS))
+	{
+		++TicWorkerWaitFrames;
+		return false;
+	}
+	if (r_tic_handoff && !TicSettling && TicCostMs * GameTicRate > 1000.0)
+	{
+		const uint64_t start = I_nsTime();
+		const double remaining = TicJobCostMs - double(start - TicWorkerStartNS) / 1e6;
+		if (remaining < FrameCostMs * 0.5)
+		{
+			TicMainWaiting = true;
+			TicWorkerWaitFinishedFor(std::max(remaining, 0.0) + 2.0);
+			TicMainWaiting = false;
+			// [Karto] Tic time, not frame time, as in TicWorkerSettleForEvents (r_tic_chain compares the two).
+			const double waited = double(I_nsTime() - start) / 1e6;
+			MainTicMs += waited;
+			TicHandoffMs += waited;
+			++TicHandoffWaits;
+		}
+	}
+	if (!TicWorkerPoll())
+	{
+		++TicWorkerWaitFrames;
+		return false;
+	}
+	if (TicRunAheadDone > 0)
+	{
+		C_SkipDelayedCommandTics(TicRunAheadQueued, TicRunAheadDone);
+		TicRunAheadTics += TicRunAheadDone;
+		TicBatch.Remaining = std::max(TicBatch.Remaining - TicRunAheadDone, 0);
+		TicSteadyPending = false;
+	}
+	NoteCost(TicJobCostMs, double(TicWorkerJobEndNS - TicWorkerStartNS) / 1e6 / (1 + TicRunAheadDone));
+	TicRunAheadDone = TicRunAheadLimit = 0;
+	if (TicSteadyPending)
+	{
+		TicSteadyPending = false;
+		const double tic = 1e9 / GameTicRate;
+		const double done = double(TicWorkerDoneNS - TicFrameOffsetNS) - double(TicDueNS);
+		const uint64_t seen = TicSeenNS != 0 ? TicSeenNS : I_GetTimeNS();
+		const double need = std::clamp(r_tic_steadyseen ? double(seen) - double(TicDueNS) + 0.5e6 : done + 1.5e6, 0.0, 0.9 * tic);
+		const uint64_t start = TicDueNS + uint64_t(TicLatencyNS);
+		const uint64_t now = I_GetTimeNS();
+		TicSteadyApplied = true;
+		// [Karto] A settle collects the tic before its moment: it starts now, never in the future (a start ahead of the
+		// frame clock showed the next tic's step for a frame and then stepped back).
+		if (now <= start + uint64_t(1.5e6)) TicSteadyStartNS = std::min(start, now), ++TicSteadyShown;
+		else TicSteadyStartNS = now, ++TicSteadyLate;
+		TicDelays[TicDelayNext] = need;
+		TicDelayNext = (TicDelayNext + 1) % 35;
+		TicDelayCount = std::min(TicDelayCount + 1, 35u);
+		double sorted[35];
+		std::copy(TicDelays, TicDelays + TicDelayCount, sorted);
+		const unsigned rank = std::min(TicDelayCount - 1, unsigned(TicDelayCount * std::clamp(*r_tic_steadypct, 1, 100) / 100.0));
+		std::nth_element(sorted, sorted + rank, sorted + TicDelayCount);
+		TicLatencyNS += (sorted[rank] - TicLatencyNS) * 0.25;
+	}
+	TicWorkerCheckArmed = false;
+	if (soundEngine) soundEngine->FlushDeferredStarts();
+	NoteCost(TicCostMs, WorkerTicMs);
+	P_TickerOnMainAfterWorker();
+	C_FlushWorkerPrints();
+	FinishTic();
+	if (bCommandsReset)
+	{
+		bCommandsReset = false;
+		TicBatch.Remaining = 0;
+		TicBatch.Carry = TicBatch.CarryTotal = 0;
+	}
+	if (!RunBatchTics()) return false;
+	FinishBatch();
+	return ContinueCarry();
+}
+
+static bool ContinueCarry()
+{
+	while (TicBatch.Carry > 0 && !TicSettling)
+	{
+		{
+			FFrameStageScope stage(FS_Predict);
+			P_UnPredictClient();
+		}
+		WorldModeApplyMapFlags(primaryLevel);
+		TicBatch.Remaining = TicBatch.Carry;
+		TicBatch.TotalTics = TicBatch.CarryTotal;
+		TicBatch.Carry = TicBatch.CarryTotal = 0;
+		TicBatchSingle = false;
+		TicBatch.WorldTimer = primaryLevel->LocalWorldTimer;
+		if (!RunBatchTics()) return false;
+		FinishBatch();
+	}
+	return true;
+}
+
+// [Karto] A key can open the menu, run a console command or reach a ZScript handler, so events other than mouse motion
+// first finish the worker's tic.
+// [Karto] r_tic_eventdefer: outside a UI, events other than mouse motion wait until the worker is idle, so a key press
+// never shows a tic before its steady-clock moment.
+CVAR(Bool, r_tic_eventdefer, true, 0)
+static TArray<event_t> TicDeferredEvents;
+
+void TicWorkerSettleForEvents()
+{
+	if (!TicWorkerBusy) return;
+	const bool ui = r_tic_worker_uiserial && (menuactive != MENU_Off || staticEventManager.CheckUiProcessors() ||
+		(primaryLevel != nullptr && primaryLevel->localEventManager->CheckUiProcessors()));
+	bool onlyMouse = !ui;
+	for (int i = eventtail; i != eventhead && onlyMouse; i = (i + 1) & (MAXEVENTS - 1))
+		onlyMouse = events[i].type == EV_Mouse || events[i].type == EV_None;
+	if (onlyMouse) return;
+	if (r_tic_eventdefer && !ui)
+	{
+		// [Karto] Mouse motion stays (it only turns the view); the rest goes back after D_ProcessEvents, in order.
+		int kept = eventtail;
+		for (int i = eventtail; i != eventhead; i = (i + 1) & (MAXEVENTS - 1))
+		{
+			if (events[i].type == EV_Mouse || events[i].type == EV_None)
+			{
+				events[kept] = events[i];
+				kept = (kept + 1) & (MAXEVENTS - 1);
+			}
+			else TicDeferredEvents.Push(events[i]);
+		}
+		eventhead = kept;
+		++TicEventDefers;
+		return;
+	}
+	++TicWorkerSettles;
+	// [Karto] The wait is tic time, not frame time: counted as frame cost it switched r_tic_chain off.
+	const uint64_t start = I_nsTime();
+	TicSettling = true;
+	TicMainWaiting = true;
+	while (TicWorkerBusy)
+	{
+		TicWorkerWaitFinished();
+		ContinueWorkerTic();
+	}
+	TicMainWaiting = false;
+	TicSettling = false;
+	MainTicMs += double(I_nsTime() - start) / 1e6;
+}
+
+// [Karto] For frame code that must run play code (R_OffsetView's Trace bumps validcount and shares the intercept list):
+// alongside a worker tic it made P_NoiseAlert revisit sectors forever. The tic is collected at the next TryRunTics.
+void TicWorkerWaitForPlayAccess()
+{
+	if (!TicWorkerBusy || TicWorkerOnThread()) return;
+	const uint64_t start = I_nsTime();
+	TicMainWaiting = true;
+	TicWorkerWaitFinished();
+	TicMainWaiting = false;
+	MainTicMs += double(I_nsTime() - start) / 1e6;
+}
+
+void TicWorkerRequeueEvents()
+{
+	for (auto& ev : TicDeferredEvents)
+	{
+		events[eventhead] = ev;
+		eventhead = (eventhead + 1) & (MAXEVENTS - 1);
+	}
+	TicDeferredEvents.Clear();
+}
+
 void TryRunTics()
 {
-	GC::CheckGC();
+	{
+		const uint64_t now = I_nsTime();
+		if (FrameEnterNS != 0) NoteCost(FrameCostMs, std::max(double(now - FrameEnterNS) / 1e6 - MainTicMs, 0.0));
+		FrameEnterNS = now;
+		MainTicMs = 0;
+		TicFrameOffsetNS = now - I_GetTimeNS();
+	}
+	if (TicWorkerBusy ? !ContinueWorkerTic() : TicBatch.Carry > 0 && !ContinueCarry()) return;
+	{
+		FFrameStageScope stage(FS_GC);
+		GC::CheckGC();
+	}
 
 	if (ToggleFullscreen)
 	{
@@ -2215,6 +2807,12 @@ void TryRunTics()
 
 	const int startCommand = ClientTic;
 	int totalTics = EnterTic - LastEnterTic;
+	if (totalTics <= 0 && SPOwedTics > 0 && r_sp_maxahead > 0 && !netgame && !demoplayback && !demorecording &&
+		ClientTic - gametic <= r_sp_maxahead)
+	{
+		totalTics = 1;
+		--SPOwedTics;
+	}
 	if (totalTics > 1 && singletics)
 		totalTics = 1;
 
@@ -2222,7 +2820,10 @@ void TryRunTics()
 	// needed for singleplayer! But is instead handled entirely through local
 	// buffers. This has a limit of one seconds worth of commands that can be
 	// generated in advanced from the last time the game updated.
-	NetUpdate(totalTics);
+	{
+		FFrameStageScope stage(FS_Net);
+		NetUpdate(totalTics);
+	}
 
 	LastEnterTic = EnterTic;
 
@@ -2290,6 +2891,13 @@ void TryRunTics()
 		{
 			LagState = LAG_PREDICTING;
 			P_PredictClient();
+			if (gamestate == GS_LEVEL)
+			{
+				WorldModePublishActors(primaryLevel);
+				if (netgame) TicPublished();
+				else TicPublishCmdTic = P_PredictClientSkips() ? gametic : ClientTic;
+			}
+			D_RecordHud();
 		}
 
 		// If we actually did have some tics available, make sure the UI
@@ -2314,40 +2922,17 @@ void TryRunTics()
 	LastGameUpdate = EnterTic;
 
 	// Run the available tics.
-	P_UnPredictClient();
-	while (runTics--)
 	{
-		const bool stabilize = ShouldStabilizeTick();
-		if (stabilize)
-			TicStabilityBegin();
-
-		if (advancedemo)
-			D_DoAdvanceDemo();
-
-		G_Ticker();
-		MakeConsistencies();
-		++gametic;
-
-		if (stabilize)
-			TicStabilityEnd();
-
-		if (bCommandsReset)
-		{
-			bCommandsReset = false;
-			break;
-		}
+		FFrameStageScope stage(FS_Predict);
+		P_UnPredictClient();
 	}
-	P_PredictClient();
-
-	// These should use the actual tics since they're not actually tied to the gameplay logic.
-	// Make sure it always comes after so the HUD has the correct game state when updating.
-	for (int i = 0; i < totalTics; ++i)
-		P_RunClientSideLogic();
-
-	// Since the level could get reset mid-tick, make sure the smaller of the two values is used
-	// since it should only go up otherwise.
-	S_UpdateSounds(players[consoleplayer].camera, primaryLevel->LocalWorldTimer - min<int>(primaryLevel->LocalWorldTimer, worldTimer));
-	NetworkEntityManager::VerifyPredictedEntities();
+	// [Karto] Automap flags frames deferred are set before the tics read them.
+	WorldModeApplyMapFlags(primaryLevel);
+	TicBatch.Remaining = runTics;
+	TicBatch.TotalTics = totalTics;
+	TicBatch.WorldTimer = worldTimer;
+	TicBatchSingle = runTics == 1;
+	if (RunBatchTics()) FinishBatch();
 }
 
 void Net_NewClientTic()

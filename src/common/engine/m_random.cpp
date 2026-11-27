@@ -117,6 +117,7 @@ CCMD(rngseed)
 // PRIVATE DATA DEFINITIONS ------------------------------------------------
 
 FRandom *FRandom::RNGList, *FRandom::CRNGList;
+
 static TDeletingArray<FRandom *> NewRNGs, NewCRNGs;
 
 // CODE --------------------------------------------------------------------

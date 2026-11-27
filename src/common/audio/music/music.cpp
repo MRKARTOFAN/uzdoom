@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <stdexcept>
 #include <memory>
+#include <mutex>
 
 #include "i_sound.h"
 #include "i_music.h"
@@ -69,6 +70,39 @@ static int DefaultFindMusic(const char* fn)
 }
 
 MusicCallbacks mus_cb = { nullptr, DefaultFindMusic };
+
+// [Karto] The main thread updates the playing song every frame, so the tic worker queues its changes for the main thread.
+bool TicWorkerOnThread();
+struct FWorkerMusicRequest
+{
+	FString Name;
+	int Order;
+	bool Looping, Force, Stop;
+};
+static std::mutex WorkerMusicLock;
+static TArray<FWorkerMusicRequest> WorkerMusic;
+
+static void QueueWorkerMusic(const FWorkerMusicRequest& request)
+{
+	std::lock_guard<std::mutex> guard(WorkerMusicLock);
+	WorkerMusic.Push(request);
+}
+
+static void FlushWorkerMusic()
+{
+	TArray<FWorkerMusicRequest> requests;
+	{
+		std::lock_guard<std::mutex> guard(WorkerMusicLock);
+		if (WorkerMusic.Size() == 0) return;
+		requests = std::move(WorkerMusic);
+		WorkerMusic.Clear();
+	}
+	for (auto& r : requests)
+	{
+		if (r.Stop) S_StopMusic(r.Force);
+		else S_ChangeMusic(r.Name.GetChars(), r.Order, r.Looping, r.Force);
+	}
+}
 
 
 // PUBLIC DATA DEFINITIONS -------------------------------------------------
@@ -343,6 +377,7 @@ void S_ResumeMusic ()
 
 void S_UpdateMusic ()
 {
+	FlushWorkerMusic();
 	if (mus_playing.handle != nullptr)
 	{
 		ZMusic_Update(mus_playing.handle);
@@ -681,6 +716,13 @@ bool S_ChangeMusic(const char* musicname, int order, bool looping, bool force)
 {
 	if (!MusicEnabled()) return false;	// skip the entire procedure if music is globally disabled.
 
+	if (TicWorkerOnThread())
+	{
+		QueueWorkerMusic({ musicname, order, looping, force, false });
+		return true;
+	}
+	FlushWorkerMusic();
+
 	if (!force && PlayList.GetNumSongs())
 	{ // Don't change if a playlist is active
 		return true; // do not report an error here.
@@ -879,6 +921,12 @@ int S_GetMusic (const char **name)
 
 void S_StopMusic (bool force)
 {
+	if (TicWorkerOnThread())
+	{
+		QueueWorkerMusic({ FString(), 0, false, force, true });
+		return;
+	}
+	FlushWorkerMusic();
 	try
 	{
 		// [RH] Don't stop if a playlist is active.

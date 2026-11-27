@@ -35,6 +35,7 @@ Material ProcessMaterial(); // note that this is deprecated. Use SetupMaterial!
 void SetupMaterial(inout Material mat);
 vec4 ProcessLight(Material mat, vec4 color);
 vec3 ProcessMaterialLight(Material material, vec3 color);
+vec2 GetTexCoord();
 
 #ifdef USE_GETTEXCOORD
 vec2 GetTexCoord()
@@ -121,7 +122,11 @@ vec4 dodesaturate(vec4 texel, float factor)
 
 vec4 desaturate(vec4 texel)
 {
+#ifdef SPEC_NO_DESAT
+	return texel;
+#else
 	return dodesaturate(texel, uDesaturationFactor);
+#endif
 }
 
 //===========================================================================
@@ -249,18 +254,24 @@ vec4 getTexel(vec2 st)
 	}
 
 	// Apply the texture modification colors.
+#ifndef SPEC_NO_TEXMANIP
 	int blendflags = int(uTextureAddColor.a);	// this alpha is unused otherwise
 	if (blendflags != 0)
 	{
 		// only apply the texture manipulation if it contains something.
 		texel = ApplyTextureManipulation(texel, blendflags);
 	}
+#endif
 
 	// Apply the Doom64 style material colors on top of everything from the texture modification settings.
 	// This may be a bit redundant in terms of features but the data comes from different sources so this is unavoidable.
+#ifdef SPEC_NO_D64
+	texel *= uObjectColor;
+#else
 	texel.rgb += uAddColor.rgb;
 	if (uObjectColor2.a == 0.0) texel *= uObjectColor;
 	else texel *= mix(uObjectColor, uObjectColor2, gradientdist.z);
+#endif
 
 	// Last but not least apply the desaturation from the sector's light.
 	return desaturate(texel);
@@ -425,7 +436,7 @@ vec2 softshadow[9 * 3] = vec2[](
 float shadowAttenuation(vec4 lightpos, float lightcolorA)
 {
 	float shadowIndex = abs(lightcolorA) - 1.0;
-	if (shadowIndex >= 1024.0)
+	if (shadowIndex >= 4096.0)
 		return 1.0; // Don't cast rays for this light
 
 	vec3 origin = pixelpos.xzy;
@@ -565,7 +576,7 @@ float sampleShadowmapPCF(vec3 planePoint, float v)
 
 float shadowmapAttenuation(vec4 lightpos, float shadowIndex)
 {
-	if (shadowIndex >= 1024.0)
+	if (shadowIndex >= 4096.0)
 		return 1.0; // No shadowmap available for this light
 
 	vec3 planePoint = pixelpos.xyz - lightpos.xyz;
@@ -574,7 +585,7 @@ float shadowmapAttenuation(vec4 lightpos, float shadowIndex)
 	if (dot(planePoint.xz, planePoint.xz) < 1.0)
 		return 1.0; // Light is too close
 
-	float v = (shadowIndex + 0.5) / 1024.0;
+	float v = (shadowIndex + 0.5) / 4096.0;
 
 	if (uShadowmapFilter <= 0)
 	{
@@ -740,6 +751,7 @@ vec4 getLightColor(Material material, float fogdist, float fogfactor)
 	//
 	// handle glowing walls
 	//
+#ifndef SPEC_NO_GLOW
 	if (uGlowTopColor.a > 0.0 && glowdist.x < uGlowTopColor.a)
 	{
 		color.rgb += desaturate(uGlowTopColor * (1.0 - glowdist.x / uGlowTopColor.a)).rgb;
@@ -748,6 +760,7 @@ vec4 getLightColor(Material material, float fogdist, float fogfactor)
 	{
 		color.rgb += desaturate(uGlowBottomColor * (1.0 - glowdist.y / uGlowBottomColor.a)).rgb;
 	}
+#endif
 	color = min(color, 1.0);
 
 	// these cannot be safely applied by the legacy format where the implementation cannot guarantee that the values are set.
@@ -771,10 +784,12 @@ vec4 getLightColor(Material material, float fogdist, float fogfactor)
 	//
 	// apply lightmaps
 	//
+#ifndef SPEC_NO_LIGHTMAP
 	if (vLightmap.z >= 0.0)
 	{
 		color.rgb += texture(LightMap, vLightmap).rgb;
 	}
+#endif
 
 	//
 	// apply dynamic lights

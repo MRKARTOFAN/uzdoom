@@ -28,9 +28,12 @@
 #include "hwrenderer/data/buffers.h"
 #include <atomic>
 #include <mutex>
+#include <memory>
 
 class FRenderState;
 struct secplane_t;
+struct sector_t;
+class FWallVertexCache;
 
 struct FFlatVertex
 {
@@ -96,6 +99,13 @@ public:
 	unsigned int mNumReserved;
 
 	unsigned int mMapStart;
+	static const unsigned int CAPTURE_SCRATCH_SIZE = 65536;
+	TArray<FFlatVertex> CaptureScratch;
+	unsigned int CaptureBase = 0;
+	bool Capturing = false;
+	std::unique_ptr<IVertexBuffer> RetainedFlatIDBuffer;
+	uint64_t RetainedFlatSetupNS = 0;
+	uint64_t RetainedFlatMetadataBytes = 0;
 
 	static const unsigned int BUFFER_SIZE = 2000000;
 	static const unsigned int BUFFER_SIZE_TO_USE = BUFFER_SIZE-500;
@@ -125,8 +135,22 @@ public:
 
 	FFlatVertex *GetBuffer(int index) const
 	{
+		if (Capturing && unsigned(index) >= CaptureBase && unsigned(index) - CaptureBase < CAPTURE_SCRATCH_SIZE)
+			return const_cast<FFlatVertex*>(&CaptureScratch[unsigned(index) - CaptureBase]);
 		FFlatVertex *ff = (FFlatVertex*)mVertexBuffer->Memory();
 		return &ff[index];
+	}
+
+	void BeginCaptureScratch()
+	{
+		if (CaptureScratch.Size() < CAPTURE_SCRATCH_SIZE) CaptureScratch.Resize(CAPTURE_SCRATCH_SIZE);
+		CaptureBase = mCurIndex;
+		Capturing = true;
+	}
+
+	void EndCaptureScratch()
+	{
+		Capturing = false;
 	}
 
 	FFlatVertex *GetBuffer() const
@@ -135,6 +159,10 @@ public:
 	}
 
 	std::pair<FFlatVertex *, unsigned int> AllocVertices(unsigned int count);
+	IVertexBuffer *CacheWallVertices(const void *side, uint8_t part, const FFlatVertex *vertices, unsigned &index, bool verify);
+	IVertexBuffer* RetainPreparedWallVertices(const FFlatVertex* vertices, unsigned& index);
+	void ClearWallVertexCache();
+	void EnsureRetainedFlatIDs(TArray<sector_t>& sectors);
 
 	void Reset()
 	{
@@ -146,6 +174,12 @@ public:
 		mPipelinePos++;
 		mPipelinePos %= mPipelineNbr;
 
+		mVertexBuffer = mVertexBufferPipeline[mPipelinePos];
+	}
+
+	void SelectPipelineBuffer(int slot)
+	{
+		mPipelinePos = slot % mPipelineNbr;
 		mVertexBuffer = mVertexBufferPipeline[mPipelinePos];
 	}
 
@@ -175,6 +209,12 @@ public:
 	{
 		return mPipelinePos;
 	}
+
+private:
+	std::unique_ptr<FWallVertexCache> WallVertexCache;
+	std::unique_ptr<IVertexBuffer> WallVertexBuffer;
+	std::unique_ptr<IVertexBuffer> PreparedWallVertexBuffer;
+	unsigned PreparedWallSlots = 0;
 };
 
 #endif

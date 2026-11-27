@@ -30,7 +30,10 @@
 #include "hw_cvars.h"
 #include "hw_viewpointbuffer.h"
 #include "flatvertices.h"
+#include "hw_vertexbuilder.h"
+#include "hwrenderer/scene/hw_walldispatcher.h"
 #include "hw_lightbuffer.h"
+#include "hw_lighting.h"
 #include "hw_bonebuffer.h"
 #include "hw_vrmodes.h"
 #include "hw_clipper.h"
@@ -39,10 +42,17 @@
 #include "texturemanager.h"
 #include "actorinlines.h"
 #include "g_levellocals.h"
+#include <set>
+#include "d_framestages.h"
 
 EXTERN_CVAR(Float, r_visibility)
 EXTERN_CVAR(Int, r_distance_cull_type)
 EXTERN_CVAR(Float, r_line_distance_cull)
+EXTERN_CVAR(Bool, vk_gpu_driven_bake)
+EXTERN_CVAR(Bool, vk_gpu_driven_cull)
+EXTERN_CVAR(Bool, vk_gpu_driven_geometry)
+EXTERN_CVAR(Bool, vk_gpu_driven_candidate)
+
 CVAR(Bool, gl_bandedswlight, false, CVAR_ARCHIVE)
 CVAR(Bool, gl_sort_textures, false, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
 CVAR(Bool, gl_no_skyclear, false, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
@@ -51,6 +61,8 @@ CVAR(Int, gl_enhanced_nv_stealth, 3, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
 CVAR(Bool, gl_texture, true, 0)
 CVAR(Float, gl_mask_threshold, 0.5f, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
 CVAR(Float, gl_mask_sprite_threshold, 0.5f, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
+EXTERN_CVAR(Bool, r_sprite_batch)
+EXTERN_CVAR(Bool, r_sprite_solidruns)
 
 CVAR(Bool, gl_coronas, true, CVAR_ARCHIVE);
 
@@ -183,6 +195,7 @@ void HWDrawInfo::StartScene(FRenderViewpoint &parentvp, HWViewpointUniforms *uni
 			VPUniforms.mThickFogDistance = Level->thickfogdistance;
 		}
 		VPUniforms.mThickFogMultiplier =  (r_distance_cull_type > 1 ? 30.0 : Level->thickfogmultiplier);
+		VPUniforms.mExtraLight = getExtraLight() / 255.f;
 	}
 	mClipper->SetViewpoint(Viewpoint);
 	vClipper->SetViewpoint(Viewpoint);
@@ -230,6 +243,8 @@ HWDrawInfo *HWDrawInfo::EndDrawInfo()
 
 void HWDrawInfo::ClearBuffers()
 {
+	OwnedNextOrder = 1;
+	OwnOpaqueWalls = false;
 	otherFloorPlanes.Clear();
 	otherCeilingPlanes.Clear();
 	floodFloorSegs.Clear();
@@ -483,6 +498,11 @@ HWDecal *HWDrawInfo::AddDecal(bool onmirror)
 
 void HWDrawInfo::CreateScene(bool drawpsprites)
 {
+	GpuSprites = UseGpuSprites();
+	for (auto& visible : GpuSpriteVisible) visible.clear();
+	GpuParticles = UseGpuParticles();
+	GpuParticleRanges.clear();
+	GpuParticleIndices.clear();
 	const auto &vp = Viewpoint;
 	angle_t a1 = FrustumAngle(); // horizontally clip the back of the viewport
 	mClipper->SafeAddClipRangeRealAngles(vp.Angles.Yaw.BAMs() + a1, vp.Angles.Yaw.BAMs() - a1);
@@ -534,14 +554,40 @@ void HWDrawInfo::CreateScene(bool drawpsprites)
 
 void HWDrawInfo::RenderScene(FRenderState &state)
 {
+	struct OwnershipScope
+	{
+		FRenderState& State;
+		bool Previous;
+		OwnershipScope(FRenderState& state, bool enabled) : State(state), Previous(state.SetRetainedWorldOwnership(enabled)) {}
+		~OwnershipScope() { State.SetRetainedWorldOwnership(Previous); }
+	} ownershipScope(state, OwnOpaqueWalls);
 	const auto &vp = Viewpoint;
 	RenderAll.Clock();
+
+	if (vk_gpu_driven_geometry && !vk_gpu_driven_candidate && vk_gpu_driven_cull && !outer && !mCurrentPortal && !mClipPortal &&
+		!Viewpoint.bDoOob && !Viewpoint.bDoOrtho && screen->IsVulkan())
+	{
+		drawlists[GLDL_PLAINWALLS].PrepareGpuDrivenWalls();
+		VSMatrix vpm = VPUniforms.ProjectionMatrix;
+		vpm.multMatrix(VPUniforms.ViewMatrix);
+		const float* matrix = vpm.get();
+		float planes[24];
+		for (int p = 0; p < 6; ++p)
+		{
+			const float sign = (p & 1) ? -1.0f : 1.0f;
+			const int row = p >> 1;
+			for (int k = 0; k < 4; ++k)
+				planes[p * 4 + k] = matrix[k * 4 + 3] + sign * matrix[k * 4 + row];
+		}
+		GPUBakeRunCull(planes, true);
+	}
 
 	state.SetDepthMask(true);
 
 	state.EnableFog(true);
 	state.SetRenderStyle(STYLE_Source);
 
+	if (OwnOpaqueWalls) drawlists[GLDL_PLAINWALLS].PrepareOwnedWalls(this);
 	if (gl_sort_textures)
 	{
 		drawlists[GLDL_PLAINWALLS].SortWalls();
@@ -558,12 +604,47 @@ void HWDrawInfo::RenderScene(FRenderState &state)
 
 	state.EnableTexture(gl_texture);
 	state.EnableBrightmap(true);
-	drawlists[GLDL_PLAINWALLS].DrawWalls(this, state, false);
+	const bool profileGPU = IsGPUProfilingEnabled();
+	if (profileGPU) state.BeginGPUProfile("world_opaque");
+	// [Karto] World mode replays the world for the main view only; portal and offscreen views draw no world while it is active.
+	const bool worldMode = !outer && !mCurrentPortal && WorldModeActive(Level);
+	if (worldMode)
+	{
+		CullWorldMode(state);
+		state.SetCulling(ECull(WorldModeCullMode()));
+		state.DrawWorldMode(false);
+		state.SetCulling(Cull_None);
+	}
+	if (!vk_gpu_driven_candidate || !vk_gpu_driven_geometry || !vk_gpu_driven_cull ||
+		!drawlists[GLDL_PLAINWALLS].DrawGpuDrivenWalls(this, state))
+		drawlists[GLDL_PLAINWALLS].DrawWalls(this, state, false);
 	drawlists[GLDL_PLAINFLATS].DrawFlats(this, state, false);
+	if (profileGPU) state.EndGPUProfile();
+
+	if (vk_gpu_driven_geometry && !vk_gpu_driven_candidate)
+	{
+		const uint32_t gpuDrawCount = state.GpuDrivenGeometryCount();
+		if (gpuDrawCount)
+		{
+			// [Karto] An inherited flat material/custom fragment shader can discard unrelated walls even with color writes disabled.
+			state.EnableTexture(false);
+			state.SetColorMask(false, false, false, false);
+			state.DrawGpuDrivenGeometry(gpuDrawCount);
+			state.SetColorMask(true, true, true, true);
+			state.EnableTexture(gl_texture);
+		}
+	}
 
 
 	// Part 2: masked geometry. This is set up so that only pixels with alpha>gl_mask_threshold will show
+	if (profileGPU) state.BeginGPUProfile("world_masked");
 	state.AlphaFunc(Alpha_GEqual, gl_mask_threshold);
+	if (worldMode)
+	{
+		state.SetCulling(ECull(WorldModeCullMode()));
+		state.DrawWorldMode(true);
+		state.SetCulling(Cull_None);
+	}
 	drawlists[GLDL_MASKEDWALLS].DrawWalls(this, state, false);
 	drawlists[GLDL_MASKEDFLATS].DrawFlats(this, state, false);
 
@@ -574,7 +655,14 @@ void HWDrawInfo::RenderScene(FRenderState &state)
 		drawlists[GLDL_MASKEDWALLSOFS].DrawWalls(this, state, false);
 		state.ClearDepthBias();
 	}
+	if (worldMode)
+	{
+		if (profileGPU) state.BeginGPUProfile("world_visibility");
+		DrawWorldModeVisibilityPass(state);
+		if (profileGPU) state.EndGPUProfile();
+	}
 
+	if (profileGPU) state.EndGPUProfile();
 	screen->mBones->Map();
 	drawlists[GLDL_MODELS].Draw(this, state, false);
 	screen->mBones->Unmap();
@@ -597,21 +685,109 @@ void HWDrawInfo::RenderScene(FRenderState &state)
 void HWDrawInfo::RenderTranslucent(FRenderState &state)
 {
 	RenderAll.Clock();
+	const bool profileGPU = IsGPUProfilingEnabled();
+	if (profileGPU) state.BeginGPUProfile("world_translucent");
 
 	// final pass: translucent stuff
 	state.AlphaFunc(Alpha_GEqual, gl_mask_sprite_threshold);
+	// [Karto] A portal drawn without a depth buffer leaves depth writes off. The sorted pass never needed them; the solid
+	// sprite and particle passes below do, or a farther sprite drawn later shows through a nearer one.
+	state.SetDepthMask(true);
+	if (drawlists[GLDL_SOLIDSPRITES].Size() > 0)
+	{
+		// [Karto] Solid sprites go first here, where the sorted list drew them: after ambient occlusion (which would shade
+		// around them) and portals (which would overwrite them), with depth writes on and opaque blending.
+		state.SetRenderStyle(STYLE_Source);
+		FFrameStageScope stage(FS_SolidSprites);
+		if (r_sprite_batch)
+		{
+			FFrameStageScope sort(FS_SolidSort);
+			drawlists[GLDL_SOLIDSPRITES].SortSolidSprites();
+		}
+		if (r_sprite_batch && r_sprite_solidruns) drawlists[GLDL_SOLIDSPRITES].DrawSolidSprites(this, state);
+		else drawlists[GLDL_SOLIDSPRITES].Draw(this, state, false);
+		state.SetTextureMode(TM_NORMAL);
+		state.AlphaFunc(Alpha_GEqual, gl_mask_sprite_threshold);
+	}
+	if (GpuSprites)
+	{
+		state.SetRenderStyle(STYLE_Source);
+		if (profileGPU) state.BeginGPUProfile("gpu_sprites_solid");
+		DrawGpuSprites(state, 0);
+		if (profileGPU) state.EndGPUProfile();
+		state.SetTextureMode(TM_NORMAL);
+		state.AlphaFunc(Alpha_GEqual, gl_mask_sprite_threshold);
+	}
+	if (drawlists[GLDL_SOLIDPARTICLES].Size() > 0)
+	{
+		FFrameStageScope stage(FS_ParticlePass);
+		if (profileGPU) state.BeginGPUProfile("particles_solid");
+		drawlists[GLDL_SOLIDPARTICLES].DrawParticleBuckets(this, state);
+		if (profileGPU) state.EndGPUProfile();
+		state.AlphaFunc(Alpha_GEqual, gl_mask_sprite_threshold);
+	}
 	state.SetRenderStyle(STYLE_Translucent);
 
 	state.EnableBrightmap(true);
 	drawlists[GLDL_TRANSLUCENTBORDER].Draw(this, state, true);
 	state.SetDepthMask(false);
 
-	drawlists[GLDL_TRANSLUCENT].DrawSorted(this, state);
+	{
+		FFrameStageScope stage(FS_SortedList);
+		drawlists[GLDL_TRANSLUCENT].DrawSorted(this, state);
+	}
+	// [Karto] Buckets go after the sorted list and before the additive pass, as the sorted list ordered them.
+	{
+		FFrameStageScope stage(FS_AlphaPass);
+		if (profileGPU) state.BeginGPUProfile("sprites_alpha");
+		if (GpuSprites) DrawGpuSprites(state, 1);
+		drawlists[GLDL_ALPHASPRITES].DrawAdditiveSprites(this, state);
+		if (profileGPU) state.EndGPUProfile();
+	}
+	{
+		FFrameStageScope stage(FS_ParticlePass);
+		if (profileGPU) state.BeginGPUProfile("particles");
+		drawlists[GLDL_PARTICLES].DrawParticleBuckets(this, state);
+		if (profileGPU) state.EndGPUProfile();
+	}
+	{
+		FFrameStageScope stage(FS_AddPass);
+		if (profileGPU) state.BeginGPUProfile("sprites_add");
+		if (GpuSprites) DrawGpuSprites(state, 2);
+		drawlists[GLDL_ADDSPRITES].DrawAdditiveSprites(this, state);
+		if (profileGPU) state.EndGPUProfile();
+	}
+	if (drawlists[GLDL_ADDPARTICLES].Size() > 0)
+	{
+		FFrameStageScope stage(FS_ParticlePass);
+		if (profileGPU) state.BeginGPUProfile("particles_add");
+		drawlists[GLDL_ADDPARTICLES].DrawParticleBuckets(this, state);
+		if (profileGPU) state.EndGPUProfile();
+	}
 	state.EnableBrightmap(false);
+	if (profileGPU) state.EndGPUProfile();
 
 
 	state.AlphaFunc(Alpha_GEqual, 0.5f);
 	state.SetDepthMask(true);
+
+	GPUBakeFinalize();
+
+	if (vk_gpu_driven_cull && !vk_gpu_driven_candidate)
+	{
+		VSMatrix vpm = VPUniforms.ProjectionMatrix;
+		vpm.multMatrix(VPUniforms.ViewMatrix);
+		const float* m = vpm.get();
+		float planes[24];
+		for (int p = 0; p < 6; ++p)
+		{
+			const float sign = (p & 1) ? -1.0f : 1.0f;	// pair (+row,-row)
+			const int row = p >> 1;						// 0=x,1=y,2=z
+			for (int k = 0; k < 4; ++k)
+				planes[p * 4 + k] = float(m[k * 4 + 3]) + sign * float(m[k * 4 + row]);
+		}
+		GPUBakeRunCull(planes);
+	}
 
 	RenderAll.Unclock();
 }
@@ -626,7 +802,10 @@ void HWDrawInfo::RenderTranslucent(FRenderState &state)
 void HWDrawInfo::RenderPortal(HWPortal *p, FRenderState &state, bool usestencil)
 {
 	auto gp = static_cast<HWPortal *>(p);
+	const bool profileStages = !outer && IsGPUProfilingEnabled();
+	if (profileStages) state.BeginGPUProfile("portal_setup");
 	gp->SetupStencil(this, state, usestencil);
+	if (profileStages) { state.EndGPUProfile(); state.BeginGPUProfile("portal_contents"); }
 	auto new_di = StartDrawInfo(this->Level, this, Viewpoint, &VPUniforms);
 	new_di->mCurrentPortal = gp;
 	state.SetLightIndex(-1);
@@ -634,8 +813,55 @@ void HWDrawInfo::RenderPortal(HWPortal *p, FRenderState &state, bool usestencil)
 	new_di->EndDrawInfo();
 	state.SetVertexBuffer(screen->mVertexData);
 	screen->mViewpoints->Bind(state, vpIndex);
+	if (profileStages) { state.EndGPUProfile(); state.BeginGPUProfile("portal_remove"); }
 	gp->RemoveStencil(this, state, usestencil);
+	if (profileStages) state.EndGPUProfile();
 
+}
+
+static void LateSkyScreenQuad(HWDrawInfo *di, FRenderState &state, bool farOnly, int vpIndex)
+{
+	screen->mViewpoints->Set2D(state, screen->GetWidth(), screen->GetHeight());
+	state.SetVertexBuffer(screen->mVertexData);
+	state.ResetColor();
+	state.SetEffect(EFF_STENCIL);
+	state.EnableTexture(false);
+	state.SetRenderStyle(STYLE_Source);
+	state.SetColorMask(false);
+	state.SetDepthMask(false);
+	state.EnableDepthTest(farOnly);
+	state.SetDepthRange(1, 1);
+	state.SetDepthFunc(DF_LEqual);
+	if (farOnly) state.SetStencil(0, SOP_Increment);
+	else state.SetStencil(1, SOP_Decrement);
+	state.Draw(DT_TriangleStrip, FFlatVertexBuffer::FULLSCREEN_INDEX, 4);
+	state.SetStencil(0, SOP_Keep);
+	state.SetDepthRange(0, 1);
+	state.SetDepthFunc(DF_Less);
+	state.EnableDepthTest(true);
+	state.SetDepthMask(true);
+	state.SetColorMask(true);
+	state.EnableTexture(true);
+	state.SetEffect(EFF_NONE);
+	screen->mViewpoints->Bind(state, vpIndex);
+}
+
+void HWDrawInfo::RenderLateSkyPortal(HWPortal *p, FRenderState &state)
+{
+	p->DrawLateSkySurfaces(this, state, HWPortal::LSS_Depth);
+	p->DrawLateSkySurfaces(this, state, HWPortal::LSS_Mark);
+	LateSkyScreenQuad(this, state, true, vpIndex);
+	p->SetupStencil(this, state, false);
+	state.SetStencil(1, SOP_Keep);
+	auto new_di = StartDrawInfo(this->Level, this, Viewpoint, &VPUniforms);
+	new_di->mCurrentPortal = p;
+	state.SetLightIndex(-1);
+	p->DrawContents(new_di, state);
+	new_di->EndDrawInfo();
+	state.SetVertexBuffer(screen->mVertexData);
+	screen->mViewpoints->Bind(state, vpIndex);
+	LateSkyScreenQuad(this, state, false, vpIndex);
+	p->DrawLateSkySurfaces(this, state, HWPortal::LSS_Reset);
 }
 
 void HWDrawInfo::DrawCorona(FRenderState& state, ACorona* corona, double dist)
@@ -931,7 +1157,7 @@ void HWDrawInfo::EndDrawScene(sector_t * viewsector, FRenderState &state)
 	}*/
 
 	// [BB] HUD models need to be rendered here.
-	const bool renderHUDModel = IsHUDModelForPlayerAvailable(players[consoleplayer].camera->player);
+	const bool renderHUDModel = IsHUDModelForPlayerAvailable(WorldModeRenderPlayer(consoleplayer)->camera->player);
 	if (renderHUDModel)
 	{
 		// [BB] The HUD model should be drawn over everything else already drawn.
@@ -953,7 +1179,7 @@ void HWDrawInfo::EndDrawScene(sector_t * viewsector, FRenderState &state)
 
 void HWDrawInfo::DrawEndScene2D(sector_t * viewsector, FRenderState &state)
 {
-	const bool renderHUDModel = IsHUDModelForPlayerAvailable(players[consoleplayer].camera->player);
+	const bool renderHUDModel = IsHUDModelForPlayerAvailable(WorldModeRenderPlayer(consoleplayer)->camera->player);
 	auto vrmode = VRMode::GetVRMode(true);
 
 	HWViewpointUniforms vp = VPUniforms;
@@ -1019,7 +1245,7 @@ void HWDrawInfo::DrawScene(int drawmode)
 		applySSAO = true;
 		if (r_dithertransparency && vp.bDoOob)
 		{
-			vp.camera->tracer ? SetDitherTransFlags(vp.camera->tracer) : SetDitherTransFlags(players[consoleplayer].mo);
+			vp.camera->tracer ? SetDitherTransFlags(vp.camera->tracer) : SetDitherTransFlags(WorldModeRenderPlayer(consoleplayer)->mo);
 		}
 	}
 	else if (drawmode == DM_OFFSCREEN)
@@ -1032,22 +1258,39 @@ void HWDrawInfo::DrawScene(int drawmode)
 		ssao_portals_available--;
 	}
 
+	auto& stageState = *screen->RenderState();
+	const bool profileStages = drawmode == DM_MAINVIEW && IsGPUProfilingEnabled();
+	if (profileStages) stageState.BeginGPUProfile("create_scene");
 	if (vp.camera != nullptr)
 	{
 		ActorRenderFlags savedflags = vp.camera->renderflags;
+		FFrameStageScope stage(FS_CreateScene);
 		CreateScene(drawmode == DM_MAINVIEW);
 		vp.camera->renderflags = savedflags;
 	}
 	else
 	{
+		FFrameStageScope stage(FS_CreateScene);
 		CreateScene(false);
 	}
+	if (profileStages) stageState.EndGPUProfile();
 	auto& RenderState = *screen->RenderState();
 
 	RenderState.SetDepthMask(true);
+	if (profileStages) RenderState.BeginGPUProfile("first_sky");
 	if (!gl_no_skyclear) portalState.RenderFirstSkyPortal(recursion, this, RenderState);
+	if (profileStages) RenderState.EndGPUProfile();
 
-	RenderScene(RenderState);
+	{
+		FFrameStageScope stage(FS_RenderScene);
+		RenderScene(RenderState);
+	}
+	if (portalState.LateSky != nullptr && recursion == 0)
+	{
+		if (profileStages) RenderState.BeginGPUProfile("late_sky");
+		portalState.RenderLateSky(this, RenderState);
+		if (profileStages) RenderState.EndGPUProfile();
+	}
 
 	if (applySSAO && RenderState.GetPassType() == GBUFFER_PASS)
 	{
@@ -1058,8 +1301,11 @@ void HWDrawInfo::DrawScene(int drawmode)
 	// Handle all portals after rendering the opaque objects but before
 	// doing all translucent stuff
 	recursion++;
+	if (profileStages) RenderState.BeginGPUProfile("portals");
 	portalState.EndFrame(this, RenderState);
+	if (profileStages) RenderState.EndGPUProfile();
 	recursion--;
+	FFrameStageScope stage(FS_Translucent);
 	RenderTranslucent(RenderState);
 }
 

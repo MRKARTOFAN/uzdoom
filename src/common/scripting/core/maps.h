@@ -23,6 +23,7 @@
 
 #pragma once
 
+#include <optional>
 #include "tarray.h"
 #include "refcounted.h"
 #include "vm.h"
@@ -58,18 +59,14 @@ template<class KT, class VT>
 struct ZSMapIterator
 {
 	RefCountedPtr<ZSMapInfo> info;
-	TMapIterator<KT,VT>  *it = nullptr;
+	// [Karto] Held inline: scripts init a local iterator per loop, so a heap one would allocate every time.
+	std::optional<TMapIterator<KT,VT>> it;
 	typename ZSMap<KT,VT>::Pair *p = nullptr;
 
 	typedef KT KeyType;
 	typedef VT ValueType;
 
 	int rev = 0;
-
-	~ZSMapIterator()
-	{
-		if(it) delete it;
-	}
 
 	bool Valid()
 	{
@@ -79,8 +76,7 @@ struct ZSMapIterator
 	bool ReInit()
 	{
 		if(info.get() && info->self) {
-			if(it) delete it;
-			it = new TMapIterator<KT,VT>(*static_cast<ZSMap<KT,VT>*>(info->self));
+			it.emplace(*static_cast<ZSMap<KT,VT>*>(info->self));
 			rev = info->rev;
 			p = nullptr;
 			return true;

@@ -24,6 +24,8 @@
 
 #include "zvulkan/vulkanobjects.h"
 #include <list>
+#include <map>
+#include <tuple>
 #include "tarray.h"
 
 class VulkanRenderDevice;
@@ -54,6 +56,24 @@ public:
 
 	std::unique_ptr<VulkanDescriptorSet> AllocateTextureDescriptorSet(int numLayers);
 
+	void TryCreateBindlessTextureSet();
+	bool IsBindlessEnabled() const;
+	VulkanDescriptorSetLayout* GetBindlessTextureSetLayout() const { return IsBindlessEnabled() ? BindlessTextureSetLayout.get() : nullptr; }
+	VulkanDescriptorSet* GetBindlessTextureSet() const { return IsBindlessEnabled() ? BindlessTextureSet.get() : nullptr; }
+	int GetBindlessTextureCapacity() const { return IsBindlessEnabled() ? BindlessTextureCapacity : 0; }
+	bool IsBindlessTextureReady(int index, VulkanImageView* view, VulkanSampler* sampler, VkImageLayout layout) const;
+	void RegisterBindlessTexture(int index, VulkanImageView* view, VulkanSampler* sampler, VkImageLayout layout);
+	void UnregisterBindlessTexture(int index);
+	void InvalidateBindlessTextures();
+	VulkanDescriptorSet* GetGpuWorldTextureSet() const { return GpuWorldTextureSet.get(); }
+	VulkanDescriptorSetLayout* GetGpuWorldSetLayout();
+	std::unique_ptr<VulkanDescriptorSet> AllocateGpuWorldSet(VulkanBuffer* buffer, VulkanBuffer* references = nullptr, VulkanBuffer* visibility = nullptr,
+		VulkanBuffer* surfaceParams = nullptr, VulkanBuffer* params = nullptr, VulkanBuffer* planeMatrices = nullptr,
+		VulkanBuffer* planeHeights = nullptr, VulkanBuffer* vertexRefs = nullptr, bool transient = false, VulkanBuffer* surfaceLights = nullptr,
+		VulkanBuffer* worldLights = nullptr);
+	int GetGpuWorldTexture(VulkanImageView* view, VulkanSampler* sampler, VkImageLayout layout);
+	uint64_t GetGpuWorldTextureEpoch() const { return GpuWorldTextureEpoch; }
+
 	VulkanDescriptorSet* GetInput(VkPPRenderPassSetup* passSetup, const TArray<PPTextureInput>& textures, bool bindShadowMapBuffers);
 
 	void AddMaterial(VkMaterial* texture);
@@ -64,6 +84,7 @@ private:
 	void CreateFixedSetLayout();
 	void CreateHWBufferPool();
 	void CreateFixedSetPool();
+	void CreateBindlessTextureSet(int maxTextures);
 
 	std::unique_ptr<VulkanDescriptorSet> AllocatePPDescriptorSet(VulkanDescriptorSetLayout* layout);
 
@@ -85,6 +106,32 @@ private:
 	std::unique_ptr<VulkanDescriptorSet> HWBufferSet;
 	std::unique_ptr<VulkanDescriptorSet> FixedSet;
 	std::unique_ptr<VulkanDescriptorSet> NullTextureDescriptorSet;
+
+	std::unique_ptr<VulkanDescriptorSetLayout> BindlessTextureSetLayout;
+	std::unique_ptr<VulkanDescriptorPool> BindlessTexturePool;
+	std::unique_ptr<VulkanDescriptorSet> BindlessTextureSet;
+	int BindlessTextureCapacity = 0;
+	struct BindlessTextureSlot
+	{
+		VulkanImageView* View = nullptr;
+		VulkanSampler* Sampler = nullptr;
+		VkImageLayout Layout = VK_IMAGE_LAYOUT_UNDEFINED;
+		uint64_t Epoch = 0;
+		bool Compatible = false;
+	};
+	std::vector<BindlessTextureSlot> BindlessTextureSlots;
+	uint64_t BindlessTextureEpoch = 1;
+	std::unique_ptr<VulkanDescriptorSet> GpuWorldTextureSet;
+	std::unique_ptr<VulkanDescriptorSetLayout> GpuWorldSetLayout;
+	std::unique_ptr<VulkanDescriptorPool> GpuWorldPool;
+	// [Karto] Per-frame sets (GPU sprites) use their own pool: retiring a full pool frees every set in it, and the shared
+	// pool also holds world mode's map-lifetime set.
+	std::unique_ptr<VulkanDescriptorPool> TransientGpuWorldPool;
+	std::map<std::tuple<VulkanImageView*, VulkanSampler*, VkImageLayout>, uint32_t> GpuWorldTextures;
+	uint32_t GpuWorldTextureCount = 0;
+	uint64_t GpuWorldTextureEpoch = 1;
+	bool BindlessCreationFailed = false;
+	int BindlessRegisterCount = 0;
 
 	std::list<VkMaterial*> Materials;
 

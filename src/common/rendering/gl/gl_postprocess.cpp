@@ -41,6 +41,9 @@
 #include "i_time.h"
 #include "g_levellocals.h"
 
+struct FLevelLocals;
+int WorldModeFrameTimer(FLevelLocals* level);
+
 extern bool vid_hdr_active;
 
 CVAR(Int, gl_dither_bpc, 0, CVAR_ARCHIVE | CVAR_GLOBALCONFIG | CVAR_NOINITCALL)
@@ -65,7 +68,8 @@ void FGLRenderer::PostProcessScene(int fixedcm, float flash, const std::function
 
 	renderstate.TimeDelta = static_cast<float>(GetDeltaTime());
 	renderstate.Time = static_cast<float>(screen->FrameTime / 1000.0);
-	renderstate.TimeGame = static_cast<float>(primaryLevel->LocalWorldTimer / (double)GameTicRate);
+	// [Karto] Shader game time follows the tic that frames draw, which can lag the simulation.
+	renderstate.TimeGame = static_cast<float>(WorldModeFrameTimer(primaryLevel) / (double)GameTicRate);
 
 	hw_postprocess.Pass1(&renderstate, fixedcm, sceneWidth, sceneHeight);
 	mBuffers->BindCurrentFB();

@@ -32,6 +32,7 @@
 #include "a_dynlight.h"
 #include "actorinlines.h"
 #include "memarena.h"
+#include <algorithm>
 
 static FMemArena DynLightArena(sizeof(FDynamicLight) * 200);
 static TArray<FDynamicLight*> FreeList;
@@ -61,7 +62,7 @@ FDynamicLight *FDynamicLight::GetLight(FLevelLocals *Level)
 	Level->lights = ret;
 	if (ret->next) ret->next->prev = ret;
 	ret->flags |= ILF_VISIBLE_TO_PLAYER;
-	ret->mShadowmapIndex = 1024;
+	ret->mShadowmapIndex = IShadowMap::Rows;
 	ret->Level = Level;
 	ret->Pos.X = -10000000;	// not a valid coordinate.
 	return ret;
@@ -90,14 +91,14 @@ void FDynamicLight::AttachLight(AActor *self)
 	light->specialf1 = DAngle::fromDeg(double(self->SpawnAngle)).Normalized360().Degrees();
 	light->Sector = self->Sector;
 	light->target = self;
-	light->mShadowmapIndex = 1024;
+	light->mShadowmapIndex = IShadowMap::Rows;
 	light->flags &= ~(ILF_ACTIVE);
 	light->flags |= ILF_VISIBLE_TO_PLAYER;
 
 	ELightType type = static_cast<ELightType>(self->IntVar(NAME_lighttype));
 
 	if(type > RandomColorFlickerLight) type = PointLight;
-	
+
 	light->SetLightType(type);
 	self->AttachedLights.Push(light);
 
@@ -181,6 +182,10 @@ DEFINE_ACTION_FUNCTION_NATIVE(ADynamicLight, SetOffset, SetOffset)
 
 void FDynamicLight::ReleaseLight()
 {
+	for (auto key : cellKeys)
+	{
+		Level->lightgrid.RemoveLightFromCell(key, this);
+	}
 	assert(prev != nullptr || this == Level->lights);
 	if (prev != nullptr) prev->next = next;
 	else Level->lights = next;
@@ -222,6 +227,12 @@ void FDynamicLight::Activate()
 // [TS]
 //
 //==========================================================================
+float FDynamicLight::OwnerLightAlpha()
+{
+	if (PublishedCopy) return PublishedOwnerAlpha;
+	return target && (target->renderflags2 & RF2_LIGHTMULTALPHA) ? (float)target->Alpha : 1.f;
+}
+
 void FDynamicLight::Tick()
 {
 	if (!target)
@@ -401,6 +412,7 @@ void FDynamicLight::UpdateLocation()
 		{
 			//Update the light lists
 			LinkLight();
+			UpdateLightGrid();
 		}
 	}
 }
@@ -482,6 +494,9 @@ struct LightLinkEntry
 	DVector3 pos;
 };
 static TArray<LightLinkEntry> collected_ss;
+static TArray<FSection*> LinkSections, SortedLinkSections;
+static TArray<side_t*> LinkSides, SortedLinkSides;
+static bool LinkHitOneSidedBack;
 
 void FDynamicLight::CollectWithinRadius(const DVector3 &opos, FSection *section, float radius)
 {
@@ -496,7 +511,7 @@ void FDynamicLight::CollectWithinRadius(const DVector3 &opos, FSection *section,
 		auto pos = collected_ss[i].pos;
 		section = collected_ss[i].sect;
 
-		AddLightNode(section, NULL);
+		LinkSections.Push(section);
 
 
 		auto processSide = [&](side_t *sidedef, const vertex_t *v1, const vertex_t *v2)
@@ -509,7 +524,7 @@ void FDynamicLight::CollectWithinRadius(const DVector3 &opos, FSection *section,
 				{
 					linedef->validcount = ::validcount;
 
-					AddLightNode(NULL, sidedef);
+					LinkSides.Push(sidedef);
 				}
 				else if (linedef->sidedef[0] == sidedef && linedef->sidedef[1] == nullptr)
 				{
@@ -600,10 +615,71 @@ void FDynamicLight::CollectWithinRadius(const DVector3 &opos, FSection *section,
 			}
 		}
 	}
-	if((hitonesidedback && !DontShadowmap() && IsActive()) == !(flags & ILF_SHADOWMAPPED))
+	LinkHitOneSidedBack = hitonesidedback;
+}
+
+//==========================================================================
+//
+// Update the world light grid
+//
+//==========================================================================
+
+void FDynamicLight::UpdateLightGrid()
+{
+	TArray<uint64_t> newCellKeys;
+
+	float radius = GetRadius();
+
+	int minX = FLightGrid::WorldToCell(Pos.X - radius);
+	int maxX = FLightGrid::WorldToCell(Pos.X + radius);
+	int minY = FLightGrid::WorldToCell(Pos.Y - radius);
+	int maxY = FLightGrid::WorldToCell(Pos.Y + radius);
+
+	for (int x = minX; x <= maxX; x++)
 	{
-		flags ^= ILF_SHADOWMAPPED;
+		for (int y = minY; y <= maxY; y++)
+		{
+			newCellKeys.Push(FLightGrid::MakeCellKey(x, y));
+		}
 	}
+
+	FLightGrid *grid = &Level->lightgrid;
+
+	unsigned oldIndex = 0;
+	unsigned newIndex = 0;
+
+	while (oldIndex < cellKeys.Size() && newIndex < newCellKeys.Size())
+	{
+		uint64_t oldKey = cellKeys[oldIndex];
+		uint64_t newKey = newCellKeys[newIndex];
+
+		if (oldKey == newKey)
+		{
+			// Cell exists in both sets.
+			oldIndex++;
+			newIndex++;
+		}
+		else if (oldKey < newKey)
+		{
+			// Present only in old keys: remove.
+			grid->RemoveLightFromCell(oldKey, this);
+			oldIndex++;
+		}
+		else
+		{
+			// Present only in new keys: add.
+			grid->AddLightToCell(newKey, this);
+			newIndex++;
+		}
+	}
+
+	while (oldIndex < cellKeys.Size())
+		grid->RemoveLightFromCell(cellKeys[oldIndex++], this);
+
+	while (newIndex < newCellKeys.Size())
+		grid->AddLightToCell(newCellKeys[newIndex++], this);
+
+	cellKeys.Swap(newCellKeys);
 }
 
 //==========================================================================
@@ -612,18 +688,79 @@ void FDynamicLight::CollectWithinRadius(const DVector3 &opos, FSection *section,
 //
 //==========================================================================
 
+CVAR(Bool, r_lightlink_keep, true, 0)
+CVAR(Bool, r_lightlink_keep_verify, false, 0)
+static uint64_t LightLinkStats[3];	// links, kept, verify mismatches
+
+template<class T> static bool LightLinkSameSet(const TArray<T*>& found, TArray<T*>& sorted, const TArray<T*>& current)
+{
+	sorted = found;
+	std::sort(sorted.begin(), sorted.end());
+	const auto end = std::unique(sorted.begin(), sorted.end());
+	sorted.Resize(unsigned(end - sorted.begin()));
+	if (sorted.Size() != current.Size()) return false;
+	for (unsigned i = 0; i < sorted.Size(); i++)
+	{
+		if (sorted[i] != current[i]) return false;
+	}
+	return true;
+}
+
+template<class T> static bool LightLinkSameList(const TArray<T*>& a, const TArray<T*>& b)
+{
+	if (a.Size() != b.Size()) return false;
+	for (unsigned i = 0; i < a.Size(); i++)
+	{
+		if (a[i] != b[i]) return false;
+	}
+	return true;
+}
+
+CCMD(lightlink_stats)
+{
+	Printf("LIGHTLINK keep=%d verify=%d links=%llu kept=%llu mismatches=%llu\n", int(r_lightlink_keep), int(r_lightlink_keep_verify),
+		(unsigned long long)LightLinkStats[0], (unsigned long long)LightLinkStats[1], (unsigned long long)LightLinkStats[2]);
+	if (argv.argc() > 1) memset(LightLinkStats, 0, sizeof(LightLinkStats));
+}
+
 void FDynamicLight::LinkLight()
 {
-	UnlinkLight();
-	if(radius > 0)
+	// passing in radius*radius allows us to do a distance check without any calls to sqrt
+	FSection *sect = radius > 0 ? Level->PointInRenderSubsector(Pos)->section : nullptr;
+	if (sect == nullptr)
 	{
-		// passing in radius*radius allows us to do a distance check without any calls to sqrt
-		FSection *sect = Level->PointInRenderSubsector(Pos)->section;
-
-		dl_validcount++;
-		::validcount++;
-		CollectWithinRadius(Pos, sect, float(radius*radius));
+		UnlinkLight();
+		if (radius > 0)
+		{
+			dl_validcount++;
+			::validcount++;
+		}
+		return;
 	}
+
+	dl_validcount++;
+	::validcount++;
+	LinkSections.Clear();
+	LinkSides.Clear();
+	CollectWithinRadius(Pos, sect, float(radius*radius));
+	const bool shadowmapped = LinkHitOneSidedBack && !DontShadowmap() && IsActive();
+	LightLinkStats[0]++;
+	const bool same = r_lightlink_keep && LightLinkSameSet(LinkSections, SortedLinkSections, touchlists.flat_tlist) &&
+		LightLinkSameSet(LinkSides, SortedLinkSides, touchlists.wall_tlist);
+	if (same && !r_lightlink_keep_verify)
+	{
+		LightLinkStats[1]++;
+		if (shadowmapped) flags |= ILF_SHADOWMAPPED;
+		else flags &= ~ILF_SHADOWMAPPED;
+		return;
+	}
+
+	UnlinkLight();
+	for (FSection *section : LinkSections) AddLightNode(section, NULL);
+	for (side_t *sidedef : LinkSides) AddLightNode(NULL, sidedef);
+	if (shadowmapped) flags |= ILF_SHADOWMAPPED;
+	if (same && !(LightLinkSameList(SortedLinkSections, touchlists.flat_tlist) && LightLinkSameList(SortedLinkSides, touchlists.wall_tlist)))
+		LightLinkStats[2]++;
 }
 
 
@@ -634,6 +771,8 @@ void FDynamicLight::LinkLight()
 //==========================================================================
 void FDynamicLight::UnlinkLight()
 {
+	++LinkSerial;
+
 	for(int i = 0; i < touchlists.wall_tlist.SSize(); i++)
 	{
 		if(touchlists.wall_tlist[i])
@@ -662,6 +801,10 @@ void FDynamicLight::UnlinkLight()
 //
 //==========================================================================
 
+// [Karto] Linking writes the per-section light maps frames read, so the worker defers it to the main-thread client pass.
+bool DeferLightLinks = false;
+TArray<FDynamicLight*> DeferredLightLinks;
+
 void AActor::AttachLight(unsigned int count, const FLightDefaults *lightdef)
 {
 	if(ObjectFlags & OF_EuthanizeMe) return;
@@ -680,7 +823,8 @@ void AActor::AttachLight(unsigned int count, const FLightDefaults *lightdef)
 		AttachedLights.Push(light);
 	}
 	lightdef->ApplyProperties(light);
-	light->UpdateLocation();
+	if (DeferLightLinks) DeferredLightLinks.Push(light);
+	else light->UpdateLocation();
 }
 
 //==========================================================================
@@ -731,14 +875,36 @@ void AActor::SetDynamicLights()
 //
 //==========================================================================
 
+// [Karto] Releasing lights on the worker would delete nodes of per-section light maps that main-thread frames walk; it waits
+// for P_TickerOnMainAfterWorker, before the client pass ticks any light.
+CVAR(Bool, r_light_deferrelease, true, 0)
+bool TicWorkerOnThread();
+static TArray<FDynamicLight*> DeferredLightReleases;
+
 void AActor::DeleteAttachedLights()
 {
+	const bool defer = r_light_deferrelease && TicWorkerOnThread();
 	for (auto l : AttachedLights)
 	{
+		if (defer)
+		{
+			DeferredLightReleases.Push(l);
+			continue;
+		}
 		l->UnlinkLight();
 		l->ReleaseLight();
 	}
 	AttachedLights.Clear();
+}
+
+void P_FinishDeferredLightReleases()
+{
+	for (auto l : DeferredLightReleases)
+	{
+		l->UnlinkLight();
+		l->ReleaseLight();
+	}
+	DeferredLightReleases.Clear();
 }
 
 //==========================================================================
@@ -784,6 +950,7 @@ int AttachLightDef(AActor *self, int _lightid, int _lightname)
 		auto userlight = self->UserLights[FindUserLight(self, lightid, true)];
 		userlight->CopyFrom(*LightDefaults[lightdef]);
 		self->flags8 |= MF8_RECREATELIGHTS;
+		self->QueueRecreate();
 		self->Level->flags3 |= LEVEL3_LIGHTCREATED;
 		return 1;
 	}
@@ -832,6 +999,7 @@ int AttachLightDirect(AActor *self, int _lightid, int type, int color, int radiu
 		userlight->UnsetSpotPitch();
 	}
 	self->flags8 |= MF8_RECREATELIGHTS;
+	self->QueueRecreate();
 	self->Level->flags3 |= LEVEL3_LIGHTCREATED;
 	return 1;
 }
@@ -871,6 +1039,7 @@ int RemoveLight(AActor *self, int _lightid)
 		delete self->UserLights[userlight];
 		self->UserLights.Delete(userlight);
 		self->flags8 |= MF8_RECREATELIGHTS;
+		self->QueueRecreate();
 		self->Level->flags3 |= LEVEL3_LIGHTCREATED;
 		return 1;
 	}

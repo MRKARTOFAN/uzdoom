@@ -32,6 +32,8 @@
 #include "r_data/r_vanillatrans.h"
 #include "matrix.h"
 #include "models.h"
+#include "hw_spriterecord.h"
+#include "c_dispatch.h"
 #include "vectors.h"
 #include "texturemanager.h"
 #include "basics.h"
@@ -53,6 +55,8 @@
 #include "quaternion.h"
 
 #include "p_visualthinker.h"
+#include "i_time.h"
+#include <climits>
 
 extern TArray<spritedef_t> sprites;
 extern TArray<spriteframe_t> SpriteFrames;
@@ -75,6 +79,10 @@ EXTERN_CVAR(Int, r_distance_cull_type)
 
 CVAR(Bool, gl_usecolorblending, true, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
 CVAR(Bool, gl_sprite_blend, false, CVAR_ARCHIVE | CVAR_GLOBALCONFIG);
+CVAR(Bool, r_sprite_batch, true, 0)
+CVAR(Bool, r_sprite_gpu_check, false, 0)
+CVAR(Bool, r_sprite_gpu_lights, true, 0)
+CVAR(Bool, r_sprite_indexed, true, 0)
 CVAR(Int, gl_spriteclip, -1, CVAR_ARCHIVE)
 CVAR(Bool, r_debug_nolimitanamorphoses, false, 0)
 CVAR(Float, r_spriteclipanamorphicminbias, 0.6, CVAR_ARCHIVE)
@@ -96,7 +104,7 @@ CUSTOM_CVAR(Int, gl_fuzztype, 8, CVAR_ARCHIVE)
 //
 //==========================================================================
 
-void HWSprite::DrawSprite(HWDrawInfo *di, FRenderState &state, bool translucent)
+void HWSprite::DrawSprite(HWDrawInfo *di, FRenderState &state, bool translucent, bool runStart)
 {
 	bool additivefog = false;
 	bool foglayer = false;
@@ -115,7 +123,7 @@ void HWSprite::DrawSprite(HWDrawInfo *di, FRenderState &state, bool translucent)
 
 		// Optionally use STYLE_ColorBlend in place of STYLE_Add for fullbright items.
 		if (RenderStyle == LegacyRenderStyles[STYLE_Add] && trans > 1.f - FLT_EPSILON &&
-			gl_usecolorblending && !di->isFullbrightScene() && actor &&
+			gl_usecolorblending && !di->isFullbrightScene() && (actor || record) &&
 			fullbright && texture && !texture->GetTranslucency())
 		{
 			RenderStyle = LegacyRenderStyles[STYLE_ColorAdd];
@@ -162,7 +170,8 @@ void HWSprite::DrawSprite(HWDrawInfo *di, FRenderState &state, bool translucent)
 	{
 		// This still needs to set the texture mode. As blend mode it will always use GL_ONE/GL_ZERO
 		state.SetTextureMode(RenderStyle);
-		state.SetDepthBias(-1, -128);
+		// [Karto] The bias keeps wall sprites in front of their wall; face sprites in the solid list match the sorted pass's no-bias draw.
+		if (record == nullptr && (actor == nullptr || (actor->renderflags & RF_SPRITETYPEMASK) != RF_FACESPRITE)) state.SetDepthBias(-1, -128);
 	}
 	if (RenderStyle.BlendOp != STYLEOP_Shadow)
 	{
@@ -171,11 +180,15 @@ void HWSprite::DrawSprite(HWDrawInfo *di, FRenderState &state, bool translucent)
 			if (dynlightindex == -1)	// only set if we got no light buffer index. This covers all cases where sprite lighting is used.
 			{
 				float out[3] = {};
-				di->GetDynSpriteLight(gl_light_sprites ? actor : nullptr, gl_light_particles ? particle : nullptr, out);
+				if (record != nullptr)
+				{
+					if (gl_light_sprites) di->GetDynSpriteLight(*record, out);
+				}
+				else di->GetDynSpriteLight(gl_light_sprites ? actor : nullptr, gl_light_particles ? particle : nullptr, out);
 				state.SetDynLight(out[0], out[1], out[2]);
 			}
 		}
-		sector_t *cursec = actor ? actor->Sector : particle ? particle->subsector->sector : nullptr;
+		sector_t *cursec = record ? record->Sector : actor ? actor->Sector : particle ? particle->subsector->sector : nullptr;
 		if (cursec != nullptr)
 		{
 			const PalEntry finalcol = fullbright
@@ -227,7 +240,7 @@ void HWSprite::DrawSprite(HWDrawInfo *di, FRenderState &state, bool translucent)
 	}
 
 	uint32_t spritetype = actor? uint32_t(actor->renderflags & RF_SPRITETYPEMASK) : 0;
-	if (texture) state.SetMaterial(texture, UF_Sprite, (spritetype == RF_FACESPRITE) ? CTF_Expand : 0, clampmode, translation, OverrideShader, actor ? actor->GetClass() : nullptr);
+	if (texture) state.SetMaterial(texture, UF_Sprite, (spritetype == RF_FACESPRITE) ? CTF_Expand : 0, clampmode, translation, OverrideShader, record ? record->Class : actor ? actor->GetClass() : nullptr);
 	else if (!modelframe) state.EnableTexture(false);
 
 	//SetColor(lightlevel, rel, Colormap, trans);
@@ -277,16 +290,20 @@ void HWSprite::DrawSprite(HWDrawInfo *di, FRenderState &state, bool translucent)
 			state.SetNormal(0, 0, 0);
 
 
+			const bool batch = (runStart || (r_sprite_batch && !translucent)) && !clipping && !foglayer && (record != nullptr ||
+				(actor != nullptr && (actor->renderflags & RF_SPRITETYPEMASK) == RF_FACESPRITE)) && screen->BuffersArePersistent();
 			if (screen->BuffersArePersistent())
 			{
-				CreateVertices(di);
+				CreateVertices(di, batch);
 			}
 			if (polyoffset)
 			{
 				state.SetDepthBias(-1, -128);
 			}
 			state.SetLightIndex(-1);
-			state.Draw(DT_TriangleStrip, vertexindex, 4);
+			if (!batch) state.Draw(DT_TriangleStrip, vertexindex, 4);
+			else if (polyoffset) state.Draw(DT_TriangleFan, vertexindex, 4);
+			else state.DrawBatchedQuad(vertexindex);
 
 			if (foglayer)
 			{
@@ -315,11 +332,14 @@ void HWSprite::DrawSprite(HWDrawInfo *di, FRenderState &state, bool translucent)
 				}
 			}
 
+			if (ModelCensusArmed) ModelCensusActor(this, di, translucent, clipping);
 			FHWModelRenderer renderer(di, state, dynlightindex);
 			RenderModel(&renderer, x, y, z, modelframe, actor, Net_ModifyObjectFrac(actor, di->Viewpoint.TicFrac));
 			state.SetVertexBuffer(screen->mVertexData);
 		}
 	}
+
+	if (runStart) return;
 
 	if (clipping)
 	{
@@ -347,13 +367,76 @@ void HWSprite::DrawSprite(HWDrawInfo *di, FRenderState &state, bool translucent)
 	state.SetDynLight(0, 0, 0);
 }
 
+void HWSprite::DrawRunRepeat(HWDrawInfo *di, FRenderState &state)
+{
+	CreateVertices(di, true);
+	if (polyoffset)
+	{
+		state.SetDepthBias(-1, -128);
+		state.Draw(DT_TriangleFan, vertexindex, 4);
+	}
+	else state.DrawBatchedQuadSameState(vertexindex);
+}
+
+// [Karto] What DrawSprite's end restores for a translucent face sprite without clipping, the only kind the additive pass takes.
+void HWSprite::FinishAdditiveRun(FRenderState &state)
+{
+	state.EnableBrightmap(true);
+	state.SetRenderStyle(STYLE_Translucent);
+	state.SetTextureMode(TM_NORMAL);
+	state.SetObjectColor(0xffffffff);
+	state.SetAddColor(0);
+	state.EnableTexture(true);
+	state.SetDynLight(0, 0, 0);
+}
+
+void HWSprite::FinishSolidRun(FRenderState &state)
+{
+	state.ClearDepthBias();
+	state.SetObjectColor(0xffffffff);
+	state.SetAddColor(0);
+	state.EnableTexture(true);
+	state.SetDynLight(0, 0, 0);
+}
+
+void HWSpriteRunKey::Set(HWDrawInfo *di, const HWSprite &s)
+{
+	texture = s.texture;
+	cls = s.record ? (const void*)s.record->Class : (const void*)s.actor->GetClass();
+	Colormap = s.Colormap;
+	lightlevel = s.lightlevel;
+	OverrideShader = s.OverrideShader;
+	translation = s.translation.index();
+	style = s.RenderStyle.AsDWORD;
+	thingColor = s.ThingColor.d;
+	sector_t *cursec = s.record ? s.record->Sector : s.actor->Sector;
+	hasSector = cursec != nullptr;
+	sectorColor = hasSector ? cursec->SpecialColors[sector_t::sprites].d : 0;
+	sectorAdd = hasSector ? cursec->AdditiveColors[sector_t::sprites].d : 0;
+	trans = s.trans;
+	foglevel = s.foglevel;
+	hw_styleflags = s.hw_styleflags;
+	fullbright = s.fullbright;
+	fromRecord = s.record != nullptr;
+	dynlight = di->Level->HasDynamicLights && !di->isFullbrightScene() && !s.fullbright;
+}
+
+bool HWSpriteRunKey::operator==(const HWSpriteRunKey &o) const
+{
+	return texture == o.texture && cls == o.cls && memcmp(&Colormap, &o.Colormap, sizeof(Colormap)) == 0 &&
+		lightlevel == o.lightlevel && OverrideShader == o.OverrideShader && translation == o.translation && style == o.style &&
+		thingColor == o.thingColor && hasSector == o.hasSector && sectorColor == o.sectorColor && sectorAdd == o.sectorAdd &&
+		trans == o.trans && foglevel == o.foglevel && hw_styleflags == o.hw_styleflags && fullbright == o.fullbright &&
+		fromRecord == o.fromRecord && dynlight == o.dynlight;
+}
+
 //==========================================================================
 //
 //
 //
 //==========================================================================
 
-void HandleSpriteOffsets(Matrix3x4 *mat, const FRotator *HW, FVector2 *offset, bool XYBillboard)
+static void SpriteOffsetBasis(const FRotator *HW, bool XYBillboard, FVector3& side, FVector3& up)
 {
 	FAngle zero = FAngle::fromDeg(0);
 	FAngle pitch = (XYBillboard) ? HW->Pitch : zero;
@@ -362,8 +445,16 @@ void HandleSpriteOffsets(Matrix3x4 *mat, const FRotator *HW, FVector2 *offset, b
 	FQuaternion quat = FQuaternion::FromAngles(yaw, pitch, zero);
 	FVector3 sideVec = quat * FVector3(0, 1, 0);
 	FVector3 upVec = quat * FVector3(0, 0, 1);
-	FVector3 res = sideVec * offset->X + upVec * offset->Y;
-	mat->Translate(res.X, res.Z, res.Y);
+	side = FVector3(sideVec.X, sideVec.Z, sideVec.Y);
+	up = FVector3(upVec.X, upVec.Z, upVec.Y);
+}
+
+void HandleSpriteOffsets(Matrix3x4 *mat, const FRotator *HW, FVector2 *offset, bool XYBillboard)
+{
+	FVector3 side, up;
+	SpriteOffsetBasis(HW, XYBillboard, side, up);
+	FVector3 res = side * offset->X + up * offset->Y;
+	mat->Translate(res.X, res.Y, res.Z);
 }
 
 bool HWSprite::CalculateVertices(HWDrawInfo* di, FVector3* v, DVector3* vp)
@@ -412,7 +503,8 @@ bool HWSprite::CalculateVertices(HWDrawInfo* di, FVector3* v, DVector3* vp)
 
 	// [BB] Billboard stuff
 	const bool drawWithXYBillboard = ((particle && (gl_billboard_particles || gl_billboard_mode == 1) && !(particle->flags & SPF_NO_XY_BILLBOARD))
-		|| (actor && !(actor->renderflags & RF_FORCEYBILLBOARD) && (gl_billboard_mode == 1 || actor->renderflags & RF_FORCEXYBILLBOARD))) && !AngledRoll;
+		|| (actor && !(actor->renderflags & RF_FORCEYBILLBOARD) && (gl_billboard_mode == 1 || actor->renderflags & RF_FORCEXYBILLBOARD))
+		|| (record && !(record->renderflags & RF_FORCEYBILLBOARD) && (gl_billboard_mode == 1 || record->renderflags & RF_FORCEXYBILLBOARD))) && !AngledRoll;
 
 	bool drawBillboardFacingCamera = gl_billboard_faces_camera;
 	if (!hw_force_cambbpref)
@@ -434,7 +526,7 @@ bool HWSprite::CalculateVertices(HWDrawInfo* di, FVector3* v, DVector3* vp)
 	}
 
 	// [Nash] has +ROLLSPRITE
-	const bool drawRollSpriteActor = (actor != nullptr && actor->renderflags & RF_ROLLSPRITE);
+	const bool drawRollSpriteActor = (actor != nullptr && actor->renderflags & RF_ROLLSPRITE) || (record != nullptr && record->renderflags & RF_ROLLSPRITE);
 	const bool drawRollParticle = (particle != nullptr && particle->flags & SPF_ROLL);
 	const bool doRoll = (drawRollSpriteActor || drawRollParticle);
 
@@ -444,7 +536,7 @@ bool HWSprite::CalculateVertices(HWDrawInfo* di, FVector3* v, DVector3* vp)
 
 	// [Nash] is a flat sprite
 	const bool isWallSprite = (actor != nullptr) && (spritetype == RF_WALLSPRITE);
-	const bool useOffsets = ((actor != nullptr) && !(actor->renderflags & RF_ROLLCENTER)) || (particle && !(particle->flags & SPF_ROLLCENTER));
+	const bool useOffsets = (record != nullptr && !(record->renderflags & RF_ROLLCENTER)) || ((actor != nullptr) && !(actor->renderflags & RF_ROLLCENTER)) || (particle && !(particle->flags & SPF_ROLLCENTER));
 
 	FVector2 offset = FVector2( offx, offy );
 	float xx = -center.X + x;
@@ -477,19 +569,17 @@ bool HWSprite::CalculateVertices(HWDrawInfo* di, FVector3* v, DVector3* vp)
 
 		// [fgsfds] calculate yaw vectors
 		float rollDegrees = doRoll ? Angles.Roll.Degrees() : 0;
-		float angleRad = (FAngle::fromDeg(270.) - HWAngles.Yaw).Radians();
+		float angleDeg = (FAngle::fromDeg(270.) - HWAngles.Yaw).Degrees();
 
 		// [fgsfds] Rotate the sprite about the sight vector (roll)
 		if (isWallSprite)
 		{
-			float yawvecX = Angles.Yaw.Cos();
-			float yawvecY = Angles.Yaw.Sin();
 			mat.Rotate(0, 1, 0, 0);
 			if (drawRollSpriteActor)
 			{
 
 				if (useOffsets) mat.Translate(xx, zz, yy);
-				mat.Rotate(yawvecX, 0, yawvecY, rollDegrees);
+				mat.Rotate(float_fastcosdeg(Angles.Yaw.Degrees()), 0, float_fastsindeg(Angles.Yaw.Degrees()), rollDegrees);
 				if (useOffsets) mat.Translate(-xx, -zz, -yy);
 			}
 		}
@@ -498,9 +588,9 @@ bool HWSprite::CalculateVertices(HWDrawInfo* di, FVector3* v, DVector3* vp)
 			if (useOffsets) mat.Translate(xx, zz, yy);
 			if (drawWithXYBillboard)
 			{
-				mat.Rotate(-sin(angleRad), 0, cos(angleRad), -HWAngles.Pitch.Degrees());
+				mat.Rotate(-float_fastsindeg(angleDeg), 0, float_fastcosdeg(angleDeg), -HWAngles.Pitch.Degrees());
 			}
-			mat.Rotate(cos(angleRad), 0, sin(angleRad), rollDegrees);
+			mat.Rotate(float_fastcosdeg(angleDeg), 0, float_fastsindeg(angleDeg), rollDegrees);
 			if (useOffsets) mat.Translate(-xx, -zz, -yy);
 		}
 		else if (drawWithXYBillboard)
@@ -508,7 +598,7 @@ bool HWSprite::CalculateVertices(HWDrawInfo* di, FVector3* v, DVector3* vp)
 			// Rotate the sprite about the vector starting at the center of the sprite
 			// triangle strip and with direction orthogonal to where the player is looking
 			// in the x/y plane.
-			mat.Rotate(-sin(angleRad), 0, cos(angleRad), -HWAngles.Pitch.Degrees());
+			mat.Rotate(-float_fastsindeg(angleDeg), 0, float_fastcosdeg(angleDeg), -HWAngles.Pitch.Degrees());
 		}
 
 		mat.Scale(1.0, pixelstretch, 1.0);	// stretch sprite by level aspect ratio
@@ -531,7 +621,7 @@ bool HWSprite::CalculateVertices(HWDrawInfo* di, FVector3* v, DVector3* vp)
 			if (doRoll)
 			{
 				// Compute center of sprite
-				float angleRad = (FAngle::fromDeg(270.) - HWAngles.Yaw).Radians();
+				float angleDeg = (FAngle::fromDeg(270.) - HWAngles.Yaw).Degrees();
 				float rollDegrees = Angles.Roll.Degrees();
 				float pitchDegrees = 0.0;
 
@@ -539,14 +629,15 @@ bool HWSprite::CalculateVertices(HWDrawInfo* di, FVector3* v, DVector3* vp)
 				{
 					rollDegrees = fmodf(rollDegrees, 360.0f);
 					DAngle ang = di->Viewpoint.Angles.Yaw + actor->Angles.Yaw + actor->AngledRollOffset - DAngle::fromDeg(90.0);
-					angleRad = ang.Radians();
+					// [Karto] Upstream rotates an angled-roll sprite about the view/actor angle, not the outer 270 - yaw one.
+					angleDeg = ang.Degrees();
 					FVector3 relPos = center - FVector3(di->Viewpoint.Pos);
 					if (useOffsets) relPos += FVector3(xx, yy, zz);
 
 					Matrix3x4 rolltilt;
 					rolltilt.MakeIdentity();
 					ang = actor->Angles.Yaw + actor->AngledRollOffset;
-					rolltilt.Rotate(ang.Cos(), ang.Sin(), 0.0, -rollDegrees);
+					rolltilt.Rotate(float_fastcosdeg(ang.Degrees()), float_fastsindeg(ang.Degrees()), 0.0, -rollDegrees);
 					pitchDegrees = 270.0 - DVector3(rolltilt * relPos).Angle().Degrees();
 				}
 
@@ -554,7 +645,7 @@ bool HWSprite::CalculateVertices(HWDrawInfo* di, FVector3* v, DVector3* vp)
 				if (useOffsets) mat.Translate(xx, zz, yy);
 				mat.Scale(1.0, 1.0/pixelstretch, 1.0);	// unstretch sprite by level aspect ratio
 				if (AngledRoll) mat.Rotate(0.0, 1.0, 0.0, -HWAngles.Yaw.Degrees()); // Cancel regular Y-billboarding
-				mat.Rotate(cos(angleRad), 0, sin(angleRad), rollDegrees);
+				mat.Rotate(float_fastcosdeg(angleDeg), 0, float_fastsindeg(angleDeg), rollDegrees);
 				if (AngledRoll) mat.Rotate(0.0, 1.0, 0.0, pitchDegrees); // New Y-billboarding about rolled z-axis
 				mat.Scale(1.0, pixelstretch, 1.0);	// stretch sprite by level aspect ratio
 				if (useOffsets) mat.Translate(-xx, -zz, -yy);
@@ -563,10 +654,10 @@ bool HWSprite::CalculateVertices(HWDrawInfo* di, FVector3* v, DVector3* vp)
 
 			if (actor && (actor->renderflags2 & RF2_ISOMETRICSPRITES) && di->Viewpoint.bDoOrtho)
 			{
-				float angleRad = (FAngle::fromDeg(270.) - HWAngles.Yaw).Radians();
+				float angleDeg = (FAngle::fromDeg(270.) - HWAngles.Yaw).Degrees();
 				mat.Translate(center.X, center.Z, center.Y);
 				mat.Translate(0.0, z2 - center.Z, 0.0);
-				mat.Rotate(-sin(angleRad), 0, cos(angleRad), -actor->isotheta);
+				mat.Rotate(-float_fastsindeg(angleDeg), 0, float_fastcosdeg(angleDeg), -actor->isotheta);
 				mat.Translate(0.0, center.Z - z2, 0.0);
 				mat.Translate(-center.X, -center.Z, -center.Y);
 			}
@@ -622,7 +713,7 @@ inline void HWSprite::PutSprite(HWDrawInfo *di, bool translucent)
 //
 //==========================================================================
 
-void HWSprite::CreateVertices(HWDrawInfo *di)
+void HWSprite::CreateVertices(HWDrawInfo *di, bool fan)
 {
 	if (modelframe == nullptr)
 	{
@@ -634,8 +725,10 @@ void HWSprite::CreateVertices(HWDrawInfo *di)
 
 		vp[0].Set(v[0][0], v[0][1], v[0][2], ul, vt);
 		vp[1].Set(v[1][0], v[1][1], v[1][2], ur, vt);
-		vp[2].Set(v[2][0], v[2][1], v[2][2], ul, vb);
-		vp[3].Set(v[3][0], v[3][1], v[3][2], ur, vb);
+		// [Karto] Fan order (batched quads share a fan-to-triangles index buffer) swaps the bottom corners of strip order.
+		const int bl = fan ? 3 : 2, br = fan ? 2 : 3;
+		vp[bl].Set(v[2][0], v[2][1], v[2][2], ul, vb);
+		vp[br].Set(v[3][0], v[3][1], v[3][2], ur, vb);
 	}
 
 }
@@ -696,10 +789,28 @@ void HWSprite::SplitSprite(HWDrawInfo *di, sector_t * frontsector, bool transluc
 //
 //==========================================================================
 
+struct FSpriteClipSource
+{
+	sector_t* Sector;
+	DVector2 Pos;
+	double floorz, ceilingz, Floorclip;
+	ActorFlags flags;
+	ActorFlags2 flags2;
+	ActorFlags3 flags3;
+	bool player, IsInventory;
+};
+
 void HWSprite::PerformSpriteClipAdjustment(AActor *thing, const DVector2 &thingpos, float spriteheight)
 {
+	PerformSpriteClipAdjustment(FSpriteClipSource{ thing->Sector, thing->Pos().XY(), thing->floorz, thing->ceilingz, thing->Floorclip,
+		thing->flags, thing->flags2, thing->flags3, thing->player != nullptr, thing->IsKindOf(NAME_Inventory) }, thingpos, spriteheight);
+}
+
+void HWSprite::PerformSpriteClipAdjustment(const FSpriteClipSource& src, const DVector2 &thingpos, float spriteheight)
+{
+	const FSpriteClipSource* thing = &src;
 	const float NO_VAL = 100000000.0f;
-	bool clipthing = (thing->player || thing->flags3&MF3_ISMONSTER || thing->IsKindOf(NAME_Inventory)) && (thing->flags&MF_ICECORPSE || !(thing->flags&MF_CORPSE));
+	bool clipthing = (thing->player || thing->flags3&MF3_ISMONSTER || thing->IsInventory) && (thing->flags&MF_ICECORPSE || !(thing->flags&MF_CORPSE));
 	bool smarterclip = !clipthing && gl_spriteclip == 3;
 	if ((clipthing || gl_spriteclip > 1) && !(thing->flags2 & MF2_FLOATBOB))
 	{
@@ -740,7 +851,7 @@ void HWSprite::PerformSpriteClipAdjustment(AActor *thing, const DVector2 &thingp
 			}
 		}
 		if (btm == NO_VAL)
-			btm = thing->Sector->floorplane.ZatPoint(thing) - thing->Floorclip;
+			btm = thing->Sector->floorplane.ZatPoint(thing->Pos) - thing->Floorclip;
 		if (top == NO_VAL)
 			top = thing->Sector->ceilingplane.ZatPoint(thingpos);
 
@@ -822,12 +933,14 @@ void HWSprite::Process(HWDrawInfo *di, AActor* thing, sector_t * sector, area_t 
 #endif
 
 	const auto &vp = di->Viewpoint;
-	AActor *camera = vp.camera;
+	// [Karto] Both sides may be published copies; identity is the live actor's.
+	AActor *camera = WorldModeLiveActor(vp.camera);
 
 	const double alpha = thing->InterpolatedAlpha(vp.TicFrac);
 	if (thing->renderflags & RF_INVISIBLE || !thing->RenderStyle.IsVisible(alpha))
 	{
-		if (!(thing->flags & MF_STEALTH) || !di->isStealthVision() || thing == camera)
+		// [Karto] thing may be a published copy; identity is the live actor's.
+		if (!(thing->flags & MF_STEALTH) || !di->isStealthVision() || WorldModeLiveActor(thing) == camera)
 			return;
 	}
 
@@ -865,8 +978,11 @@ void HWSprite::Process(HWDrawInfo *di, AActor* thing, sector_t * sector, area_t 
 		return;
 	}
 	// Some added checks if the camera actor is not supposed to be seen. It can happen that some portal setup has this actor in view in which case it may not be skipped here
-	if (viewmaster == camera && !vp.showviewer)
+	if (WorldModeLiveActor(viewmaster) == camera && !vp.showviewer)
 	{
+		// [Karto] vp.camera may be the published copy while a MASTERNOSEE thing's master is the live actor the worker
+		// may have moved ahead, so compare against the copy.
+		viewmaster = vp.camera;
 		if (vp.bForceNoViewer || (viewmaster->player && viewmaster->player->crossingPortal)) return;
 		DVector3 vieworigin = viewmaster->Pos();
 		if (thruportal == 1) vieworigin += di->Level->Displacements.getOffset(viewmaster->Sector->PortalGroup, sector->PortalGroup);
@@ -904,7 +1020,8 @@ void HWSprite::Process(HWDrawInfo *di, AActor* thing, sector_t * sector, area_t 
 	// don't draw first frame of a player missile
 	if (thing->flags&MF_MISSILE)
 	{
-		if (!(thing->flags7 & MF7_FLYCHEAT) && thing->target == vp.ViewActor && vp.ViewActor != nullptr)
+		// [Karto] vp.ViewActor may be the published copy while a copy's target still points at the live actor.
+		if (!(thing->flags7 & MF7_FLYCHEAT) && vp.ViewActor != nullptr && thing->target == WorldModeLiveActor(vp.ViewActor))
 		{
 			double speed = thing->Vel.Length();
 			if (speed >= thing->target->radius / 2)
@@ -954,7 +1071,7 @@ void HWSprite::Process(HWDrawInfo *di, AActor* thing, sector_t * sector, area_t 
 	// [RH] Make floatbobbing a renderer-only effect.
 	else
 	{
-		float fz = thing->GetBobOffset(Net_ModifyObjectFrac(thing, vp.TicFrac));
+		float fz = thing->GetBobOffsetAt(WorldModeFrameTic(thing->Level), Net_ModifyObjectFrac(thing, vp.TicFrac));
 		z += fz;
 	}
 
@@ -1254,7 +1371,7 @@ void HWSprite::Process(HWDrawInfo *di, AActor* thing, sector_t * sector, area_t 
 
 	lightlevel = rendersector->CheckSpriteGlow(lightlevel, thingpos);
 
-	ThingColor = (thing->RenderStyle.Flags & STYLEF_ColorIsFixed) ? thing->fillcolor : Color::str("#fff");
+	ThingColor = (thing->RenderStyle.Flags & STYLEF_ColorIsFixed) ? thing->fillcolor : Color::White;
 	ThingColor.a = 255;
 	RenderStyle = thing->RenderStyle;
 
@@ -1461,6 +1578,895 @@ void HWSprite::Process(HWDrawInfo *di, AActor* thing, sector_t * sector, area_t 
 	rendered_sprites++;
 }
 
+struct FSpriteInstanceGeometry
+{
+	FGameTexture* Texture;
+	float x1, y1, z1, x2, y2, z2, ul, ur, vt, vb, depth;
+	int Rotation;
+	FVector3 v[4];		// the corners as CalculateVertices gives them: (x, z, y), top left, top right, bottom left, bottom right
+};
+
+static float SpriteAnamorphicBias(float z1, float z2, float btm, float top, float vbtm, float vtop, float vpx, float vpy, float vpz,
+	float tpx, float tpy, double radius, bool shallowWater)
+{
+	float minbias = r_spriteclipanamorphicminbias;
+	minbias = clamp(minbias, 0.3f, 1.0f);
+	if (!(r_debug_nolimitanamorphoses))
+	{
+		float objradiusbias = 1.f - radius / sqrt((vpx - tpx) * (vpx - tpx) + (vpy - tpy) * (vpy - tpy));
+		minbias = max(minbias, objradiusbias);
+	}
+	float bintersect, tintersect;
+	if (z2 < vpz && vbtm < vpz)
+		bintersect = min((btm - vpz) / (z2 - vpz), (vbtm - vpz) / (z2 - vpz));
+	else
+		bintersect = 1.0;
+	if (z1 > vpz && vtop > vpz)
+		tintersect = min((top - vpz) / (z1 - vpz), (vtop - vpz) / (z1 - vpz));
+	else
+		tintersect = 1.0;
+	if (shallowWater)
+		bintersect = tintersect = 1.0f;
+	return clamp(min(bintersect, tintersect), minbias, 1.0f);
+}
+
+static FVector3 SpriteRotate(const FVector3& k, float deg, const FVector3& d)
+{
+	const float a = deg * float(M_PI / 180.0), c = cosf(a), s = sinf(a);
+	return d * c + (k ^ d) * s + k * ((k | d) * (1.f - c));
+}
+
+struct FSpriteViewParams
+{
+	float AxisDeg, PitchDeg, PixelStretch;
+	FVector3 Side[2], Up[2];	// offset directions: Y billboard, XY billboard
+};
+
+static void SpriteInstanceCorners(FVector3 v[4], const FVector3& origin, const FSpriteInstance& in, const FSpriteViewParams& p)
+{
+	const bool roll = (in.Flags & SIF_Roll) != 0, xy = (in.Flags & SIF_XYBillboard) != 0;
+	if (!roll && !xy && in.Offset[0] == 0 && in.Offset[1] == 0) return;
+	const float ar = p.AxisDeg * float(M_PI / 180.0);
+	const FVector3 rollAxis(cosf(ar), 0.f, sinf(ar)), pitchAxis(-sinf(ar), 0.f, cosf(ar));
+	const FVector3 centre = (v[0] + v[3]) * 0.5f;
+	const FVector3 res = p.Side[xy] * in.Offset[0] + p.Up[xy] * in.Offset[1];
+	for (int i = 0; i < 4; ++i)
+	{
+		if (xy)
+		{
+			FVector3 d = v[i] - centre;
+			d.Y *= p.PixelStretch;
+			if (roll)
+			{
+				const FVector3 o = (in.Flags & SIF_RollCenter) ? FVector3(0, 0, 0) : origin - centre;
+				d = SpriteRotate(pitchAxis, -p.PitchDeg, SpriteRotate(rollAxis, in.Roll, d - o)) + o;
+			}
+			else d = SpriteRotate(pitchAxis, -p.PitchDeg, d);
+			d += res;
+			d.Y /= p.PixelStretch;
+			v[i] = centre + d;
+		}
+		else if (roll)
+		{
+			const FVector3 pivot = (in.Flags & SIF_RollCenter) ? centre : origin;
+			FVector3 d = v[i] - pivot;
+			d.Y *= p.PixelStretch;
+			d = SpriteRotate(rollAxis, in.Roll, d);
+			d.Y /= p.PixelStretch;
+			v[i] = pivot + d + res;
+		}
+		else v[i] += res;
+	}
+}
+
+static FSpriteViewParams SpriteViewParams(HWDrawInfo* di)
+{
+	const auto& vp = di->Viewpoint;
+	FSpriteViewParams p;
+	p.AxisDeg = float((FAngle::fromDeg(270.) - vp.HWAngles.Yaw).Degrees());
+	p.PitchDeg = float(vp.HWAngles.Pitch.Degrees());
+	p.PixelStretch = float(di->Level->pixelstretch);
+	SpriteOffsetBasis(&vp.HWAngles, false, p.Side[0], p.Up[0]);
+	SpriteOffsetBasis(&vp.HWAngles, true, p.Side[1], p.Up[1]);
+	return p;
+}
+
+static bool SpriteInstanceGeometry(HWDrawInfo* di, const FSpriteInstance& in, FSpriteInstanceGeometry& g)
+{
+	const FSpriteFrameEntry* e = WorldModeSpriteFrameEntry(in.Frame);
+	if (e == nullptr || !e->Usable) return false;
+	const auto& vp = di->Viewpoint;
+	const float t = float(vp.TicFrac);
+	float pos[3];
+	for (int k = 0; k < 3; ++k) pos[k] = (in.Flags & SIF_DontInterpolate) ? in.Pos[k] : in.Prev[k] * (1.f - t) + in.Pos[k] * t;
+	const float x = pos[0] + in.WorldOffset[0], y = pos[1] + in.WorldOffset[1];
+	float z = pos[2] + in.WorldOffset[2] - in.Floorclip;
+	if (in.Flags & SIF_FloatBob)
+	{
+		const float bt = float(Net_ModifyFrac((in.Flags & SIF_ClientSide) != 0, vp.TicFrac));
+		z += sinf((in.BobPhase + float(WorldModeFrameTic(di->Level)) * in.BobFactor + bt) * (180.f / 32.f) * float(M_PI / 180.0)) * 8.f * in.BobStrength;
+	}
+	float ang = di->Viewpoint.bDoOrtho ? float(vp.Angles.Yaw.Degrees()) :
+		atan2f(pos[1] - float(vp.Pos.Y), pos[0] - float(vp.Pos.X)) * float(180.0 / M_PI);
+	const float sprang = (in.Flags & SIF_SpriteAngle) ? in.Angle : ang - in.Angle;
+	const bool flipagain = (in.Flags & SIF_SpriteFlip) != 0;
+	float a = e->SameFirst ? (flipagain ? -sprang + 360.f + 202.5f : sprang + 202.5f) : (flipagain ? -sprang + 360.f + 191.25f : sprang + 191.25f);
+	a -= 360.f * floorf(a / 360.f);
+	const int rot = int(a * (16.f / 360.f)) & 15;
+	g.Rotation = rot;
+	g.Texture = e->Texture[rot];
+	const bool mirror = (e->Flip >> rot) & 1;
+	g.vt = e->VT[rot];
+	g.vb = e->VB[rot];
+	if (in.Flags & SIF_YFlip) std::swap(g.vt, g.vb);
+	FloatRect rect = e->Rect[rot];
+	const bool xflip = ((in.Flags & SIF_XFlip) != 0) != ((in.Flags & SIF_SpriteFlip) != 0);
+	if (mirror != xflip)
+	{
+		rect.left = -rect.width - rect.left;
+		g.ul = e->UL[rot];
+		g.ur = e->UR[rot];
+	}
+	else
+	{
+		g.ul = e->UR[rot];
+		g.ur = e->UL[rot];
+	}
+	rect.Scale(in.Scale[0], in.Scale[1]);
+	const float pixelstretch = float(di->Level->pixelstretch);
+	if (in.Flags & SIF_RollScale)
+	{
+		const float mult = 1.f / sqrtf(pixelstretch);
+		rect.Scale(mult * pixelstretch, mult);
+	}
+	const float rightfac = -rect.left, leftfac = rightfac - rect.width;
+	g.z1 = z - rect.top;
+	g.z2 = g.z1 - rect.height;
+	const float spriteheight = in.Scale[1] * rect.height;
+	if (spriteheight > 0 && gl_spriteclip > 0)
+	{
+		const bool clipthing = (in.Flags & SIF_ClipThing) != 0;
+		const bool smarterclip = !clipthing && gl_spriteclip == 3;
+		if ((clipthing || gl_spriteclip > 1) && !(in.Flags & SIF_FloatBob))
+		{
+			const float btm = in.ClipBottom;
+			const float top = (in.Ceiling[3] + in.Ceiling[0] * pos[0] + in.Ceiling[1] * pos[1]) * in.Ceiling[2];
+			float diffb = (g.z2 + 1) - btm;
+			float difft = (g.z1 - 1) - top;
+			if (diffb >= 0) diffb = 0;
+			if (smarterclip)
+			{
+				if ((in.Flags & SIF_Corpse) || spriteheight > fabsf(diffb))
+				{
+					const float ratio = clamp<float>((fabsf(diffb) * (float)gl_sclipfactor / (spriteheight + 1)), 0.5, 1.0);
+					diffb *= ratio;
+				}
+				if (!diffb)
+				{
+					if (difft <= 0) difft = 0;
+					if (difft >= (float)gl_sclipthreshold)
+					{
+						if (!(in.Flags & SIF_Monster) || (in.Flags & SIF_NoGravity) || (in.Flags & SIF_Corpse) || difft > (float)gl_sclipthreshold)
+							difft = 0;
+					}
+					if (spriteheight > fabsf(difft))
+					{
+						const float ratio = clamp<float>((fabsf(difft) * (float)gl_sclipfactor / (spriteheight + 1)), 0.5, 1.0);
+						difft *= ratio;
+					}
+					g.z2 -= difft;
+					g.z1 -= difft;
+				}
+			}
+			if (diffb <= (0 - (float)gl_sclipthreshold))
+			{
+				if (!(in.Flags & SIF_Monster) || (in.Flags & SIF_NoGravity) || (in.Flags & SIF_Corpse) || diffb < (-1.8f * (float)gl_sclipthreshold))
+					diffb = 0;
+			}
+			g.z2 -= diffb;
+			g.z1 -= diffb;
+		}
+	}
+	const float viewvecX = vp.ViewVector.X, viewvecY = vp.ViewVector.Y;
+	g.x1 = x - viewvecY * leftfac;
+	g.x2 = x - viewvecY * rightfac;
+	g.y1 = y + viewvecX * leftfac;
+	g.y2 = y + viewvecX * rightfac;
+	g.depth = (x - float(vp.Pos.X)) * float(vp.TanCos) + (y - float(vp.Pos.Y)) * float(vp.TanSin);
+	if (gl_spriteclip == -1)
+	{
+		const float vpx = float(vp.Pos.X), vpy = float(vp.Pos.Y), vpz = float(vp.Pos.Z);
+		auto planeZ = [](const float* p, float px, float py) { return (p[3] + p[0] * px + p[1] * py) * p[2]; };
+		const float spbias = SpriteAnamorphicBias(g.z1, g.z2, in.ClipBottom, planeZ(in.Ceiling, pos[0], pos[1]), planeZ(in.Floor, vpx, vpy),
+			planeZ(in.Ceiling, vpx, vpy), vpx, vpy, vpz, pos[0], pos[1], in.Radius, (in.Flags & SIF_ShallowWater) != 0);
+		const float vpbias = 1.0 - spbias;
+		g.x1 = g.x1 * spbias + vpx * vpbias;
+		g.y1 = g.y1 * spbias + vpy * vpbias;
+		g.z1 = g.z1 * spbias + vpz * vpbias;
+		g.x2 = g.x2 * spbias + vpx * vpbias;
+		g.y2 = g.y2 * spbias + vpy * vpbias;
+		g.z2 = g.z2 * spbias + vpz * vpbias;
+	}
+	g.v[0] = FVector3(g.x1, g.z1, g.y1);
+	g.v[1] = FVector3(g.x2, g.z1, g.y2);
+	g.v[2] = FVector3(g.x1, g.z2, g.y1);
+	g.v[3] = FVector3(g.x2, g.z2, g.y2);
+	SpriteInstanceCorners(g.v, FVector3(x, z, y), in, SpriteViewParams(di));
+	return true;
+}
+
+static uint64_t SpriteGpuChecked, SpriteGpuTextureMismatch, SpriteGpuRotationMismatch, SpriteGpuGeometryMismatch;
+static double SpriteGpuMaxError;
+
+EXTERN_CVAR(Bool, r_sprite_gpu)
+EXTERN_CVAR(Bool, r_sprite_records)
+EXTERN_CVAR(Bool, r_sprite_opaquepass)
+EXTERN_CVAR(Bool, r_worldmode_snapshot)
+EXTERN_CVAR(Bool, gl_light_sprites)
+EXTERN_CVAR(Int, gl_billboard_mode)
+EXTERN_CVAR(Bool, gl_billboard_faces_camera)
+EXTERN_CVAR(Bool, hw_force_cambbpref)
+
+// [Karto] Main view only; any condition under which ProcessRecord would differ from the shader sends the whole scene to
+// the CPU path.
+bool HWDrawInfo::UseGpuSprites()
+{
+	if (!r_sprite_gpu || !r_sprite_records || !r_worldmode_snapshot || !r_sprite_opaquepass || gl_sprite_blend) return false;
+	if (mCurrentPortal != nullptr || gl_billboard_mode == 1 || gl_billboard_faces_camera || isNightvision() || isStealthVision()) return false;
+	if (Level->HasDynamicLights && gl_light_sprites && !r_sprite_gpu_lights) return false;
+	return screen->RenderState()->SupportsSpriteInstances();
+}
+
+EXTERN_CVAR(Bool, r_particle_gpu)
+EXTERN_CVAR(Bool, r_sprite_transbuckets)
+
+bool HWDrawInfo::UseGpuParticles()
+{
+	if (!r_particle_gpu || !r_worldmode_snapshot || !r_sprite_transbuckets || mCurrentPortal != nullptr) return false;
+	if (!screen->BuffersArePersistent() || !screen->RenderState()->SupportsParticleExpansion()) return false;
+	const float* data;
+	uint32_t count;
+	uint64_t serial;
+	if (!WorldModeGpuParticleData(Level, data, count, serial)) return false;
+	GpuParticleSerial = serial;
+	return true;
+}
+
+static uint64_t GpuSpriteScenes, GpuSpriteNoPublish, GpuSpriteDraws, GpuSpriteDeclined, GpuSpriteInstances, GpuSpriteRows;
+static uint64_t GpuSpriteLightFrames, GpuSpriteLightComputed, GpuSpriteLightReused, GpuSpriteLightNS;
+
+CCMD(sprite_gpu_stats)
+{
+	Printf("SPRITEGPUSTATS scenes=%llu no_publish=%llu draws=%llu declined=%llu instances=%llu rows=%llu\n", (unsigned long long)GpuSpriteScenes,
+		(unsigned long long)GpuSpriteNoPublish, (unsigned long long)GpuSpriteDraws, (unsigned long long)GpuSpriteDeclined,
+		(unsigned long long)GpuSpriteInstances, (unsigned long long)GpuSpriteRows);
+	Printf("SPRITEGPULIGHTS frames=%llu computed=%llu reused=%llu us_per_frame=%.1f\n", (unsigned long long)GpuSpriteLightFrames,
+		(unsigned long long)GpuSpriteLightComputed, (unsigned long long)GpuSpriteLightReused,
+		GpuSpriteLightFrames ? double(GpuSpriteLightNS) / GpuSpriteLightFrames / 1000.0 : 0.0);
+}
+
+struct FGpuSpriteLightCache
+{
+	const FSpriteInstance* PublishInstances = nullptr;
+	int PublishTic = INT_MIN;
+	uint32_t Serial = 0;
+	std::vector<uint32_t> Stamps;
+	std::vector<float> Colors;
+
+	void Begin(const FSpriteInstance* instances, int tic)
+	{
+		if (instances == PublishInstances && tic == PublishTic) return;
+		PublishInstances = instances;
+		PublishTic = tic;
+		if (++Serial == 0)
+		{
+			std::fill(Stamps.begin(), Stamps.end(), 0u);
+			Serial = 1;
+		}
+	}
+
+	void Get(HWDrawInfo* di, const FSpriteInstance& in, const FSpriteAppearanceKey* keys, float* out)
+	{
+		out[0] = out[1] = out[2] = 0.f;
+		const FSpriteRecord* record = WorldModeSpriteRecord(in.Record);
+		if (record == nullptr || keys[in.Appearance].Fullbright) return;
+		const size_t r = size_t(in.Record);
+		if (r >= Stamps.size())
+		{
+			Stamps.resize(r + 1, 0u);
+			Colors.resize((r + 1) * 3, 0.f);
+		}
+		if (Stamps[r] != Serial)
+		{
+			di->GetDynSpriteLight(*record, &Colors[r * 3]);
+			Stamps[r] = Serial;
+			++GpuSpriteLightComputed;
+		}
+		else ++GpuSpriteLightReused;
+		memcpy(out, &Colors[r * 3], 3 * sizeof(float));
+	}
+} GpuSpriteLights;
+
+// [Karto] Within a frame entry the order is the publish's, not the traversal's: only blending among overlapping
+// translucent sprites of one frame differs.
+CVAR(Bool, r_sprite_gpu_pertic, true, 0)
+CVAR(Bool, r_sprite_gpu_lightpass, true, 0)
+static struct
+{
+	uint32_t Serial = 0;
+	bool GpuLights = false;
+	std::vector<uint32_t> Order[3], App[3], Mark[3];
+	std::vector<float> Light[3];
+	std::vector<uint8_t> LightDone[3];
+	std::vector<uint32_t> PosOf;	// instance -> position in its blend's order
+	uint32_t MarkSerial = 0;
+} GpuSpriteTic;
+
+void HWDrawInfo::DrawGpuSprites(FRenderState &state, int blend)
+{
+	const FSpriteInstance* instances;
+	const FSpriteAppearanceKey* keys;
+	uint32_t count, keyCount;
+	if (blend == 0) ++GpuSpriteScenes;
+	if (blend == 0 && Level->HasDynamicLights && gl_light_sprites) ++GpuSpriteLightFrames;
+	if (!WorldModeGpuSprites(Level, instances, count, keys, keyCount) || count == 0)
+	{
+		if (blend == 0) ++GpuSpriteNoPublish;
+		return;
+	}
+	const auto& reached = GpuSpriteVisible[blend];
+	if (reached.empty()) return;
+	auto colorAdd = [&](const FSpriteAppearanceKey& key)
+	{
+		return key.Blend == 2 && key.Alpha > 1.f - FLT_EPSILON && gl_usecolorblending && !isFullbrightScene() && key.Fullbright && !key.SoftTexture &&
+			!key.Shaded;
+	};
+	auto styleOf = [&](const FSpriteAppearanceKey& key) -> FRenderStyle
+	{
+		if (key.Blend == 1) return LegacyRenderStyles[key.Shaded ? STYLE_Shaded : STYLE_Translucent];
+		if (key.Blend == 2) return LegacyRenderStyles[key.Shaded ? STYLE_AddShaded : colorAdd(key) ? STYLE_ColorAdd : STYLE_Add];
+		return LegacyRenderStyles[STYLE_Normal];
+	};
+	const uint32_t* frames = nullptr;
+	uint32_t frameWords = 0;
+	bool rowsReady = false;
+	uint64_t frameVersion = 0;
+	static std::vector<uint32_t> order, starts;
+	auto groupByFrame = [&](const uint32_t* list, size_t size, std::vector<uint32_t>& out)
+	{
+		uint32_t entries = 0;
+		for (size_t i = 0; i < size; ++i) entries = std::max(entries, instances[list[i]].GpuFrame + 1);
+		starts.assign(entries + 1, 0);
+		for (size_t i = 0; i < size; ++i) ++starts[instances[list[i]].GpuFrame + 1];
+		for (uint32_t e = 0; e < entries; ++e) starts[e + 1] += starts[e];
+		out.resize(size);
+		for (size_t i = 0; i < size; ++i) out[starts[instances[list[i]].GpuFrame]++] = list[i];
+	};
+	const uint32_t serial = r_sprite_gpu_pertic ? WorldModeGpuSpriteSerial() : 0;
+	const std::vector<uint32_t>* drawOrder = &order;
+	auto& tic = GpuSpriteTic;
+	if (serial != 0)
+	{
+		if (tic.Serial != serial)
+		{
+			tic.Serial = serial;
+			static std::vector<uint32_t> all[3];
+			for (auto& list : all) list.clear();
+			for (uint32_t i = 0; i < count; ++i) all[keys[instances[i].Appearance].Blend].push_back(i);
+			tic.PosOf.resize(count);
+			for (int k = 0; k < 3; ++k)
+			{
+				groupByFrame(all[k].data(), all[k].size(), tic.Order[k]);
+				const auto& ord = tic.Order[k];
+				tic.App[k].resize(ord.size());
+				for (size_t i = 0; i < ord.size(); ++i)
+				{
+					tic.App[k][i] = instances[ord[i]].Appearance;
+					tic.PosOf[ord[i]] = uint32_t(i);
+				}
+				tic.Mark[k].assign(ord.size(), 0u);
+				tic.Light[k].assign(ord.size() * 3, 0.f);
+				tic.LightDone[k].assign(ord.size(), 0);
+			}
+			tic.MarkSerial = 0;
+			tic.GpuLights = false;
+			if (r_sprite_gpu_lightpass && Level->HasDynamicLights && gl_light_sprites)
+			{
+				FGpuLightPack pack;
+				if (WorldModeGpuLightPack(Level, pack))
+					tic.GpuLights = state.ComputeSpriteLights(reinterpret_cast<const uint32_t*>(instances), count, uint32_t(sizeof(FSpriteInstance) / 4),
+						serial, pack);
+			}
+		}
+		if (++tic.MarkSerial == 0)
+		{
+			for (auto& mark : tic.Mark) std::fill(mark.begin(), mark.end(), 0u);
+			tic.MarkSerial = 1;
+		}
+		for (int32_t index : reached) tic.Mark[blend][tic.PosOf[index]] = tic.MarkSerial;
+		drawOrder = &tic.Order[blend];
+	}
+	else groupByFrame(reinterpret_cast<const uint32_t*>(reached.data()), reached.size(), order);
+	const bool lit = Level->HasDynamicLights && gl_light_sprites && !isFullbrightScene();
+	const bool gpuLights = lit && serial != 0 && tic.GpuLights && r_sprite_gpu_lightpass;
+	if (lit && !gpuLights) GpuSpriteLights.Begin(instances, WorldModeFrameTic(Level));
+	static std::vector<uint32_t> passEntries[2];
+	static std::vector<uint8_t> keyColorAdd;
+	size_t used[2] = {};
+	keyColorAdd.assign(keyCount, 0);
+	if (blend == 2) for (uint32_t k = 0; k < keyCount; ++k) keyColorAdd[k] = colorAdd(keys[k]);
+	{
+		const uint64_t lightStarted = I_nsTime();
+		for (auto& entries : passEntries) if (entries.size() < drawOrder->size() * 4) entries.resize(drawOrder->size() * 4);
+		static const float unlit[3] = {};
+		if (serial != 0)
+		{
+			const auto& ord = tic.Order[blend];
+			const auto& app = tic.App[blend];
+			const auto& mark = tic.Mark[blend];
+			auto& lights = tic.Light[blend];
+			auto& done = tic.LightDone[blend];
+			for (size_t i = 0; i < ord.size(); ++i)
+			{
+				if (mark[i] != tic.MarkSerial) continue;
+				const int pass = keyColorAdd[app[i]];
+				uint32_t* entry = &passEntries[pass][used[pass]];
+				used[pass] += 4;
+				entry[0] = ord[i];
+				if (lit && !gpuLights && !done[i])
+				{
+					GpuSpriteLights.Get(this, instances[ord[i]], keys, &lights[i * 3]);
+					done[i] = 1;
+				}
+				memcpy(entry + 1, lit && !gpuLights ? &lights[i * 3] : unlit, sizeof(unlit));
+			}
+		}
+		else for (uint32_t index : *drawOrder)
+		{
+			const FSpriteInstance& in = instances[index];
+			const int pass = keyColorAdd[in.Appearance];
+			uint32_t* entry = &passEntries[pass][used[pass]];
+			used[pass] += 4;
+			entry[0] = index;
+			float light[3] = {};
+			if (lit) GpuSpriteLights.Get(this, in, keys, light);
+			memcpy(entry + 1, light, sizeof(light));
+		}
+		if (lit) GpuSpriteLightNS += I_nsTime() - lightStarted;
+	}
+	auto drawPass = [&](bool wantColorAdd)
+	{
+		const uint32_t* visible = passEntries[wantColorAdd].data();
+		const uint32_t n = uint32_t(used[wantColorAdd] / 4);
+		if (n == 0) return;
+		if (!rowsReady)
+		{
+			WorldModeFillSpriteFrameTable(state, frames, frameWords, frameVersion);
+			rowsReady = true;
+		}
+		const FSpriteFrameEntry* first = WorldModeSpriteFrameEntry(instances[visible[0]].Frame);
+		if (first == nullptr) return;
+		state.SetMaterial(first->Texture[0], UF_Sprite, CTF_Expand, CLAMP_XY, 0, -1, nullptr);
+		state.SetDynLight(0, 0, 0);
+		for (uint32_t k = 0; k < keyCount; ++k)
+		{
+			const FSpriteAppearanceKey& key = keys[k];
+			sector_t* sector = key.Sector;
+			const FRenderStyle style = styleOf(key);
+			FColormap cm;
+			if (isFullbrightScene()) cm.Clear();
+			else
+			{
+				cm = sector->Colormap;
+				if (key.Fullbright) cm.MakeWhite();
+				else if (Level->flags3 & LEVEL3_NOCOLOREDSPRITELIGHTING) cm.Decolorize();
+			}
+			const int rel = key.Fullbright ? 0 : getExtraLight();
+			// [Karto] Full alpha, as ProcessRecord sets ThingColor: Color::White has alpha 0, which a fullbright row would use unmodulated and fail the alpha test.
+			PalEntry thingColor = key.Shaded ? PalEntry(key.FillColor) : PalEntry(Color::White);
+			thingColor.a = 255;
+			// [Karto] A style without texture-mode flags leaves the mode alone; the CPU path starts every run from TM_NORMAL,
+			// so a row after a shaded one must not inherit red-is-alpha.
+			state.SetTextureMode(TM_NORMAL);
+			state.SetTextureMode(style);
+			// [Karto] A soft texture's row discards only zero alpha, as DrawSprite's no-alpha-test case shows under source-alpha
+			// blending; every row keeps the alpha-test shader variant (the variant without it drew opaque black quads).
+			if (key.Blend != 0)
+			{
+				if (key.SoftTexture) state.AlphaFunc(Alpha_Greater, 0.f);
+				else state.AlphaFunc(Alpha_GEqual, gl_mask_sprite_threshold);
+			}
+			state.SetObjectColor(key.Fullbright ? thingColor : thingColor.Modulate(sector->SpecialColors[sector_t::sprites]));
+			state.SetAddColor(sector->AdditiveColors[sector_t::sprites] | 0xff000000);
+			SetColor(state, Level, lightmode, key.LightLevel, rel, isFullbrightScene(), cm, key.Alpha);
+			uint8_t foglevel = (uint8_t)clamp<short>(sector->lightlevel, 0, 255);
+			if (cm.FadeColor.isBlack()) foglevel = key.LightLevel;
+			const bool additiveFog = style.BlendOp == STYLEOP_Add && style.DestAlpha == STYLEALPHA_One;
+			SetFog(state, Level, lightmode, foglevel, rel, isFullbrightScene(), &cm, additiveFog);
+			state.AddSpriteRow();
+		}
+		const FRenderStyle drawStyle = blend == 0 ? LegacyRenderStyles[STYLE_Source] :
+			blend == 1 ? LegacyRenderStyles[STYLE_Translucent] : LegacyRenderStyles[wantColorAdd ? STYLE_ColorAdd : STYLE_Add];
+		state.SetRenderStyle(drawStyle);
+		state.SetTextureMode(blend == 0 ? LegacyRenderStyles[STYLE_Normal] : drawStyle);
+		const auto& vp = Viewpoint;
+		const FSpriteViewParams view = SpriteViewParams(this);
+		const float params[32] = {
+			float(vp.Pos.X), float(vp.Pos.Y), float(vp.Pos.Z), float(vp.TicFrac),
+			float(vp.ViewVector.X), float(vp.ViewVector.Y), float(Net_ModifyFrac(false, vp.TicFrac)), float(WorldModeFrameTic(Level)),
+			vp.bDoOrtho ? 1.f : 0.f, float(vp.Angles.Yaw.Degrees()), float(gl_spriteclip), float(gl_sclipthreshold),
+			float(gl_sclipfactor), r_sprite_indexed ? 1.f : 0.f, view.PixelStretch, view.AxisDeg,
+			view.Side[0].X, view.Side[0].Y, view.Side[0].Z, view.PitchDeg,
+			view.Up[0].X, view.Up[0].Y, view.Up[0].Z, gpuLights ? 1.f : 0.f,
+			view.Side[1].X, view.Side[1].Y, view.Side[1].Z, clamp(float(r_spriteclipanamorphicminbias), 0.3f, 1.0f),
+			view.Up[1].X, view.Up[1].Y, view.Up[1].Z, r_debug_nolimitanamorphoses ? 1.f : 0.f };
+		if (state.DrawSpriteInstances(reinterpret_cast<const uint32_t*>(instances), count, uint32_t(sizeof(FSpriteInstance) / 4), serial,
+			visible, n, frames, frameWords, frameVersion, params, 8))
+		{
+			++GpuSpriteDraws;
+			GpuSpriteInstances += n;
+			GpuSpriteRows += keyCount;
+		}
+		else ++GpuSpriteDeclined;
+	};
+	drawPass(false);
+	if (blend == 2) drawPass(true);
+	state.SetObjectColor(0xffffffff);
+	state.SetAddColor(0);
+	state.SetDynLight(0, 0, 0);
+	if (blend != 0)
+	{
+		state.SetRenderStyle(STYLE_Translucent);
+		state.SetTextureMode(TM_NORMAL);
+		state.EnableTexture(true);
+	}
+}
+
+CCMD(sprite_gpu_check)
+{
+	Printf("SPRITEGPUCHECK checked=%llu texture_mismatch=%llu rotation_mismatch=%llu geometry_mismatch=%llu max_error=%.5f\n",
+		(unsigned long long)SpriteGpuChecked, (unsigned long long)SpriteGpuTextureMismatch, (unsigned long long)SpriteGpuRotationMismatch,
+		(unsigned long long)SpriteGpuGeometryMismatch, SpriteGpuMaxError);
+}
+
+//==========================================================================
+//
+// [Karto] Sprite record path: expressions keep Process's operand order and types so the result is bit-identical.
+//
+//==========================================================================
+
+void HWSprite::ProcessRecord(HWDrawInfo *di, const FSpriteRecord& r, sector_t * sector, area_t in_area, int thruportal)
+{
+	const auto &vp = di->Viewpoint;
+	sector_t rs;
+	sector_t * rendersector;
+
+	const double alpha = (r.renderflags2 & RF2_INTERPOLATEALPHA) ? r.PrevAlpha * (1.0 - vp.TicFrac) + r.Alpha * vp.TicFrac : r.Alpha;
+	if (!r.RenderStyle.IsVisible(alpha))
+	{
+		if (!(r.flags & MF_STEALTH) || !di->isStealthVision() || r.Live == WorldModeLiveActor(vp.camera)) return;
+	}
+	if ((!r_debug_disable_vis_filter && !!(r.RenderRequired & ~r_renderercaps)) ||
+		(!!(r.RenderHidden & r_renderercaps)))
+		return;
+
+	int spritenum = r.sprite;
+	DVector2 sprscale = (r.renderflags2 & RF2_INTERPOLATESCALE) ? r.PrevScale * (1.0 - vp.TicFrac) + r.Scale * vp.TicFrac : r.Scale;
+	DVector3 thingpos = (r.renderflags & RF_DONTINTERPOLATE) ? r.Pos : r.Prev * (1.0 - vp.TicFrac) + r.Pos * vp.TicFrac;
+	if (thruportal == 1) thingpos += di->Level->Displacements.getOffset(r.PortalGroup, sector->PortalGroup);
+
+	modelframe = nullptr;
+	modelframeflags = 0;
+
+	if (fabs(thingpos.X - vp.Pos.X) < 2 && fabs(thingpos.Y - vp.Pos.Y) < 2
+		&& vp.Pos.Z >= thingpos.Z - 2 && vp.Pos.Z <= thingpos.Z + r.Height + 2
+		&& r.Moving)
+	{
+		return;
+	}
+
+	if (thruportal != 2 && di->mClipPortal != nullptr)
+	{
+		int clipres = di->mClipPortal->ClipPoint(thingpos.XY());
+		if (clipres == PClip_InFront) return;
+	}
+	Angles = r.Angles;
+
+	if (sector->sectornum != r.Sector->sectornum && !thruportal)
+	{
+		rendersector = hw_FakeFlat(r.Sector, in_area, false, &rs);
+	}
+	else
+	{
+		rendersector = sector;
+	}
+	topclip = rendersector->PortalBlocksMovement(sector_t::ceiling) ? LARGE_VALUE : rendersector->GetPortalPlaneZ(sector_t::ceiling);
+	bottomclip = rendersector->PortalBlocksMovement(sector_t::floor) ? -LARGE_VALUE : rendersector->GetPortalPlaneZ(sector_t::floor);
+
+	x = thingpos.X + r.WorldOffset.X;
+	z = thingpos.Z + r.WorldOffset.Z;
+	y = thingpos.Y + r.WorldOffset.Y;
+	z -= r.Floorclip;
+	{
+		const double ticfrac = Net_ModifyFrac(r.ClientSide, vp.TicFrac);
+		float fz = (r.flags2 & MF2_FLOATBOB) ? BobSin(r.FloatBobPhase + WorldModeFrameTic(di->Level) * r.FloatBobFactor + ticfrac) * r.FloatBobStrength : 0;
+		z += fz;
+	}
+
+	bool mirror = false;
+	DAngle ang = (thingpos - vp.Pos).Angle();
+	if (di->Viewpoint.bDoOrtho) ang = vp.Angles.Yaw;
+	DAngle sprangle = (r.flags7 & MF7_SPRITEANGLE) ? r.SpriteAngle : ang - (r.Angles.Yaw + r.SpriteRotation);
+	FTextureID patch = sprites[spritenum].GetSpriteFrame(r.frame, -1, sprangle, &mirror, !!(r.renderflags & RF_SPRITEFLIP));
+	if (!patch.isValid()) return;
+	auto tex = TexMan.GetGameTexture(patch, false);
+	if (!tex || !tex->isValid()) return;
+	auto& spi = tex->GetSpritePositioning(true);
+
+	offx = (float)(r.renderflags2 & RF2_FLIPSPRITEOFFSETX ? r.SpriteOffset.X : -r.SpriteOffset.X);
+	offy = (float)(r.renderflags2 & RF2_FLIPSPRITEOFFSETY ? r.SpriteOffset.Y : -r.SpriteOffset.Y);
+
+	vt = spi.GetSpriteVT();
+	vb = spi.GetSpriteVB();
+	if (r.renderflags & RF_YFLIP) std::swap(vt, vb);
+
+	auto rect = spi.GetSpriteRect();
+	// [Karto] Process toggles the actor's RF_XFLIP around this test for RF_SPRITEFLIP; the record path uses a local copy.
+	ActorRenderFlags rflags = r.renderflags;
+	if (rflags & RF_SPRITEFLIP) rflags ^= RF_XFLIP;
+	if (mirror ^ !!(rflags & RF_XFLIP))
+	{
+		rect.left = -rect.width - rect.left;
+		ul = spi.GetSpriteUL();
+		ur = spi.GetSpriteUR();
+	}
+	else
+	{
+		ul = spi.GetSpriteUR();
+		ur = spi.GetSpriteUL();
+	}
+
+	texture = tex;
+	if (texture->isHardwareCanvas()) std::swap(vt, vb);
+
+	const double isoscaleY = 1.0;
+	rect.Scale(sprscale.X, sprscale.Y * isoscaleY);
+	if ((r.renderflags & RF_ROLLSPRITE) && !(r.renderflags2 & RF2_STRETCHPIXELS))
+	{
+		double ps = di->Level->pixelstretch;
+		double mult = 1.0 / sqrt(ps);
+		rect.Scale(mult * ps, mult);
+	}
+
+	float rightfac = -rect.left;
+	float leftfac = rightfac - rect.width;
+	z1 = z - rect.top;
+	z2 = z1 - rect.height;
+
+	float spriteheight = sprscale.Y * rect.height * isoscaleY;
+	if (spriteheight > 0 && gl_spriteclip > 0)
+	{
+		PerformSpriteClipAdjustment(FSpriteClipSource{ r.Sector, r.Pos.XY(), r.floorz, r.ceilingz, r.Floorclip, r.flags, r.flags2, r.flags3,
+			false, r.IsInventory }, thingpos.XY(), spriteheight);
+	}
+
+	{
+		float viewvecX = vp.ViewVector.X;
+		float viewvecY = vp.ViewVector.Y;
+
+		x1 = x - viewvecY*leftfac;
+		x2 = x - viewvecY*rightfac;
+		y1 = y + viewvecX*leftfac;
+		y2 = y + viewvecX*rightfac;
+	}
+
+	depth = (float)((x - vp.Pos.X) * vp.TanCos + (y - vp.Pos.Y) * vp.TanSin);
+
+	if (gl_spriteclip == -1)
+	{
+		const float vpx = vp.Pos.X, vpy = vp.Pos.Y, vpz = vp.Pos.Z;
+		const float spbias = SpriteAnamorphicBias(z1, z2, r.Sector->floorplane.ZatPoint(r.Pos) - r.Floorclip,
+			r.Sector->ceilingplane.ZatPoint(thingpos), r.Sector->floorplane.ZatPoint(vp.Pos), r.Sector->ceilingplane.ZatPoint(vp.Pos),
+			vpx, vpy, vpz, thingpos.X, thingpos.Y, r.radius, r.waterlevel >= 1 && r.waterlevel <= 2);
+		const float vpbias = 1.0 - spbias;
+		x1 = x1 * spbias + vpx * vpbias;
+		y1 = y1 * spbias + vpy * vpbias;
+		z1 = z1 * spbias + vpz * vpbias;
+		x2 = x2 * spbias + vpx * vpbias;
+		y2 = y2 * spbias + vpy * vpbias;
+		z2 = z2 * spbias + vpz * vpbias;
+	}
+
+	bool enhancedvision = false;
+
+	fullbright = (r.flags5 & MF5_BRIGHT) ||
+		((r.renderflags & RF_FULLBRIGHT) && (!texture || !texture->isFullbrightDisabled()));
+
+	if (fullbright) lightlevel = 255;
+	else
+	{
+		int level = rendersector->GetSpriteLight();
+		if (r.flags8 & MF8_ADDLIGHTLEVEL) level += r.LightLevel;
+		else if (r.LightLevel > -1) level = r.LightLevel;
+		lightlevel = RescaleLightLevel(level);
+	}
+
+	foglevel = (uint8_t)clamp<short>(rendersector->lightlevel, 0, 255);
+
+	lightlevel = rendersector->CheckSpriteGlow(lightlevel, thingpos);
+
+	ThingColor = (r.RenderStyle.Flags & STYLEF_ColorIsFixed) ? r.fillcolor : Color::White;
+	ThingColor.a = 255;
+	RenderStyle = r.RenderStyle;
+
+	if (di->isFullbrightScene())
+	{
+		enhancedvision = di->isStealthVision();
+
+		Colormap.Clear();
+
+		if (di->isNightvision())
+		{
+			if ((r.IsInventory || r.flags3&MF3_ISMONSTER || r.flags&MF_MISSILE || r.flags&MF_CORPSE))
+			{
+				RenderStyle.Flags |= STYLEF_InvertSource;
+			}
+		}
+	}
+	else
+	{
+		Colormap = rendersector->Colormap;
+		if (fullbright)
+		{
+			if (rendersector == &di->Level->sectors[rendersector->sectornum] || in_area != area_below)
+			{
+				Colormap.MakeWhite();
+			}
+			else
+			{
+				Colormap.LightColor.r = (3 * Colormap.LightColor.r + 0xff) / 4;
+				Colormap.LightColor.g = (3 * Colormap.LightColor.g + 0xff) / 4;
+				Colormap.LightColor.b = (3 * Colormap.LightColor.b + 0xff) / 4;
+			}
+		}
+		else if (di->Level->flags3 & LEVEL3_NOCOLOREDSPRITELIGHTING)
+		{
+			Colormap.Decolorize();
+		}
+	}
+
+	translation = r.Translation;
+
+	OverrideShader = -1;
+	trans = alpha;
+	hw_styleflags = STYLEHW_Normal;
+
+	if (RenderStyle.BlendOp >= STYLEOP_Fuzz && RenderStyle.BlendOp <= STYLEOP_FuzzOrRevSub)
+	{
+		RenderStyle.CheckFuzz();
+		if (RenderStyle.BlendOp == STYLEOP_Fuzz)
+		{
+			if (gl_fuzztype != 0 && !(RenderStyle.Flags & STYLEF_InvertSource))
+			{
+				RenderStyle = LegacyRenderStyles[STYLE_Translucent];
+				OverrideShader = SHADER_NoTexture + gl_fuzztype;
+				trans = 0.99f;
+				hw_styleflags = STYLEHW_NoAlphaTest;
+			}
+			else
+			{
+				RenderStyle.BlendOp = STYLEOP_Shadow;
+			}
+		}
+	}
+
+	if (RenderStyle.Flags & STYLEF_TransSoulsAlpha)
+	{
+		trans = transsouls;
+	}
+	else if (RenderStyle.Flags & STYLEF_Alpha1)
+	{
+		trans = 1.f;
+	}
+	if (r_UseVanillaTransparency && (r.renderflags & RF_ZDOOMTRANS))
+	{
+		if (r_UseVanillaTransparency == 1 || AutoTrans.CheckKey(r.Class->TypeName) != nullptr)
+		{
+			trans = 1.f;
+			RenderStyle.BlendOp = STYLEOP_Add;
+			RenderStyle.SrcAlpha = STYLEALPHA_One;
+			RenderStyle.DestAlpha = STYLEALPHA_Zero;
+		}
+	}
+	if (trans >= 1.f - FLT_EPSILON && RenderStyle.BlendOp != STYLEOP_Shadow && (
+		(RenderStyle.SrcAlpha == STYLEALPHA_One && RenderStyle.DestAlpha == STYLEALPHA_Zero) ||
+		(RenderStyle.SrcAlpha == STYLEALPHA_Src && RenderStyle.DestAlpha == STYLEALPHA_InvSrc)
+		))
+	{
+		trans = 1.f;
+
+		if (!gl_sprite_blend ||
+			(hw_force_cambbpref ? gl_billboard_faces_camera :
+			(gl_billboard_faces_camera && !(r.renderflags2 & RF2_BILLBOARDNOFACECAMERA)) ||
+			r.renderflags2 & RF2_BILLBOARDFACECAMERA))
+		{
+			RenderStyle.SrcAlpha = STYLEALPHA_One;
+			RenderStyle.DestAlpha = STYLEALPHA_Zero;
+			hw_styleflags = STYLEHW_Solid;
+		}
+		else
+		{
+			RenderStyle.SrcAlpha = STYLEALPHA_Src;
+			RenderStyle.DestAlpha = STYLEALPHA_InvSrc;
+		}
+	}
+	if ((texture && texture->GetTranslucency()) || (RenderStyle.Flags & STYLEF_RedIsAlpha))
+	{
+		if (hw_styleflags == STYLEHW_Solid)
+		{
+			RenderStyle.SrcAlpha = STYLEALPHA_Src;
+			RenderStyle.DestAlpha = STYLEALPHA_InvSrc;
+		}
+		hw_styleflags = STYLEHW_NoAlphaTest;
+	}
+
+	if (enhancedvision && gl_enhanced_nightvision)
+	{
+		if (RenderStyle.BlendOp == STYLEOP_Shadow)
+		{
+			trans = 0.5f;
+			FRenderStyle rstyle = RenderStyle;
+			RenderStyle = STYLE_Translucent;
+			RenderStyle.Flags = rstyle.Flags;
+		}
+		else if (r.flags & MF_STEALTH)
+		{
+			// enhanced vision overcomes stealth!
+			if (trans < 0.5f) trans = 0.5f;
+		}
+	}
+
+	if (trans == 0.0f) return;
+
+	actor = nullptr;
+	record = &r;
+	index = r.SpawnOrder;
+
+	if (r_sprite_gpu_check && r.Instance >= 0)
+	{
+		const FSpriteInstance* in = WorldModeSpriteInstance(r.Instance);
+		FSpriteInstanceGeometry g;
+		if (in != nullptr && SpriteInstanceGeometry(di, *in, g))
+		{
+			++SpriteGpuChecked;
+			// [Karto] A texture difference with equal mirroring is a rotation picked on the other side of a boundary
+			// (single against double precision); anything else is a real mismatch.
+			if (g.Texture != texture)
+			{
+				if (g.ul == ul && g.ur == ur) ++SpriteGpuRotationMismatch;
+				else ++SpriteGpuTextureMismatch;
+			}
+			else
+			{
+				float err = std::max({ fabsf(g.x1 - x1), fabsf(g.y1 - y1), fabsf(g.z1 - z1), fabsf(g.x2 - x2), fabsf(g.y2 - y2),
+					fabsf(g.z2 - z2), fabsf(g.depth - depth) });
+				FVector3 v[4];
+				CalculateVertices(di, v, &di->Viewpoint.Pos);
+				for (int i = 0; i < 4; ++i)
+					err = std::max({ err, fabsf(g.v[i].X - v[i].X), fabsf(g.v[i].Y - v[i].Y), fabsf(g.v[i].Z - v[i].Z) });
+				SpriteGpuMaxError = std::max(SpriteGpuMaxError, double(err));
+				if (err > 0.05f || g.ul != ul || g.ur != ur || g.vt != vt || g.vb != vb) ++SpriteGpuGeometryMismatch;
+			}
+		}
+	}
+	particle = nullptr;
+	lightlist = nullptr;
+
+	PutSprite(di, hw_styleflags != STYLEHW_Solid);
+	rendered_sprites++;
+}
+
+
 
 //==========================================================================
 //
@@ -1576,7 +2582,7 @@ void HWSprite::ProcessParticle(HWDrawInfo *di, particle_t *particle, sector_t *s
 			{
 				if(custom_animated_texture)
 				{
-					lump = TexAnim.UpdateStandaloneAnimation(particle->animData, di->Level->LocalWorldTimer + timefrac);
+					lump = TexAnim.UpdateStandaloneAnimation(particle->animData, WorldModeFrameTimer(di->Level) + timefrac);
 				}
 				else if(has_texture)
 				{
@@ -1674,7 +2680,7 @@ void HWSprite::AdjustVisualThinker(HWDrawInfo* di, DVisualThinker* spr, sector_t
 
 	texture = TexMan.GetGameTexture(
 			custom_anim
-			? TexAnim.UpdateStandaloneAnimation(spr->PT.animData, di->Level->LocalWorldTimer + timefrac)
+			? TexAnim.UpdateStandaloneAnimation(spr->PT.animData, WorldModeFrameTimer(di->Level) + timefrac)
 			: spr->PT.texture, !custom_anim);
 
 	if (spr->flags & VTF_DontInterpolate)
@@ -1741,8 +2747,8 @@ void HWSprite::AdjustVisualThinker(HWDrawInfo* di, DVisualThinker* spr, sector_t
 void HWDrawInfo::ProcessActorsInPortal(FLinePortalSpan *glport, area_t in_area)
 {
 	TMap<AActor*, bool> processcheck;
-	if (glport->validcount == validcount) return;	// only process once per frame
-	glport->validcount = validcount;
+	if (glport->validcount == rendervalidcount) return;	// only process once per frame
+	glport->validcount = rendervalidcount;
 	const auto &vp = Viewpoint;
 	for (auto port : glport->lines)
 	{

@@ -33,7 +33,7 @@ class VkStreamBufferWriter
 public:
 	VkStreamBufferWriter(VulkanRenderDevice* fb);
 
-	bool Write(const StreamData& data);
+	bool Write(const StreamData& data, bool reuse = false);
 	void Reset();
 
 	uint32_t DataIndex() const { return mDataIndex; }
@@ -43,6 +43,8 @@ private:
 	VkStreamBuffer* mBuffer;
 	uint32_t mDataIndex = MAX_STREAM_DATA - 1;
 	uint32_t mStreamDataOffset = 0;
+	StreamData mLastData = {};
+	bool mLastDataValid = false;
 };
 
 class VkMatrixBufferWriter

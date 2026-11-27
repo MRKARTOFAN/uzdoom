@@ -23,6 +23,7 @@
 */
 
 #include "c_bind.h"
+#include "d_ticworkercheck.h"
 #include "c_commandbuffer.h"
 #include "c_console.h"
 #include "c_consolebuffer.h"
@@ -54,6 +55,8 @@
 #include <array>
 #include <string_view>
 #include <vector>
+#include <mutex>
+#include "d_ticworker.h"
 
 namespace Console::Defaults
 {
@@ -457,8 +460,29 @@ extern bool gameisdead;
 struct BufferedWrite { PrintFlag l; std::string s; };
 std::unique_ptr<std::vector<BufferedWrite>> prebuffer;
 
+// [Karto] The console belongs to the main thread, which prints worker output in order (C_FlushWorkerPrints).
+static std::mutex WorkerPrintLock;
+static std::vector<BufferedWrite> WorkerPrints;
+
+void C_FlushWorkerPrints()
+{
+	std::vector<BufferedWrite> pending;
+	{
+		std::lock_guard<std::mutex> guard(WorkerPrintLock);
+		pending.swap(WorkerPrints);
+	}
+	for (auto& p : pending) PrintString(p.l, p.s.c_str());
+}
+
 int PrintString (PrintFlag iprintlevel, const char *outline)
 {
+	if (TicWorkerOnThread())
+	{
+		std::lock_guard<std::mutex> guard(WorkerPrintLock);
+		WorkerPrints.push_back({ iprintlevel, outline });
+		return int(strlen(outline));
+	}
+	TicWorkerCheckNote(TWS_Print);
 	if (gameisdead)
 		return 0;
 

@@ -41,11 +41,15 @@ CVAR (Bool, gl_light_particles, true, CVAR_ARCHIVE | CVAR_GLOBALCONFIG);
 // Sets up the parameters to render one dynamic light onto one plane
 //
 //==========================================================================
-bool GetLight(FDynLightData& dld, int group, Plane & p, FDynamicLight * light, bool checkside)
+// [Karto] Out of line: with /fp:fast inlined copies may round an on-plane light differently, and world mode's
+// light lists must decide exactly as GetLight does.
+#ifdef _MSC_VER
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+bool LightReachesPlane(Plane& p, const DVector3& pos, float radius, bool checkside)
 {
-	DVector3 pos = light->PosRelative(group);
-	float radius = (light->GetRadius());
-
 	auto dist = fabs(p.DistToPoint((float)pos.X, (float)pos.Z, (float)pos.Y));
 
 	if (radius <= 0.f) return false;
@@ -54,6 +58,12 @@ bool GetLight(FDynLightData& dld, int group, Plane & p, FDynamicLight * light, b
 	{
 		return false;
 	}
+	return true;
+}
+
+bool GetLight(FDynLightData& dld, int group, Plane & p, FDynamicLight * light, bool checkside)
+{
+	if (!LightReachesPlane(p, light->PosRelative(group), light->GetRadius(), checkside)) return false;
 
 	AddLightToList(dld, group, light, false);
 	return true;
@@ -82,8 +92,7 @@ void AddLightToList(FDynLightData &dld, int group, FDynamicLight * light, bool f
 		cs = 1.0f;
 	}
 
-	if (light->target && (light->target->renderflags2 & RF2_LIGHTMULTALPHA))
-		cs *= (float)light->target->Alpha;
+	cs *= light->OwnerLightAlpha();
 
 	// Multiply intensity from GLDEFS
 	cs *= (float)light->GetLightDefIntensity();
@@ -94,8 +103,8 @@ void AddLightToList(FDynLightData &dld, int group, FDynamicLight * light, bool f
 
 	if (light->IsSubtractive())
 	{
-		DVector3 v(r, g, b);
-		float length = (float)v.Length();
+		FVector3 v(r, g, b);
+		float length = v.Length();
 
 		r = length - r;
 		g = length - g;
@@ -108,7 +117,7 @@ void AddLightToList(FDynLightData &dld, int group, FDynamicLight * light, bool f
 	{
 		shadowIndex = light->mShadowmapIndex + 1.0f;
 	}
-	else shadowIndex = 1025.f;
+	else shadowIndex = IShadowMap::Rows + 1.f;
 	// Store attenuate flag in the sign bit of the float.
 	if (light->IsAttenuated() || forceAttenuate) shadowIndex = -shadowIndex;
 
@@ -121,15 +130,18 @@ void AddLightToList(FDynLightData &dld, int group, FDynamicLight * light, bool f
 	if (light->IsSpot())
 	{
 		lightType = 1.0f;
-		spotInnerAngle = (float)light->pSpotInnerAngle->FastCos();
-		spotOuterAngle = (float)light->pSpotOuterAngle->FastCos();
+		spotInnerAngle = float_fastcosdeg(light->pSpotInnerAngle->Degrees());
+		spotOuterAngle = float_fastcosdeg(light->pSpotOuterAngle->Degrees());
 
-		DAngle negPitch = -light->Pitch;
-		DAngle Angle = light->Yaw;
-		double xzLen = negPitch.FastCos();
-		spotDirX = float(-Angle.FastCos() * xzLen);
-		spotDirY = float(-negPitch.FastSin());
-		spotDirZ = float(-Angle.FastSin() * xzLen);
+		// direction
+		float negPitch = (float)-light->Pitch.Degrees();
+		float Angle = (float)light->Yaw.Degrees();
+		float xzLen = -float_fastcosdeg(negPitch);
+
+		// faster calculations
+		spotDirX = float_fastcosdeg(Angle) * xzLen;
+		spotDirY = -float_fastsindeg(negPitch);
+		spotDirZ = float_fastsindeg(Angle) * xzLen;
 	}
 
 	float *data = &dld.arrays[i][dld.arrays[i].Reserve(16)];

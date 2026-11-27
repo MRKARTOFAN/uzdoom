@@ -100,26 +100,38 @@ bool IShadowMap::PerformUpdate()
 	if (CollectLights != nullptr)
 	{
 		UpdateCycles.Clock();
-		UploadAABBTree();
-		UploadLights();
+		const bool treeChanged = UploadAABBTree();
+		const bool lightsChanged = UploadLights();
+		if (!treeChanged && !lightsChanged && !mRedraw && mDrawnQuality == gl_shadowmap_quality)
+		{
+			FinishUpdate();
+			return false;
+		}
+		mRedraw = false;
+		mDrawnQuality = gl_shadowmap_quality;
 		return true;
 	}
 	return false;
 }
 
-void IShadowMap::UploadLights()
+bool IShadowMap::UploadLights()
 {
-	mLights.Resize(1024 * 4);
+	mLights.Resize(Rows * 4);
 	CollectLights();
 
 	if (mLightList == nullptr)
 		mLightList = screen->CreateDataBuffer(LIGHTLIST_BINDINGPOINT, true, false);
 
+	if (RowsUsed == mDrawnRows && mDrawnLights.Size() == mLights.Size() && memcmp(mDrawnLights.Data(), mLights.Data(), mLights.Size() * sizeof(float)) == 0)
+		return false;
 	mLightList->SetData(sizeof(float) * mLights.Size(), &mLights[0], BufferUsageType::Stream);
+	mDrawnLights = mLights;
+	mDrawnRows = RowsUsed;
+	return true;
 }
 
 
-void IShadowMap::UploadAABBTree()
+bool IShadowMap::UploadAABBTree()
 {
 	if (mNewTree)
 	{
@@ -132,16 +144,22 @@ void IShadowMap::UploadAABBTree()
 		if (!mLinesBuffer)
 			mLinesBuffer = screen->CreateDataBuffer(LIGHTLINES_BINDINGPOINT, true, false);
 		mLinesBuffer->SetData(mAABBTree->LinesSize(), mAABBTree->Lines(), BufferUsageType::Static);
+		return true;
 	}
 	else if (mAABBTree->Update())
 	{
 		mNodesBuffer->SetSubData(mAABBTree->DynamicNodesOffset(), mAABBTree->DynamicNodesSize(), mAABBTree->DynamicNodes());
 		mLinesBuffer->SetSubData(mAABBTree->DynamicLinesOffset(), mAABBTree->DynamicLinesSize(), mAABBTree->DynamicLines());
+		return true;
 	}
+	return false;
 }
 
 void IShadowMap::Reset()
 {
+	mRedraw = true;
+	mDrawnLights.Clear();
+	mDrawnRows = -1;
 	delete mLightList; mLightList = nullptr;
 	delete mNodesBuffer; mNodesBuffer = nullptr;
 	delete mLinesBuffer; mLinesBuffer = nullptr;

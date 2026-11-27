@@ -21,6 +21,9 @@
 #include "texturemanager.h"
 #include "modelrenderer.h"
 #include "m_swap.h"
+#include "c_cvars.h"
+
+CVAR(Bool, r_model_mergesurfaces, true, 0)
 
 #define MAX_QPATH 64
 
@@ -244,9 +247,12 @@ void FMD3Model::BuildVertexBuffer(FModelRenderer *renderer)
 		unsigned int vbufsize = 0;
 		unsigned int ibufsize = 0;
 
+		FrameVertices = 0;
 		for (unsigned i = 0; i < Surfaces.Size(); i++)
 		{
 			MD3Surface * surf = &Surfaces[i];
+			surf->vindex = FrameVertices;
+			FrameVertices += surf->numVertices;
 			vbufsize += Frames.Size() * surf->numVertices;
 			ibufsize += 3 * surf->numTriangles;
 		}
@@ -259,21 +265,20 @@ void FMD3Model::BuildVertexBuffer(FModelRenderer *renderer)
 
 		assert(vertptr != nullptr && indxptr != nullptr);
 
-		unsigned int vindex = 0, iindex = 0;
+		unsigned int iindex = 0;
 
 		for (unsigned i = 0; i < Surfaces.Size(); i++)
 		{
 			MD3Surface * surf = &Surfaces[i];
 
-			surf->vindex = vindex;
 			surf->iindex = iindex;
 			for (unsigned j = 0; j < Frames.Size() * surf->numVertices; j++)
 			{
 				MD3Vertex* vert = &surf->Vertices[j];
 
-				FModelVertex *bvert = &vertptr[vindex++];
-
 				int tc = j % surf->numVertices;
+				FModelVertex *bvert = &vertptr[(j / surf->numVertices) * FrameVertices + surf->vindex + tc];
+
 				bvert->Set(vert->x, vert->z, vert->y, surf->Texcoords[tc].s, surf->Texcoords[tc].t);
 				bvert->SetNormal(vert->nx, vert->nz, vert->ny);
 			}
@@ -282,7 +287,7 @@ void FMD3Model::BuildVertexBuffer(FModelRenderer *renderer)
 			{
 				for (int l = 0; l < 3; l++)
 				{
-					indxptr[iindex++] = surf->Tris[k].VertIndex[l];
+					indxptr[iindex++] = surf->vindex + surf->Tris[k].VertIndex[l];
 				}
 			}
 			surf->UnloadGeometry();
@@ -344,34 +349,34 @@ void FMD3Model::RenderFrame(FModelRenderer *renderer, FGameTexture * skin, int f
 {
 	if ((unsigned)frameno >= Frames.Size() || (unsigned)frameno2 >= Frames.Size()) return;
 
+	// [BB] In case no skin is specified via MODELDEF, check if the MD3 has a skin for the current surface.
+	// Note: Each surface may have a different skin.
+	auto surfaceSkinOf = [&](unsigned i) -> FGameTexture*
+	{
+		if (skin) return skin;
+		if (surfaceskinids && surfaceskinids[i].isValid()) return TexMan.GetGameTexture(surfaceskinids[i], true);
+		if (Surfaces[i].numSkins > 0 && Surfaces[i].Skins[0].isValid()) return TexMan.GetGameTexture(Surfaces[i].Skins[0], true);
+		return nullptr;
+	};
+
 	renderer->SetInterpolation(inter);
 	for (unsigned i = 0; i < Surfaces.Size(); i++)
 	{
 		MD3Surface * surf = &Surfaces[i];
-
-		// [BB] In case no skin is specified via MODELDEF, check if the MD3 has a skin for the current surface.
-		// Note: Each surface may have a different skin.
-		FGameTexture *surfaceSkin = skin;
+		FGameTexture *surfaceSkin = surfaceSkinOf(i);
 		if (!surfaceSkin)
 		{
-			if (surfaceskinids && surfaceskinids[i].isValid())
-			{
-				surfaceSkin = TexMan.GetGameTexture(surfaceskinids[i], true);
-			}
-			else if (surf->numSkins > 0 && surf->Skins[0].isValid())
-			{
-				surfaceSkin = TexMan.GetGameTexture(surf->Skins[0], true);
-			}
-
-			if (!surfaceSkin)
-			{
-				continue;
-			}
+			continue;
+		}
+		unsigned indices = surf->numTriangles * 3;
+		if (r_model_mergesurfaces)
+		{
+			while (i + 1 < Surfaces.Size() && surfaceSkinOf(i + 1) == surfaceSkin) indices += Surfaces[++i].numTriangles * 3;
 		}
 
 		renderer->SetMaterial(surfaceSkin, false, translation, act);
-		renderer->SetupFrame(this, surf->vindex + frameno * surf->numVertices, surf->vindex + frameno2 * surf->numVertices, surf->numVertices, -1);
-		renderer->DrawElements(surf->numTriangles * 3, surf->iindex * sizeof(unsigned int));
+		renderer->SetupFrame(this, frameno * FrameVertices, frameno2 * FrameVertices, FrameVertices, -1);
+		renderer->DrawElements(indices, surf->iindex * sizeof(unsigned int));
 	}
 	renderer->SetInterpolation(0.f);
 }

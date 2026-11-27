@@ -1588,6 +1588,7 @@ public:
 	bool AddressWritable;
 	bool arrayispointer = false;
 	bool noboundscheck;
+	bool NoteWrite = false;
 
 	FxArrayElement(FxExpression*, FxExpression*, bool = false);
 	~FxArrayElement();

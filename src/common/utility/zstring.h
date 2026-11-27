@@ -70,6 +70,10 @@ struct FStringData
 		return (const char *)(this + 1);
 	}
 
+	// [Karto] Shared empty-string count, never changed: every thread points at it, and plain ++/--
+	// lost updates under the tic worker until the exit freed static memory.
+	static constexpr int StaticRefs = 0x7fffffff;
+
 	char *AddRef()
 	{
 		if (RefCount < 0)
@@ -78,7 +82,7 @@ struct FStringData
 		}
 		else
 		{
-			RefCount++;
+			if (RefCount != StaticRefs) RefCount++;
 			return (char *)(this + 1);
 		}
 	}
@@ -87,6 +91,7 @@ struct FStringData
 	{
 		assert (RefCount != 0);
 
+		if (RefCount == StaticRefs) return;
 		if (--RefCount <= 0)
 		{
 			Dealloc();
@@ -392,7 +397,6 @@ protected:
 
 	void ResetToNull()
 	{
-		NullString.RefCount++;
 		Chars = &NullString.Nothing[0];
 	}
 

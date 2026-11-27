@@ -42,6 +42,8 @@ class DInterpolation : public DObject
 
 	TObjPtr<DInterpolation*> Next;
 	TObjPtr<DInterpolation*> Prev;
+	// [Karto] Skipped by this frame's DoInterpolations, so RestoreInterpolations must not write its stale backup.
+	bool Skipped = false;
 
 protected:
 	FLevelLocals *Level;
@@ -57,6 +59,7 @@ public:
 	virtual void UpdateInterpolation() = 0;
 	virtual void Restore() = 0;
 	virtual void Interpolate(double smoothratio) = 0;
+	virtual bool Retired() { return false; }
 
 	virtual void Serialize(FSerializer &arc);
 };
@@ -67,11 +70,22 @@ public:
 //
 //==========================================================================
 
+enum EInterpolationSkip
+{
+	ISKIP_Planes = 1,
+	ISKIP_FlatScroll = 2,
+	ISKIP_WallScroll = 4,
+	ISKIP_Polyobj = 8,
+	ISKIP_Other = 16,
+	ISKIP_All = ISKIP_Planes | ISKIP_FlatScroll | ISKIP_WallScroll | ISKIP_Polyobj | ISKIP_Other,
+};
+
 struct FInterpolator
 {
 	TObjPtr<DInterpolation*> Head = MakeObjPtr<DInterpolation*>(nullptr);
 	bool didInterp = false;
 	int count = 0;
+	double frac = 1.;
 
 	int CountInterpolations ();
 
@@ -79,7 +93,8 @@ public:
 	void UpdateInterpolations();
 	void AddInterpolation(DInterpolation *);
 	void RemoveInterpolation(DInterpolation *);
-	void DoInterpolations(double smoothratio);
+	void DoInterpolations(double smoothratio, int skip = 0);
+	void RetireSkipped(int skip);
 	void RestoreInterpolations();
 	void ClearInterpolations();
 };

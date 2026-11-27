@@ -2254,6 +2254,8 @@ static bool BlockCompare (TArray<int> *block1, TArray<int> *block2)
 	return true;
 }
 
+EXTERN_CVAR(Bool, p_blockdense)
+
 static void CreatePackedBlockmap (TArray<int> &BlockMap, TArray<int> *blocks, int bmapwidth, int bmapheight)
 {
 	int buckets[4096];
@@ -2630,6 +2632,7 @@ void MapLoader::LoadBlockMap (MapData * map)
 	count = Level->blockmap.bmapwidth*Level->blockmap.bmapheight;
 	Level->blockmap.blocklinks = new FBlockNode *[count];
 	memset (Level->blockmap.blocklinks, 0, count*sizeof(*Level->blockmap.blocklinks));
+	if (p_blockdense) Level->blockmap.blockarrays = new FBlockArray[count];
 	Level->blockmap.blockmap = Level->blockmap.blockmaplump+4;
 }
 
@@ -3242,6 +3245,7 @@ void MapLoader::LoadLevel(MapData *map, const char *lumpname, int position)
 
 	SWRenderer->SetColormap(Level);	//The SW renderer needs to do some special setup for the level's default colormap.
 	InitPortalGroups(Level);
+	Level->blockmap.DropMirrorUnless(Level->Displacements.size <= 1);
 	P_InitHealthGroups(Level);
 
 	if (reloop) LoopSidedefs(false);
@@ -3249,6 +3253,8 @@ void MapLoader::LoadLevel(MapData *map, const char *lumpname, int position)
 	if (!Level->IsReentering())
 		Level->FinalizePortals();	// finalize line portals after polyobjects have been initialized. This info is needed for properly flagging them.
 
+	P_ClassifyIslands(Level);	// [Karto] after polyobjects and portals: both decide which walls sight can pass
+	P_ClassifyClosets(Level);
 	Level->aabbTree = new DoomLevelAABBTree(Level);
 	Level->levelMesh = new DoomLevelMesh(*Level);
 

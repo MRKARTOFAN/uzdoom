@@ -1,0 +1,68 @@
+stages:
+  - build
+
+variables:
+  GIT_DEPTH: "0"
+  BUILD_TYPE: Release
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+linux:
+  stage: build
+  image: ubuntu:24.04
+  variables:
+    CCACHE_DIR: "$CI_PROJECT_DIR/.cache/ccache"
+    DEBIAN_FRONTEND: noninteractive
+  cache:
+    key: linux-ccache
+    paths:
+      - .cache/ccache
+  before_script:
+    - apt-get -q update
+    - >
+      apt-get -q install -y --no-install-recommends
+      build-essential clang cmake ninja-build ccache git python3 ca-certificates
+      libsdl2-dev libopenal-dev libvpx-dev libbz2-dev libwebp-dev waylandpp-dev
+  script:
+    - cmake -B build -S . -G Ninja -D CMAKE_BUILD_TYPE=$BUILD_TYPE -D CMAKE_C_COMPILER=clang -D CMAKE_CXX_COMPILER=clang++
+      -D CMAKE_C_COMPILER_LAUNCHER=ccache -D CMAKE_CXX_COMPILER_LAUNCHER=ccache -D USE_PCH=OFF -D PK3_QUIET_ZIPDIR=ON
+    - cmake --build build -- -k 0
+    - ccache -s
+    - mkdir -p package && cp build/uzdoom build/*.pk3 package/ && cp -r build/soundfonts build/fm_banks package/ && cp -r docs/licenses package/
+  artifacts:
+    name: "Linux-x86_64-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - package/
+    expire_in: 30 days
+
+windows:
+  stage: build
+  tags:
+    - saas-windows-medium-amd64
+  script:
+    - $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+    - Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+    - Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64"
+    - cmake -B build -S . -A x64 -D PK3_QUIET_ZIPDIR=ON
+    - if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    - cmake --build build --config $env:BUILD_TYPE --parallel
+    - if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    - curl.exe -fsSL -o oalsoft.zip https://github.com/kcat/openal-soft/releases/download/1.23.1/openal-soft-1.23.1-bin.zip
+    - curl.exe -fsSL -o sndfile.zip https://github.com/libsndfile/libsndfile/releases/download/1.2.2/libsndfile-1.2.2-win64.zip
+    - if ((Get-FileHash oalsoft.zip).Hash -ne "EA8BC36FD7FA05F64E13400D20886DE753A227202A4EA3781913489A26B36FC6") { throw "oalsoft.zip checksum" }
+    - if ((Get-FileHash sndfile.zip).Hash -ne "2173935C0C1ED13CF627951D34483F9D405EAD2EB473190461C42BA220643A3F") { throw "sndfile.zip checksum" }
+    - Expand-Archive oalsoft.zip deps\oal; Expand-Archive sndfile.zip deps\sndfile
+    - New-Item -ItemType Directory package | Out-Null
+    - Copy-Item "build\$env:BUILD_TYPE\uzdoom.exe", "build\$env:BUILD_TYPE\*.pk3" package\
+    - Copy-Item -Recurse "build\$env:BUILD_TYPE\soundfonts", "build\$env:BUILD_TYPE\fm_banks", docs\licenses package\
+    - Copy-Item (Get-ChildItem -Recurse deps\oal -Filter soft_oal.dll | Where-Object FullName -like "*Win64*").FullName package\
+    - Copy-Item (Get-ChildItem -Recurse deps\sndfile -Filter sndfile.dll).FullName package\
+  artifacts:
+    name: "Windows-x86_64-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - package/
+    expire_in: 30 days

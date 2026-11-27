@@ -313,6 +313,7 @@ EXTERN_CVAR (Int, fraglimit)
 void AActor::Die (AActor *source, AActor *inflictor, int dmgflags, FName MeansOfDeath)
 {
 	bool wasgibbed = (health < GetGibHealth());
+	ClosetFlags = 0;	// [Karto] a raised corpse must run its real AI, so closet flags are cleared on death
 
 	// Check to see if unmorph Actors need to be killed as well. Originally this was always
 	// called but that puts an unnecessary burden on the modder to determine whether it's

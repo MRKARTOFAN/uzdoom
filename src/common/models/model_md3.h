@@ -54,7 +54,7 @@ class FMD3Model : public FModel
 		TArray<MD3TexCoord> Texcoords;
 		TArray<MD3Vertex> Vertices;
 
-		unsigned int vindex = UINT_MAX;	// contains numframes arrays of vertices
+		unsigned int vindex = UINT_MAX;
 		unsigned int iindex = UINT_MAX;
 
 		void UnloadGeometry()
@@ -78,6 +78,7 @@ class FMD3Model : public FModel
 
 	TArray<MD3Frame> Frames;
 	TArray<MD3Surface> Surfaces;
+	unsigned FrameVertices = 0;
 
 public:
 	FMD3Model() = default;

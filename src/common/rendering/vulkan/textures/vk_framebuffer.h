@@ -45,7 +45,10 @@ public:
 	std::shared_ptr<VulkanSwapChain> SwapChain;
 	int PresentImageIndex = -1;
 
-	std::unique_ptr<VulkanSemaphore> SwapChainImageAvailableSemaphore;
+	// [Karto] One per frame in flight: an acquire may not signal a semaphore whose wait from the parked frame is still pending.
+	std::unique_ptr<VulkanSemaphore> SwapChainImageAvailableSemaphore[2];
+	int AcquireSlot = 0;
+	VulkanSemaphore* GetImageAvailableSemaphore() const { return SwapChainImageAvailableSemaphore[AcquireSlot].get(); }
 	std::vector<std::unique_ptr<VulkanSemaphore>> RenderFinishedSemaphores;
 
 private:

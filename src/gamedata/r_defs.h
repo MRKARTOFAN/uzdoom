@@ -1195,6 +1195,11 @@ enum
 	WALLF_DITHERTRANS_BOTTOM	= WALLF_DITHERTRANS << 2,	// Bottom tier (gets reset every frame)
 };
 
+extern bool SideRenderTracking;
+// [Karto] Set while the interpolator writes in-between offsets, which are not game state changes.
+extern bool SideRenderInterpolating;
+void NoteSideRenderChange(side_t* side, unsigned change);
+
 struct side_t
 {
 	enum ETexpart
@@ -1270,22 +1275,37 @@ struct side_t
 	int sidenum;
 
 	int dithertranscount;
+	uint64_t TextureTransformVersion = 0;
 
 	int GetLightLevel (bool foggy, int baselight, int which, bool is3dlight=false, int *pfakecontrast_usedbygzdoom=NULL) const;
+
+	enum ERenderChange : unsigned
+	{
+		RenderOffsetTop = 1, RenderOffsetMid = 2, RenderOffsetBottom = 4, RenderScale = 8, RenderTexture = 16, RenderLight = 32,
+		RenderAlpha = 64, RenderFlags = 128, RenderColor = 256, RenderFx = 512, RenderInit = 1024, RenderChangeKinds = 11
+	};
+
+	void MarkRenderChanged(unsigned change)
+	{
+		if (SideRenderTracking && !SideRenderInterpolating) NoteSideRenderChange(this, change);
+	}
 
 	void SetLight(int16_t l)
 	{
 		Light = l;
+		MarkRenderChanged(RenderLight);
 	}
 
 	void SetLight(int16_t l, int which)
 	{
 		TierLights[which] = l;
+		MarkRenderChanged(RenderLight);
 	}
 
 	void SetAlpha(double a)
 	{
 		alpha = a;
+		MarkRenderChanged(RenderAlpha);
 	}
 
 	void ClearAlpha()
@@ -1293,6 +1313,7 @@ struct side_t
 		// [XA] use DBL_MAX as a sentinel value for "alpha not set",
 		// instructing the renderer to use the linedef's alpha instead
 		alpha = DBL_MAX;
+		MarkRenderChanged(RenderAlpha);
 	}
 
 	bool HasAlpha()
@@ -1312,18 +1333,36 @@ struct side_t
 	void SetTexture(int which, FTextureID tex)
 	{
 		textures[which].texture = tex;
+		MarkRenderChanged(RenderTexture);
+	}
+
+	void SetTextureTransform(double& target, double value, unsigned change)
+	{
+		if (target != value)
+		{
+			target = value;
+			++TextureTransformVersion;
+			MarkRenderChanged(change);
+		}
+		target = value;
+	}
+
+	void InitTexturePart(int which, int from)
+	{
+		textures[which].InitFrom(textures[from]);
+		// [Karto] Animated-door inheritance bypasses the UV setters.
+		++TextureTransformVersion;
+		MarkRenderChanged(RenderInit);
 	}
 
 	void SetTextureXOffset(int which, double offset)
 	{
-		textures[which].xOffset = offset;;
+		SetTextureTransform(textures[which].xOffset, offset, 1u << which);
 	}
 
 	void SetTextureXOffset(double offset)
 	{
-		textures[top].xOffset =
-		textures[mid].xOffset =
-		textures[bottom].xOffset = offset;
+		for (int i = 0; i < 3; ++i) SetTextureTransform(textures[i].xOffset, offset, 1u << i);
 	}
 
 	double GetTextureXOffset(int which) const
@@ -1333,19 +1372,17 @@ struct side_t
 
 	void AddTextureXOffset(int which, double delta)
 	{
-		textures[which].xOffset += delta;
+		SetTextureXOffset(which, textures[which].xOffset + delta);
 	}
 
 	void SetTextureYOffset(int which, double offset)
 	{
-		textures[which].yOffset = offset;
+		SetTextureTransform(textures[which].yOffset, offset, 1u << which);
 	}
 
 	void SetTextureYOffset(double offset)
 	{
-		textures[top].yOffset =
-		textures[mid].yOffset =
-		textures[bottom].yOffset = offset;
+		for (int i = 0; i < 3; ++i) SetTextureTransform(textures[i].yOffset, offset, 1u << i);
 	}
 
 	double GetTextureYOffset(int which) const
@@ -1355,17 +1392,17 @@ struct side_t
 
 	void AddTextureYOffset(int which, double delta)
 	{
-		textures[which].yOffset += delta;
+		SetTextureYOffset(which, textures[which].yOffset + delta);
 	}
 
 	void SetTextureXScale(int which, double scale)
 	{
-		textures[which].xScale = scale == 0 ? 1. : scale;
+		SetTextureTransform(textures[which].xScale, scale == 0 ? 1. : scale, RenderScale);
 	}
 
 	void SetTextureXScale(double scale)
 	{
-		textures[top].xScale = textures[mid].xScale = textures[bottom].xScale = scale == 0 ? 1. : scale;
+		for (auto& part : textures) SetTextureTransform(part.xScale, scale == 0 ? 1. : scale, RenderScale);
 	}
 
 	double GetTextureXScale(int which) const
@@ -1375,17 +1412,17 @@ struct side_t
 
 	void MultiplyTextureXScale(int which, double delta)
 	{
-		textures[which].xScale *= delta;
+		SetTextureTransform(textures[which].xScale, textures[which].xScale * delta, RenderScale);
 	}
 
 	void SetTextureYScale(int which, double scale)
 	{
-		textures[which].yScale = scale == 0 ? 1. : scale;
+		SetTextureTransform(textures[which].yScale, scale == 0 ? 1. : scale, RenderScale);
 	}
 
 	void SetTextureYScale(double scale)
 	{
-		textures[top].yScale = textures[mid].yScale = textures[bottom].yScale = scale == 0 ? 1. : scale;
+		for (auto& part : textures) SetTextureTransform(part.yScale, scale == 0 ? 1. : scale, RenderScale);
 	}
 
 	double GetTextureYScale(int which) const
@@ -1395,7 +1432,7 @@ struct side_t
 
 	void MultiplyTextureYScale(int which, double delta)
 	{
-		textures[which].yScale *= delta;
+		SetTextureTransform(textures[which].yScale, textures[which].yScale * delta, RenderScale);
 	}
 
 	int GetTextureFlags(int which)
@@ -1407,6 +1444,7 @@ struct side_t
 	{
 		textures[which].flags &= ~And;
 		textures[which].flags |= Or;
+		MarkRenderChanged(RenderFlags);
 	}
 
 	void SetSpecialColor(int which, int slot, int r, int g, int b, bool useown = true)
@@ -1415,6 +1453,7 @@ struct side_t
 		if (useown) textures[which].flags |= part::UseOwnSpecialColors;
 		else  textures[which].flags &= ~part::UseOwnSpecialColors;
 		Flags |= WALLF_EXTCOLOR;
+		MarkRenderChanged(RenderColor);
 	}
 
 	void SetSpecialColor(int which, int slot, PalEntry rgb, bool useown = true)
@@ -1424,6 +1463,7 @@ struct side_t
 		if (useown) textures[which].flags |= part::UseOwnSpecialColors;
 		else  textures[which].flags &= ~part::UseOwnSpecialColors;
 		Flags |= WALLF_EXTCOLOR;
+		MarkRenderChanged(RenderColor);
 	}
 
 	// Note that the sector being passed in here may not be the actual sector this sidedef belongs to
@@ -1448,12 +1488,14 @@ struct side_t
 		{
 			textures[which].flags &= (~flag);
 		}
+		MarkRenderChanged(RenderColor);
 	}
 
 	void SetAdditiveColor(int which, PalEntry rgb)
 	{
 		rgb.a = 255;
 		textures[which].AdditiveColor = rgb;
+		MarkRenderChanged(RenderColor);
 	}
 
 	void SetTextureFx(int slot, const TextureManipulation* tm)
@@ -1467,6 +1509,7 @@ struct side_t
 		{
 			textures[slot].TextureFx = {};
 		}
+		MarkRenderChanged(RenderFx);
 	}
 
 	PalEntry GetAdditiveColor(int which, sector_t *frontsector) const
@@ -1684,6 +1727,7 @@ struct subsector_t
 	sector_t	*render_sector;
 	FSection	*section;
 	int			subsectornum;
+	int			island;
 	uint32_t	numlines;
 	uint16_t	flags;
 	short		mapsection;

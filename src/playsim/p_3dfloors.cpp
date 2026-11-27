@@ -32,6 +32,7 @@
 #include "p_spec.h"
 #include "g_levellocals.h"
 #include "actorinlines.h"
+#include <mutex>
 
 //==========================================================================
 //
@@ -288,6 +289,8 @@ bool P_CheckFor3DCeilingHit(AActor * mo, double z, bool trigger)
 //
 //==========================================================================
 
+std::shared_mutex XFloorRebuildLock;
+
 void P_Recalculate3DFloors(sector_t * sector)
 {
 	F3DFloor *		rover;
@@ -305,6 +308,8 @@ void P_Recalculate3DFloors(sector_t * sector)
 
 	TArray<F3DFloor*> & ffloors=sector->e->XFloor.ffloors;
 	TArray<lightlist_t> & lightlist = sector->e->XFloor.lightlist;
+	std::unique_lock<std::shared_mutex> rebuilding(XFloorRebuildLock, std::defer_lock);
+	if (ffloors.Size()) rebuilding.lock();
 
 	// Sort the floors top to bottom for quicker access here and later
 	// Translucent and swimmable floors are split if they overlap with solid ones.

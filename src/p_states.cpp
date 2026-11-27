@@ -27,6 +27,7 @@
 #include "cmdlib.h"
 #include "codegen.h"
 #include "r_state.h"
+#include <algorithm>
 #include "templates.h"
 #include "thingdef.h"
 
@@ -84,8 +85,59 @@ DEFINE_ACTION_FUNCTION(FState, GetSpriteTexture)
 //
 //==========================================================================
 
+namespace
+{
+	struct FStateOwnerRange
+	{
+		const FState *Begin, *End;
+		PClassActor *Owner;
+	};
+	TArray<FStateOwnerRange> StateOwnerRanges;
+	unsigned StateOwnerClassCount = ~0u;
+}
+
+void FState::StaticClearStateOwnerTable()
+{
+	StateOwnerRanges.Clear();
+	StateOwnerClassCount = ~0u;
+}
+
+void FState::StaticBuildStateOwnerTable()
+{
+	StaticClearStateOwnerTable();
+	TArray<FStateOwnerRange> ranges;
+	auto &classes = PClassActor::AllActorClasses;
+	for (unsigned i = 0; i < classes.Size(); ++i)
+	{
+		auto info = classes[i]->ActorInfo();
+		if (info != nullptr && info->NumOwnedStates > 0)
+			ranges.Push({ info->OwnedStates, info->OwnedStates + info->NumOwnedStates, classes[i] });
+	}
+	// [Karto] Stable sort: of several classes sharing one block, the first in class order stays first, as the scan returns.
+	std::stable_sort(ranges.begin(), ranges.end(), [](const FStateOwnerRange &a, const FStateOwnerRange &b) { return a.Begin < b.Begin; });
+	TArray<FStateOwnerRange> table;
+	for (auto &range : ranges)
+	{
+		if (table.Size() > 0 && table.Last().Begin == range.Begin && table.Last().End == range.End)
+			continue;
+		if (table.Size() > 0 && range.Begin < table.Last().End)
+			return;
+		table.Push(range);
+	}
+	StateOwnerRanges = std::move(table);
+	StateOwnerClassCount = classes.Size();
+}
+
 PClassActor *FState::StaticFindStateOwner (const FState *state)
 {
+	if (StateOwnerClassCount == PClassActor::AllActorClasses.Size())
+	{
+		auto end = StateOwnerRanges.end();
+		auto it = std::upper_bound(StateOwnerRanges.begin(), end, state, [](const FState *s, const FStateOwnerRange &r) { return s < r.Begin; });
+		if (it == StateOwnerRanges.begin()) return nullptr;
+		--it;
+		return state < it->End ? it->Owner : nullptr;
+	}
 	for (unsigned int i = 0; i < PClassActor::AllActorClasses.Size(); ++i)
 	{
 		PClassActor *info = PClassActor::AllActorClasses[i];
@@ -96,6 +148,30 @@ PClassActor *FState::StaticFindStateOwner (const FState *state)
 	}
 
 	return NULL;
+}
+
+CCMD(stateowner_verify)
+{
+	auto &classes = PClassActor::AllActorClasses;
+	unsigned checked = 0, mismatches = 0;
+	auto scan = [&](const FState *state) -> PClassActor *
+	{
+		for (unsigned i = 0; i < classes.Size(); ++i) if (classes[i]->OwnsState(state)) return classes[i];
+		return nullptr;
+	};
+	for (unsigned i = 0; i < classes.Size(); ++i)
+	{
+		auto info = classes[i]->ActorInfo();
+		if (info == nullptr || info->NumOwnedStates <= 0) continue;
+		for (int k = 0; k <= info->NumOwnedStates; ++k)
+		{
+			const FState *state = info->OwnedStates + k;
+			if (FState::StaticFindStateOwner(state) != scan(state)) ++mismatches;
+			++checked;
+		}
+	}
+	Printf("STATEOWNER table=%u ranges=%u checked=%u mismatches=%u\n", StateOwnerClassCount == classes.Size() ? 1u : 0u,
+		StateOwnerRanges.Size(), checked, mismatches);
 }
 
 //==========================================================================

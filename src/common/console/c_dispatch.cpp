@@ -126,6 +126,30 @@ public:
 		delayedCommands.DeleteAndClear();
 	}
 
+	bool Quiet(int tics) const
+	{
+		for (auto cmd : delayedCommands)
+		{
+			auto waiting = dynamic_cast<FWaitingCommand*>(cmd);
+			if (waiting == nullptr || waiting->TicsLeft <= tics) return false;
+		}
+		return true;
+	}
+
+	unsigned Count() const
+	{
+		return delayedCommands.Size();
+	}
+
+	void SkipTics(unsigned count, int tics)
+	{
+		if (count > delayedCommands.Size()) count = delayedCommands.Size();
+		for (unsigned i = 0; i < count; i++)
+		{
+			if (auto waiting = dynamic_cast<FWaitingCommand*>(delayedCommands[i])) waiting->TicsLeft -= tics;
+		}
+	}
+
 	void AddCommand(FDelayedCommand * cmd)
 	{
 		delayedCommands.Push(cmd);
@@ -142,6 +166,21 @@ void C_RunDelayedCommands()
 void C_ClearDelayedCommands()
 {
 	delayedCommandQueue.Clear();
+}
+
+bool C_DelayedCommandsQuiet(int tics)
+{
+	return delayedCommandQueue.Quiet(tics);
+}
+
+unsigned C_DelayedCommandCount()
+{
+	return delayedCommandQueue.Count();
+}
+
+void C_SkipDelayedCommandTics(unsigned count, int tics)
+{
+	delayedCommandQueue.SkipTics(count, tics);
 }
 
 

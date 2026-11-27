@@ -377,6 +377,20 @@ int signbit(), isnan(), isfinite();
 static double reduc();
 #endif
 extern double MAXNUM;
+
+/* [Karto] The C runtime's ldexp is a slow library call and pow scales by powers of two several times. When 2^n is a
+   normal double, x * 2^n is the same single rounding of the exact product, so the result is bit-identical. */
+static double pow_ldexp(double x, int n)
+{
+	if (n >= -1022 && n <= 1023)
+	{
+		union { double d; unsigned long long u; } scale;
+		scale.u = (unsigned long long)(n + 1023) << 52;
+		return x * scale.d;
+	}
+	return ldexp(x, n);
+}
+#define ldexp pow_ldexp
 #ifdef INFINITIES
 extern double INFINITY;
 #endif

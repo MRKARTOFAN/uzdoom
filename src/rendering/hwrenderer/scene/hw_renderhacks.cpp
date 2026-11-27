@@ -32,6 +32,11 @@
 #include "hwrenderer/scene/hw_portal.h"
 #include "hw_fakeflat.h"
 #include "hw_walldispatcher.h"
+#include "c_cvars.h"
+#include <unordered_map>
+#include <vector>
+
+CVAR(Bool, r_fillvertexcache, true, 0)
 
 //==========================================================================
 //
@@ -46,6 +51,8 @@ void HWDrawInfo::DispatchRenderHacks()
 	TMap<int, gl_subsectorrendernode*>::Iterator ofi(otherFloorPlanes);
 	HWFlat glflat;
 	glflat.section = nullptr;
+	// [Karto] ProcessSector reads 3D floor light lists, which a worker tic may be rebuilding.
+	std::shared_lock<std::shared_mutex> xfloors(XFloorRebuildLock);
 	while (ofi.NextPair(pair))
 	{
 		auto sec = hw_FakeFlat(&Level->sectors[pair->Key], in_area, false);
@@ -129,19 +136,103 @@ int HWDrawInfo::SetupLightsForOtherPlane(subsector_t * sub, FDynLightData &light
 //
 //==========================================================================
 
+// [Karto] Fill-plane vertices depend only on the subsector's geometry and the plane, so they are cached per (subsector,
+// plane) while the plane's exact values hold.
+namespace
+{
+	struct FFillVertex
+	{
+		float x, z, y, u, v;
+	};
+
+	struct FFillVertexCache
+	{
+		DVector3 Normal;
+		double D = 0, NegIC = 0;
+		std::vector<FFillVertex> Vertices;
+	};
+
+	struct FFillVertexKey
+	{
+		const subsector_t* Sub;
+		const secplane_t* Plane;
+		bool operator==(const FFillVertexKey& other) const { return Sub == other.Sub && Plane == other.Plane; }
+	};
+
+	struct FFillVertexKeyHash
+	{
+		size_t operator()(const FFillVertexKey& key) const
+		{
+			return std::hash<const void*>()(key.Sub) * size_t(33) ^ std::hash<const void*>()(key.Plane);
+		}
+	};
+
+	std::unordered_map<FFillVertexKey, FFillVertexCache, FFillVertexKeyHash> FillVertexCache;
+	const FLevelLocals* FillVertexLevel = nullptr;
+	int FillVertexStartTime = 0;
+}
+
 int HWDrawInfo::CreateOtherPlaneVertices(subsector_t *sub, const secplane_t *plane)
 {
+	// [Karto] A reload reuses addresses; starttime separates maps that share the Level object.
+	if (r_fillvertexcache && (FillVertexLevel != Level || FillVertexStartTime != Level->starttime))
+	{
+		FillVertexCache.clear();
+		FillVertexLevel = Level;
+		FillVertexStartTime = Level->starttime;
+	}
+	FFillVertexCache* cached = nullptr;
+	if (r_fillvertexcache)
+	{
+		auto found = FillVertexCache.find({ sub, plane });
+		if (found != FillVertexCache.end())
+		{
+			auto& e = found->second;
+			if (e.Vertices.size() == sub->numlines && e.D == plane->D && e.NegIC == plane->negiC &&
+				e.Normal.X == plane->normal.X && e.Normal.Y == plane->normal.Y && e.Normal.Z == plane->normal.Z)
+				cached = &e;
+		}
+		if (cached == nullptr)
+		{
+			auto& e = FillVertexCache[{ sub, plane }];
+			e.Normal = plane->normal;
+			e.D = plane->D;
+			e.NegIC = plane->negiC;
+			e.Vertices.resize(sub->numlines);
+			for (unsigned int k = 0; k < sub->numlines; k++)
+			{
+				vertex_t *vt = sub->firstline[k].v1;
+				e.Vertices[k] = { float(vt->fX()), float(plane->ZatPoint(vt)), float(vt->fY()), float(vt->fX() / 64.), float(-vt->fY() / 64.) };
+			}
+			cached = &e;
+		}
+	}
 	auto alloc = screen->mVertexData->AllocVertices(sub->numlines);
 	auto ptr = alloc.first;
-	for (unsigned int k = 0; k < sub->numlines; k++)
+	if (cached == nullptr)
 	{
-		vertex_t *vt = sub->firstline[k].v1;
-		ptr->x = vt->fX();
-		ptr->z = plane->ZatPoint(vt);
-		ptr->y = vt->fY();
-		ptr->u = vt->fX() / 64.f;
-		ptr->v = -vt->fY() / 64.f;
-		ptr++;
+		for (unsigned int k = 0; k < sub->numlines; k++)
+		{
+			vertex_t *vt = sub->firstline[k].v1;
+			ptr->x = vt->fX();
+			ptr->z = plane->ZatPoint(vt);
+			ptr->y = vt->fY();
+			ptr->u = vt->fX() / 64.f;
+			ptr->v = -vt->fY() / 64.f;
+			ptr++;
+		}
+	}
+	else
+	{
+		const FFillVertex* src = cached->Vertices.data();
+		for (unsigned int k = 0; k < sub->numlines; k++, ptr++, src++)
+		{
+			ptr->x = src->x;
+			ptr->z = src->z;
+			ptr->y = src->y;
+			ptr->u = src->u;
+			ptr->v = src->v;
+		}
 	}
 	return alloc.second;
 }
@@ -313,8 +404,8 @@ bool HWDrawInfo::DoOneSectorUpper(subsector_t * subsec, float Planez, area_t in_
 		subsector_t * backsub = seg->PartnerSeg->Subsector;
 
 		// already checked?
-		if (backsub->validcount == validcount) continue;
-		backsub->validcount = validcount;
+		if (backsub->validcount == rendervalidcount) continue;
+		backsub->validcount = rendervalidcount;
 
 		if (seg->frontsector != seg->backsector && seg->linedef)
 		{
@@ -371,8 +462,8 @@ bool HWDrawInfo::DoOneSectorLower(subsector_t * subsec, float Planez, area_t in_
 		subsector_t * backsub = seg->PartnerSeg->Subsector;
 
 		// already checked?
-		if (backsub->validcount == validcount) continue;
-		backsub->validcount = validcount;
+		if (backsub->validcount == rendervalidcount) continue;
+		backsub->validcount = rendervalidcount;
 
 		if (seg->frontsector != seg->backsector && seg->linedef)
 		{
@@ -430,8 +521,8 @@ bool HWDrawInfo::DoFakeBridge(subsector_t * subsec, float Planez, area_t in_area
 		subsector_t * backsub = seg->PartnerSeg->Subsector;
 
 		// already checked?
-		if (backsub->validcount == validcount) continue;
-		backsub->validcount = validcount;
+		if (backsub->validcount == rendervalidcount) continue;
+		backsub->validcount = rendervalidcount;
 
 		if (seg->frontsector != seg->backsector && seg->linedef)
 		{
@@ -483,8 +574,8 @@ bool HWDrawInfo::DoFakeCeilingBridge(subsector_t * subsec, float Planez, area_t 
 		subsector_t * backsub = seg->PartnerSeg->Subsector;
 
 		// already checked?
-		if (backsub->validcount == validcount) continue;
-		backsub->validcount = validcount;
+		if (backsub->validcount == rendervalidcount) continue;
+		backsub->validcount = rendervalidcount;
 
 		if (seg->frontsector != seg->backsector && seg->linedef)
 		{
@@ -527,13 +618,13 @@ void HWDrawInfo::HandleMissingTextures(area_t in_area)
 	{
 		if (!MissingUpperTextures[i].seg) continue;
 		HandledSubsectors.Clear();
-		validcount++;
+		rendervalidcount++;
 
 		if (MissingUpperTextures[i].Planez > Viewpoint.Pos.Z)
 		{
 			// close the hole only if all neighboring sectors are an exact height match
 			// Otherwise just fill in the missing textures.
-			MissingUpperTextures[i].sub->validcount = validcount;
+			MissingUpperTextures[i].sub->validcount = rendervalidcount;
 			if (DoOneSectorUpper(MissingUpperTextures[i].sub, MissingUpperTextures[i].Planez, in_area))
 			{
 				sector_t * sec = MissingUpperTextures[i].seg->backsector;
@@ -567,7 +658,7 @@ void HWDrawInfo::HandleMissingTextures(area_t in_area)
 		if (!MissingUpperTextures[i].seg->PartnerSeg) continue;
 		subsector_t *backsub = MissingUpperTextures[i].seg->PartnerSeg->Subsector;
 		if (!backsub) continue;
-		validcount++;
+		rendervalidcount++;
 		HandledSubsectors.Clear();
 
 		{
@@ -575,7 +666,7 @@ void HWDrawInfo::HandleMissingTextures(area_t in_area)
 			sector_t * fakesector = hw_FakeFlat(MissingUpperTextures[i].seg->frontsector, in_area, false);
 			float planez = (float)fakesector->GetPlaneTexZ(sector_t::ceiling);
 
-			backsub->validcount = validcount;
+			backsub->validcount = rendervalidcount;
 			if (DoFakeCeilingBridge(backsub, planez, in_area))
 			{
 				for (unsigned int j = 0; j < HandledSubsectors.Size(); j++)
@@ -593,13 +684,13 @@ void HWDrawInfo::HandleMissingTextures(area_t in_area)
 	{
 		if (!MissingLowerTextures[i].seg) continue;
 		HandledSubsectors.Clear();
-		validcount++;
+		rendervalidcount++;
 
 		if (MissingLowerTextures[i].Planez < Viewpoint.Pos.Z)
 		{
 			// close the hole only if all neighboring sectors are an exact height match
 			// Otherwise just fill in the missing textures.
-			MissingLowerTextures[i].sub->validcount = validcount;
+			MissingLowerTextures[i].sub->validcount = rendervalidcount;
 			if (DoOneSectorLower(MissingLowerTextures[i].sub, MissingLowerTextures[i].Planez, in_area))
 			{
 				sector_t * sec = MissingLowerTextures[i].seg->backsector;
@@ -633,7 +724,7 @@ void HWDrawInfo::HandleMissingTextures(area_t in_area)
 		if (!MissingLowerTextures[i].seg->PartnerSeg) continue;
 		subsector_t *backsub = MissingLowerTextures[i].seg->PartnerSeg->Subsector;
 		if (!backsub) continue;
-		validcount++;
+		rendervalidcount++;
 		HandledSubsectors.Clear();
 
 		{
@@ -641,7 +732,7 @@ void HWDrawInfo::HandleMissingTextures(area_t in_area)
 			sector_t * fakesector = hw_FakeFlat(MissingLowerTextures[i].seg->frontsector, in_area, false);
 			float planez = (float)fakesector->GetPlaneTexZ(sector_t::floor);
 
-			backsub->validcount = validcount;
+			backsub->validcount = rendervalidcount;
 			if (DoFakeBridge(backsub, planez, in_area))
 			{
 				for (unsigned int j = 0; j < HandledSubsectors.Size(); j++)
@@ -826,7 +917,7 @@ void HWDrawInfo::PrepareUnhandledMissingTextures()
 {
 	if (!Level->notexturefill)
 	{
-		validcount++;
+		rendervalidcount++;
 		for (int i = MissingUpperSegs.Size() - 1; i >= 0; i--)
 		{
 			int index = MissingUpperSegs[i].MTI_Index;
@@ -835,8 +926,8 @@ void HWDrawInfo::PrepareUnhandledMissingTextures()
 			seg_t * seg = MissingUpperSegs[i].seg;
 
 			// already done!
-			if (seg->linedef->validcount == validcount) continue;		// already done
-			seg->linedef->validcount = validcount;
+			if (seg->linedef->validcount == rendervalidcount) continue;		// already done
+			seg->linedef->validcount = rendervalidcount;
 			if (seg->frontsector->GetPlaneTexZ(sector_t::ceiling) < Viewpoint.Pos.Z) continue;	// out of sight
 
 			// FIXME: The check for degenerate subsectors should be more precise
@@ -848,7 +939,7 @@ void HWDrawInfo::PrepareUnhandledMissingTextures()
 			PrepareUpperGap(seg);
 		}
 
-		validcount++;
+		rendervalidcount++;
 		for (int i = MissingLowerSegs.Size() - 1; i >= 0; i--)
 		{
 			int index = MissingLowerSegs[i].MTI_Index;
@@ -856,8 +947,8 @@ void HWDrawInfo::PrepareUnhandledMissingTextures()
 
 			seg_t * seg = MissingLowerSegs[i].seg;
 
-			if (seg->linedef->validcount == validcount) continue;		// already done
-			seg->linedef->validcount = validcount;
+			if (seg->linedef->validcount == rendervalidcount) continue;		// already done
+			seg->linedef->validcount = rendervalidcount;
 			if (seg->frontsector->GetPlaneTexZ(sector_t::floor) > Viewpoint.Pos.Z) continue;	// out of sight
 			if (seg->backsector->transdoor) continue;
 			if (seg->backsector->GetTexture(sector_t::floor) == skyflatnum) continue;
@@ -937,7 +1028,7 @@ bool HWDrawInfo::CollectSubsectorsFloor(subsector_t * sub, sector_t * anchor)
 {
 
 	// mark it checked
-	sub->validcount=validcount;
+	sub->validcount=rendervalidcount;
 
 
 	// We must collect any subsector that either is connected to this one with a miniseg
@@ -969,7 +1060,7 @@ bool HWDrawInfo::CollectSubsectorsFloor(subsector_t * sub, sector_t * anchor)
 			// could be an anchor itself.
 			if (!CheckAnchorFloor (backsub)) // must not be an anchor itself!
 			{
-				if (backsub->validcount!=validcount)
+				if (backsub->validcount!=rendervalidcount)
 				{
 					if (!CollectSubsectorsFloor (backsub, anchor)) return false;
 				}
@@ -1039,7 +1130,7 @@ bool HWDrawInfo::CheckAnchorCeiling(subsector_t * sub)
 bool HWDrawInfo::CollectSubsectorsCeiling(subsector_t * sub, sector_t * anchor)
 {
 	// mark it checked
-	sub->validcount=validcount;
+	sub->validcount=rendervalidcount;
 
 
 	// We must collect any subsector that either is connected to this one with a miniseg
@@ -1070,7 +1161,7 @@ bool HWDrawInfo::CollectSubsectorsCeiling(subsector_t * sub, sector_t * anchor)
 			// could be an anchor itself.
 			if (!CheckAnchorCeiling (backsub)) // must not be an anchor itself!
 			{
-				if (backsub->validcount!=validcount)
+				if (backsub->validcount!=rendervalidcount)
 				{
 					if (!CollectSubsectorsCeiling (backsub, anchor)) return false;
 				}
@@ -1114,11 +1205,11 @@ void HWDrawInfo::HandleHackedSubsectors()
 	viewsubsector = Level->PointInRenderSubsector(Viewpoint.Pos);
 
 	// Each subsector may only be processed once in this loop!
-	validcount++;
+	rendervalidcount++;
 	for(unsigned int i=0;i<SubsectorHacks.Size();i++)
 	{
 		subsector_t * sub = SubsectorHacks[i].sub;
-		if (sub->validcount!=validcount && CheckAnchorFloor(sub))
+		if (sub->validcount!=rendervalidcount && CheckAnchorFloor(sub))
 		{
 			// Now collect everything that is connected with this subsector.
 			HandledSubsectors.Clear();
@@ -1138,11 +1229,11 @@ void HWDrawInfo::HandleHackedSubsectors()
 	}
 
 	// Each subsector may only be processed once in this loop!
-	validcount++;
+	rendervalidcount++;
 	for(unsigned int i=0;i<SubsectorHacks.Size();i++)
 	{
 		subsector_t * sub = SubsectorHacks[i].sub;
-		if (sub->validcount!=validcount && CheckAnchorCeiling(sub))
+		if (sub->validcount!=rendervalidcount && CheckAnchorCeiling(sub))
 		{
 			// Now collect everything that is connected with this subsector.
 			HandledSubsectors.Clear();

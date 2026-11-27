@@ -18,7 +18,11 @@
 layout(location=0) in vec2 TexCoord;
 layout(location=0) out vec4 FragColor;
 
+#if defined(NORMAL_DEBUG_MS)
+layout(binding=0) uniform sampler2DMS AODepthTexture;
+#else
 layout(binding=0) uniform sampler2D AODepthTexture;
+#endif
 
 #if defined(MULTISAMPLE)
 layout(binding=1) uniform sampler2DMS SceneFogTexture;
@@ -43,7 +47,11 @@ void main()
 	vec3 fogColor = texelFetch(SceneFogTexture, ipos, 0).rgb;
 #endif
 
+#if defined(NORMAL_DEBUG_MS)
+	vec4 ssao = texelFetch(AODepthTexture, ivec2(TexCoord * vec2(textureSize(AODepthTexture))), 0);
+#else
 	vec4 ssao = texture(AODepthTexture, TexCoord);
+#endif
 	float attenutation = ssao.x;
 
 	if (DebugMode == 0)

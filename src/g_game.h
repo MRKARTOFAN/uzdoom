@@ -73,6 +73,9 @@ void G_TimeDemo (const char* name);
 bool G_CheckDemoStatus (void);
 
 void G_Ticker (void);
+void G_TickerPrologue();
+void G_TickerPlayerCommands();
+void G_TickerWorld();
 bool G_Responder (event_t*	ev);
 
 enum

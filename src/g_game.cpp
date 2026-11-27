@@ -137,6 +137,7 @@ extern bool    playedtitlemusic;
 extern uint8_t globalfreeze;
 extern uint8_t *streamPos;
 
+CVAR(String, demo_endcommand, "", 0)
 EXTERN_CVAR (Float, con_midtime);
 EXTERN_CVAR (Int, net_disablepause);
 EXTERN_CVAR (Bool, net_limitsaves);
@@ -1244,6 +1245,12 @@ static void D_CheckCutsceneAdvance()
 //
 void G_Ticker ()
 {
+	G_TickerPrologue();
+	G_TickerWorld();
+}
+
+void G_TickerPrologue()
+{
 	gamestate_t oldgamestate;
 
 	C_TickQueuedInputs();
@@ -1347,6 +1354,13 @@ void G_Ticker ()
 		C_AdjustBottom ();
 	}
 
+	G_TickerPlayerCommands();
+
+	C_RunDelayedCommands();
+}
+
+void G_TickerPlayerCommands()
+{
 	// get commands
 	const int curTic = gametic / TicDup;
 
@@ -1375,15 +1389,21 @@ void G_Ticker ()
 			Printf("%s is turbo!\n", players[client].userinfo.GetName());
 		}
 	}
+}
 
-	C_RunDelayedCommands();
+extern thread_local bool P_InWorldTick;
 
+void G_TickerWorld()
+{
 	// do main actions
 	switch (gamestate)
 	{
 	case GS_LEVEL:
 	case GS_TITLELEVEL:
+		// [Karto] Marks the thread running the game tic for P_SightSealed (the renderer calls P_CheckSight too).
+		P_InWorldTick = true;
 		P_Ticker ();
+		P_InWorldTick = false;
 		break;
 
 	case GS_DEMOSCREEN:
@@ -3121,6 +3141,7 @@ bool G_CheckDemoStatus (void)
 			else
 			{
 				Printf ("Demo ended.\n");
+				if (*demo_endcommand) AddCommandString(demo_endcommand);
 			}
 			gameaction = ga_fullconsole;
 			timingdemo = false;

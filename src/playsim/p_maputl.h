@@ -238,6 +238,9 @@ private:
 	TArray<uint16_t> data;
 };
 
+bool P_BoxBlocksLineFree(FLevelLocals *Level, const FBoundingBox &box);
+extern uint64_t LineFreeStats[5];
+
 class FBlockLinesIterator
 {
 	friend class FMultiBlockLinesIterator;
@@ -319,6 +322,18 @@ class FBlockThingsIterator
 	int curx, cury;
 
 	FBlockNode *block;
+	bool Geo = false;
+	bool UseDense = false, Near = false;
+	double NearX = 0, NearY = 0, NearRadius = 0;
+	const struct FBlockArray *DenseArr = nullptr;
+	int DenseIdx = -1;
+	uint64_t DenseGen = 0;
+	FBlockNode *SavedNext = nullptr;
+	bool Far(double x, double y, double radius) const
+	{
+		const double blockdist = radius + NearRadius;
+		return fabs(x - NearX) >= blockdist || fabs(y - NearY) >= blockdist;
+	}
 
 	int Buckets[32];
 
@@ -327,7 +342,7 @@ class FBlockThingsIterator
 		AActor *Actor;
 		int Next;
 	};
-	HashEntry FixedHash[10];
+	HashEntry FixedHash[64];
 	int NumFixedHash;
 	TArray<HashEntry> DynHash;
 
@@ -354,7 +369,10 @@ public:
 	void init(const FBoundingBox &box, bool clearhash = true);
 	AActor *Next(bool centeronly = false);
 	void Reset() { StartBlock(minx, miny); }
+	FBlockNode *LastNode = nullptr;
 };
+
+extern uint64_t BlockLinkGeneration;
 
 class FMultiBlockThingsIterator
 {
@@ -377,12 +395,14 @@ public:
 		AActor *thing;
 		DVector3 Position;
 		int portalflags;
+		FBlockNode *node = nullptr;
 	};
 
 	FMultiBlockThingsIterator(FPortalGroupArray &check, AActor *origin, double checkradius = -1, bool ignorerestricted = false);
 	FMultiBlockThingsIterator(FPortalGroupArray &check, FLevelLocals *Level, double checkx, double checky, double checkz, double checkh, double checkradius, bool ignorerestricted, sector_t *newsec);
 	bool Next(CheckResult *item);
 	void Reset();
+	bool UseNear(double radius, bool dense);
 	const FBoundingBox &Box() const
 	{
 		return bbox;

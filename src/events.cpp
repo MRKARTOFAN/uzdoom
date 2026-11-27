@@ -690,7 +690,7 @@ void EventManager::WorldThingSpawned(AActor* actor)
 	if (ShouldCallStatic(true)) staticEventManager.WorldThingSpawned(actor);
 
 	for (DStaticEventHandler* handler = FirstEventHandler; handler; handler = handler->next)
-		handler->WorldThingSpawned(actor);
+		if (handler->HotEventMask() & DStaticEventHandler::HotSpawned) handler->WorldThingSpawned(actor);
 }
 
 void EventManager::WorldThingDied(AActor* actor, AActor* inflictor)
@@ -815,7 +815,7 @@ void EventManager::WorldThingDestroyed(AActor* actor)
 		return;
 
 	for (DStaticEventHandler* handler = LastEventHandler; handler; handler = handler->prev)
-		handler->WorldThingDestroyed(actor);
+		if (handler->HotEventMask() & DStaticEventHandler::HotDestroyed) handler->WorldThingDestroyed(actor);
 
 	if (ShouldCallStatic(true)) staticEventManager.WorldThingDestroyed(actor);
 }
@@ -1039,7 +1039,7 @@ bool EventManager::CheckReplacement( PClassActor *replacee, PClassActor **replac
 	if (ShouldCallStatic(false)) final = staticEventManager.CheckReplacement(replacee, replacement);
 
 	for (DStaticEventHandler *handler = FirstEventHandler; handler; handler = handler->next)
-		handler->CheckReplacement(replacee,replacement,&final);
+		if (handler->HotEventMask() & DStaticEventHandler::HotReplacement) handler->CheckReplacement(replacee,replacement,&final);
 	return final;
 }
 
@@ -1721,6 +1721,24 @@ static bool isEmptyInt(VMFunction *func)
 {
 	auto code = static_cast<VMScriptFunction *>(func)->Code;
 	return (code == nullptr || code->word == (0x00048000|OP_RET));
+}
+
+uint32_t DStaticEventHandler::HotEventMask()
+{
+	uint32_t mask = HotEvents.load(std::memory_order_relaxed);
+	if (mask & HotKnown) return mask;
+	mask = HotKnown;
+	{
+		IFVIRTUAL(DStaticEventHandler, WorldThingSpawned) if (!isEmpty(func)) mask |= HotSpawned;
+	}
+	{
+		IFVIRTUAL(DStaticEventHandler, CheckReplacement) if (!isEmpty(func)) mask |= HotReplacement;
+	}
+	{
+		IFVIRTUAL(DStaticEventHandler, WorldThingDestroyed) if (!isEmpty(func)) mask |= HotDestroyed;
+	}
+	HotEvents.store(mask, std::memory_order_relaxed);
+	return mask;
 }
 
 // ===========================================

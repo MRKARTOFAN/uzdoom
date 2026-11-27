@@ -17,10 +17,13 @@
 
 #include "r_defs.h"
 #include "flatvertices.h"
+#include "hw_clock.h"
+#include "hw_vertexbuilder.h"
 #include "hwrenderer/scene/hw_drawinfo.h"
 #include "hwrenderer/scene/hw_drawstructs.h"
 
 EXTERN_CVAR(Bool, gl_seamless)
+EXTERN_CVAR(Bool, vk_gpu_driven_bake)
 
 //==========================================================================
 //
@@ -278,11 +281,51 @@ int HWWall::CountVertices()
 
 void HWWall::MakeVertices(bool nosplit)
 {
+	const bool profile = SceneProfiling;
+	if (profile) ++GetSceneSurfaceProfile().VertexRequests;
 	if (vertcount == 0)
 	{
 		bool split = (gl_seamless && !nosplit && seg->sidedef != nullptr && !(seg->sidedef->Flags & WALLF_POLYOBJ) && !(flags & HWF_NOSPLIT));
-		auto ret = screen->mVertexData->AllocVertices(split ? CountVertices() : 4);
-		vertindex = ret.second;
-		vertcount = CreateVertices(ret.first, split);
+		// [Karto] Decide eligibility before the vertex count is set (CanCacheVertices rejects an already-generated wall).
+		const bool bakeThisWall = vk_gpu_driven_bake && !split && vertcount == 0 && CanCacheVertices() && seg && seg->sidedef && texture;
+		const int allocated = split ? CountVertices() : 4;
+		// [Karto] The bake sweep needs the vertices only for capture, so it must not allocate from the per-frame vertex buffer.
+		FFlatVertex sweepBuf[256];
+		FFlatVertex* base;
+		if (g_bakeSweepActive && allocated <= int(countof(sweepBuf)))
+		{
+			base = sweepBuf;
+			vertindex = 0;
+		}
+		else
+		{
+			auto ret = screen->mVertexData->AllocVertices(allocated);
+			vertindex = ret.second;
+			base = ret.first;
+		}
+		// [Karto] CreateVertices advances its cursor; the bake must copy the quad start, not the following allocation.
+		FFlatVertex* cursor = base;
+		vertcount = CreateVertices(cursor, split);
+		if (bakeThisWall)
+			GPUBakeRecordWall(base, seg, type, uint32_t(texture->GetID().GetIndex()),
+				uint32_t((sub ? sub->sector : frontsector)->Index()));
+		if (g_bakeSweepActive)
+		{
+			++g_sweepMvCalls;
+			if (!seg || !seg->sidedef) ++g_sweepSkipOther;
+			else if (!texture) ++g_sweepSkipNoTex;
+			else if (split) ++g_sweepSkipSplit;
+			else if (!CanCacheVertices(true)) ++g_sweepSkipCanCache;
+			else if (bakeThisWall) ++g_sweepBaked;
+		}
+		if (profile)
+		{
+			auto &surface = GetSceneSurfaceProfile();
+			surface.AllocatedVertices += allocated;
+			surface.GeneratedVertices += vertcount;
+			surface.VertexBytes += uint64_t(vertcount) * sizeof(FFlatVertex);
+			if (split) ++surface.SplitBuilds;
+		}
 	}
+	else if (profile) ++GetSceneSurfaceProfile().VertexReused;
 }

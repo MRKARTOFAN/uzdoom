@@ -157,7 +157,7 @@ static WeaponPosition2D GetWeaponPosition2D(player_t *player, double ticFrac)
 {
 	WeaponPosition2D w;
 	BobType = PSPB_2D;
-	FVector2 interp = PlayerBob[player - players].Interpolate2D(Net_ModifyFrac(ticFrac));
+	FVector2 interp = WorldModePlayerBob(player).Interpolate2D(Net_ModifyFrac(ticFrac));
 	w.bobx = interp.X;
 	w.boby = interp.Y;
 
@@ -188,7 +188,7 @@ static WeaponPosition3D GetWeaponPosition3D(player_t *player, double ticFrac)
 {
 	WeaponPosition3D w;
 	BobType = PSPB_3D;
-	PlayerBob[player - players].Interpolate3D(w.translation, w.rotation, Net_ModifyFrac(ticFrac));
+	WorldModePlayerBob(player).Interpolate3D(w.translation, w.rotation, Net_ModifyFrac(ticFrac));
 
 	// Interpolate the main weapon layer once so as to be able to add it to other layers.
 	if ((w.weapon = player->FindPSprite(PSP_WEAPON)) != nullptr)
@@ -471,7 +471,7 @@ bool HUDSprite::GetWeaponRenderStyle(DPSprite *psp, AActor *playermo, sector_t *
 	}
 	if (!RenderStyle.IsVisible(alpha)) return false;	// if it isn't visible skip the rest.
 
-	PalEntry ThingColor = (playermo->RenderStyle.Flags & STYLEF_ColorIsFixed) ? playermo->fillcolor : Color::str("#fff");
+	PalEntry ThingColor = (playermo->RenderStyle.Flags & STYLEF_ColorIsFixed) ? playermo->fillcolor : Color::White;
 	ThingColor.a = 255;
 
 	const bool bright = isBright(psp);
@@ -681,7 +681,7 @@ void HWDrawInfo::PreparePlayerSprites2D(sector_t * viewsector, area_t in_area)
 	static unsigned ModifyBobLayerVIndex = GetVirtualIndex(wpCls, "ModifyBobLayer");
 	static VMFunction * ModifyBobLayerOrigFunc = wpCls->Virtuals.Size() > ModifyBobLayerVIndex ? wpCls->Virtuals[ModifyBobLayerVIndex] : nullptr;
 
-	AActor * playermo = players[consoleplayer].camera;
+	AActor * playermo = WorldModeRenderPlayer(consoleplayer)->camera;
 	player_t * player = playermo->player;
 
 	const auto &vp = Viewpoint;
@@ -763,7 +763,7 @@ void HWDrawInfo::PreparePlayerSprites3D(sector_t * viewsector, area_t in_area)
 	static VMFunction * ModifyBobLayer3DOrigFunc = wpCls->Virtuals.Size() > ModifyBobLayer3DVIndex ? wpCls->Virtuals[ModifyBobLayer3DVIndex] : nullptr;
 	static VMFunction * ModifyBobPivotLayer3DOrigFunc = wpCls->Virtuals.Size() > ModifyBobPivotLayer3DVIndex ? wpCls->Virtuals[ModifyBobPivotLayer3DVIndex] : nullptr;
 
-	AActor * playermo = players[consoleplayer].camera;
+	AActor * playermo = WorldModeRenderPlayer(consoleplayer)->camera;
 	player_t * player = playermo->player;
 
 	const auto &vp = Viewpoint;
@@ -878,7 +878,7 @@ void HWDrawInfo::PreparePlayerSprites3D(sector_t * viewsector, area_t in_area)
 void HWDrawInfo::PreparePlayerSprites(sector_t * viewsector, area_t in_area)
 {
 
-	AActor * playermo = players[consoleplayer].camera;
+	AActor * playermo = WorldModeRenderPlayer(consoleplayer)->camera;
 	player_t * player = playermo->player;
 
 	const auto &vp = Viewpoint;
@@ -916,7 +916,7 @@ void HWDrawInfo::PreparePlayerSprites(sector_t * viewsector, area_t in_area)
 
 void HWDrawInfo::PrepareTargeterSprites(double ticfrac)
 {
-	AActor * playermo = players[consoleplayer].camera;
+	AActor * playermo = WorldModeRenderPlayer(consoleplayer)->camera;
 	player_t * player = playermo->player;
 	AActor *camera = Viewpoint.camera;
 

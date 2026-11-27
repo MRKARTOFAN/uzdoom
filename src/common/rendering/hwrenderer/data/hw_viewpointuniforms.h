@@ -50,6 +50,8 @@ struct HWViewpointUniforms
 	float mThickFogDistance = -1.f;
 	float mThickFogMultiplier = 30.f;
 
+	float mExtraLight = 0.f;
+
 	void CalcDependencies()
 	{
 		NormalViewMatrix.computeNormalMatrix(ViewMatrix);

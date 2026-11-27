@@ -22,7 +22,9 @@
 **
 */
 
+#include "dynarrayindex.h"
 #include <stdlib.h>
+#include "d_ticworkercheck.h"
 
 #include "dobject.h"
 #include "cmdlib.h"
@@ -215,19 +217,19 @@ void DObject::InPlaceConstructor (void *mem)
 DObject::DObject ()
 : Class(0), ObjectFlags(0)
 {
+	if (!GC::LinkLocked()) TicWorkerCheckNote(TWS_ObjectAlloc);
 	ObjectFlags = GC::CurrentWhite & OF_WhiteBits;
-	ObjNext = GC::Root;
 	GCNext = nullptr;
-	GC::Root = this;
+	GC::LinkNewObject(this, ObjNext);
 }
 
 DObject::DObject (PClass *inClass)
 : Class(inClass), ObjectFlags(0)
 {
+	if (!GC::LinkLocked()) TicWorkerCheckNote(TWS_ObjectAlloc);
 	ObjectFlags = GC::CurrentWhite & OF_WhiteBits;
-	ObjNext = GC::Root;
 	GCNext = nullptr;
-	GC::Root = this;
+	GC::LinkNewObject(this, ObjNext);
 }
 
 //==========================================================================
@@ -548,6 +550,7 @@ size_t DObject::PointerSubstitution (DObject *old, DObject *notOld, bool nullOnF
 		{
 			if (p == old)
 			{
+				ArrayIndexNoteData(aray->Data());
 				if (isType)
 				{
 					p = notOld;

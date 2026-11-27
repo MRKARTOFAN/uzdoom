@@ -39,6 +39,8 @@
 #include "imagehelpers.h"
 #include "v_video.h"
 #include "v_font.h"
+#include <mutex>
+#include <vector>
 
 // Wrappers to keep the definitions of these classes out of here.
 IHardwareTexture* CreateHardwareTexture(int numchannels);
@@ -305,6 +307,73 @@ bool FTexture::ProcessData(unsigned char* buffer, int w, int h, bool ispatch)
 	return true;
 }
 
+CVAR(Bool, r_decodehandoff, true, 0)
+CVAR(Bool, r_decodehandoff_verify, false, 0)
+
+struct FDecodeHandoff
+{
+	const FTexture *Texture;
+	const FImageSource *Image;
+	int Trans;
+	FBitmap Pixels;
+};
+static std::vector<FDecodeHandoff> DecodeHandoffs;	// oldest first
+static size_t DecodeHandoffBytes;
+static std::mutex DecodeHandoffLock;
+static uint64_t DecodeHandoffStats[4];	// left, taken, dropped, verify mismatches
+
+static bool TakeDecodeHandoff(const FTexture *texture, const FImageSource *image, FBitmap &pixels, int &trans)
+{
+	std::lock_guard<std::mutex> lock(DecodeHandoffLock);
+	for (size_t i = DecodeHandoffs.size(); i-- > 0;)
+	{
+		auto &entry = DecodeHandoffs[i];
+		if (entry.Texture != texture || entry.Image != image) continue;
+		pixels = std::move(entry.Pixels);
+		trans = entry.Trans;
+		DecodeHandoffBytes -= size_t(pixels.GetPitch()) * pixels.GetHeight();
+		DecodeHandoffs.erase(DecodeHandoffs.begin() + i);
+		DecodeHandoffStats[1]++;
+		return true;
+	}
+	return false;
+}
+
+static void LeaveDecodeHandoff(const FTexture *texture, const FImageSource *image, const FBitmap &pixels, int trans)
+{
+	if (pixels.GetPixels() == nullptr) return;
+	std::lock_guard<std::mutex> lock(DecodeHandoffLock);
+	FDecodeHandoff entry{ texture, image, trans, {} };
+	entry.Pixels.Copy(pixels);
+	DecodeHandoffBytes += size_t(pixels.GetPitch()) * pixels.GetHeight();
+	DecodeHandoffs.push_back(std::move(entry));
+	DecodeHandoffStats[0]++;
+	while (DecodeHandoffs.size() > 64 || DecodeHandoffBytes > (size_t(32) << 20))
+	{
+		DecodeHandoffBytes -= size_t(DecodeHandoffs.front().Pixels.GetPitch()) * DecodeHandoffs.front().Pixels.GetHeight();
+		DecodeHandoffs.erase(DecodeHandoffs.begin());
+		DecodeHandoffStats[2]++;
+	}
+}
+
+CCMD(decodehandoff_stats)
+{
+	std::lock_guard<std::mutex> lock(DecodeHandoffLock);
+	Printf("DECODEHANDOFF enabled=%d verify=%d left=%llu taken=%llu dropped=%llu mismatches=%llu held=%u bytes=%llu\n",
+		int(r_decodehandoff), int(r_decodehandoff_verify), (unsigned long long)DecodeHandoffStats[0], (unsigned long long)DecodeHandoffStats[1],
+		(unsigned long long)DecodeHandoffStats[2], (unsigned long long)DecodeHandoffStats[3], unsigned(DecodeHandoffs.size()),
+		(unsigned long long)DecodeHandoffBytes);
+	if (argv.argc() > 1) memset(DecodeHandoffStats, 0, sizeof(DecodeHandoffStats));
+}
+
+// [Karto] A rebuilt texture set may reuse addresses.
+void ClearDecodeHandoffs()
+{
+	std::lock_guard<std::mutex> lock(DecodeHandoffLock);
+	DecodeHandoffs.clear();
+	DecodeHandoffBytes = 0;
+}
+
 //===========================================================================
 //
 //	Initializes the buffer for the texture data
@@ -347,7 +416,28 @@ FTextureBuffer FTexture::CreateTexBuffer(int translation, int flags)
 			if (remap) translation = remap->Index;
 
 			int trans;
-			auto Pixels = GetBgraBitmap(remap ? remap->Palette : nullptr, &trans);
+			FImageSource *image = GetImage();
+			const bool handoff = r_decodehandoff && remap == nullptr && image != nullptr && image->GetNumOfFrames() == 1;
+			FBitmap Pixels;
+			const bool taken = handoff && TakeDecodeHandoff(this, image, Pixels, trans);
+			if (!taken)
+			{
+				Pixels = GetBgraBitmap(remap ? remap->Palette : nullptr, &trans);
+				if (handoff && !(flags & (CTF_ProcessData | CTF_Expand)) && !IsLuminosityTranslation(translation))
+					LeaveDecodeHandoff(this, image, Pixels, trans);
+			}
+			else if (r_decodehandoff_verify)
+			{
+				int freshTrans;
+				FBitmap fresh = GetBgraBitmap(nullptr, &freshTrans);
+				const bool same = fresh.Width == Pixels.Width && fresh.Height == Pixels.Height && fresh.Pitch == Pixels.Pitch &&
+					fresh.ClipRect.x == Pixels.ClipRect.x && fresh.ClipRect.y == Pixels.ClipRect.y &&
+					fresh.ClipRect.width == Pixels.ClipRect.width && fresh.ClipRect.height == Pixels.ClipRect.height && freshTrans == trans &&
+					memcmp(fresh.GetPixels(), Pixels.GetPixels(), size_t(fresh.Pitch) * fresh.Height) == 0;
+				if (!same) DecodeHandoffStats[3]++;
+				Pixels = std::move(fresh);
+				trans = freshTrans;
+			}
 
 			if(!exx && Pixels.ClipRect.x == 0 && Pixels.ClipRect.y == 0 && Pixels.ClipRect.width == Pixels.Width && Pixels.ClipRect.height == Pixels.Height && (Pixels.FreeBuffer || !IsLuminosityTranslation(translation)))
 			{

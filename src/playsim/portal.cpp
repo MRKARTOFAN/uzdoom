@@ -1046,10 +1046,13 @@ void FLevelLocals::CreateLinkedPortals()
 //
 //============================================================================
 
+CVAR(Bool, p_onegroup_fast, true, 0)
+
 bool FLevelLocals::CollectConnectedGroups(int startgroup, const DVector3 &position, double upperz, double checkradius, FPortalGroupArray &out)
 {
 	bool retval = false;
 	out.inited = true;
+	if (p_onegroup_fast && Displacements.size == 1) return false;
 
 	processMask.setSize(Displacements.size);
 	if (Displacements.size == 1)

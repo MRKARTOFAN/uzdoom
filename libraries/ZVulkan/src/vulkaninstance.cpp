@@ -215,11 +215,6 @@ std::vector<VulkanPhysicalDevice> VulkanInstance::GetPhysicalDevices(VkInstance 
 			VkPhysicalDeviceFeatures2 deviceFeatures2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
 
 			next = const_cast<void**>(&deviceFeatures2.pNext);
-			if (checkForExtension(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME))
-			{
-				*next = &dev.Features.BufferDeviceAddress;
-				next = &dev.Features.BufferDeviceAddress.pNext;
-			}
 			if (checkForExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME))
 			{
 				*next = &dev.Features.AccelerationStructure;
@@ -230,10 +225,31 @@ std::vector<VulkanPhysicalDevice> VulkanInstance::GetPhysicalDevices(VkInstance 
 				*next = &dev.Features.RayQuery;
 				next = &dev.Features.RayQuery.pNext;
 			}
-			if (checkForExtension(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME))
+			// [Karto] Chaining the promoted alias structs next to Vulkan12 is invalid (VUID-04748).
+			if (dev.Properties.Properties.apiVersion >= VK_API_VERSION_1_2)
 			{
-				*next = &dev.Features.DescriptorIndexing;
-				next = &dev.Features.DescriptorIndexing.pNext;
+				*next = &dev.Features.Vulkan12;
+				next = &dev.Features.Vulkan12.pNext;
+				*next = &dev.Features.ShaderDrawParameters;
+				next = &dev.Features.ShaderDrawParameters.pNext;
+			}
+			else
+			{
+				if (checkForExtension(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME))
+				{
+					*next = &dev.Features.BufferDeviceAddress;
+					next = &dev.Features.BufferDeviceAddress.pNext;
+				}
+				if (checkForExtension(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME))
+				{
+					*next = &dev.Features.DescriptorIndexing;
+					next = &dev.Features.DescriptorIndexing.pNext;
+				}
+				if (dev.Properties.Properties.apiVersion >= VK_API_VERSION_1_1)
+				{
+					*next = &dev.Features.ShaderDrawParameters;
+					next = &dev.Features.ShaderDrawParameters.pNext;
+				}
 			}
 
 			vkGetPhysicalDeviceFeatures2(dev.Device, &deviceFeatures2);
@@ -242,6 +258,8 @@ std::vector<VulkanPhysicalDevice> VulkanInstance::GetPhysicalDevices(VkInstance 
 			dev.Features.AccelerationStructure.pNext = nullptr;
 			dev.Features.RayQuery.pNext = nullptr;
 			dev.Features.DescriptorIndexing.pNext = nullptr;
+			dev.Features.ShaderDrawParameters.pNext = nullptr;
+			dev.Features.Vulkan12.pNext = nullptr;
 		}
 		else
 		{

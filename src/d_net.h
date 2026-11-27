@@ -154,6 +154,7 @@ void Net_ClearBuffers();
 bool Net_IsWaiting();
 double Net_ModifyFrac(double ticFrac);
 double Net_ModifyObjectFrac(DObject* obj, double ticFrac);
+double Net_ModifyFrac(bool clientSide, double ticFrac);
 double Net_ModifyParticleFrac(particle_t* part, double ticFrac);
 
 // Netgame stuff (buffers and pointers, i.e. indices).

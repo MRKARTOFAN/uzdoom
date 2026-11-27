@@ -47,6 +47,7 @@ public:
 	~FTextureManager ();
 
 private:
+	unsigned ResourceGeneration = 0;
 	int ResolveLocalizedTexture(int texnum);
 
 	int ResolveTextureIndex(int texnum, bool animate) const
@@ -180,6 +181,7 @@ public:
 	void ReplaceTexture (FTextureID texid, FGameTexture *newtexture, bool free);
 
 	int NumTextures () const { return (int)Textures.Size(); }
+	unsigned GetResourceGeneration() const { return ResourceGeneration; }
 
 	int GuesstimateNumTextures ();
 

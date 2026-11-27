@@ -148,6 +148,8 @@ void HWWall::SkyPlane(HWWallDispatcher *di, sector_t *sector, int plane, bool al
 			ptype = PORTALTYPE_SKY;
 			sky = &skyinfo;
 		}
+		skysector = sector;
+		skyplane = skyportalplane = plane;
 		PutPortal(di, ptype, plane);
 	}
 	else if (sportal != nullptr)
@@ -208,6 +210,15 @@ void HWWall::SkyPlane(HWWallDispatcher *di, sector_t *sector, int plane, bool al
 //
 //==========================================================================
 
+void HWWall::ReplaySky(HWWallDispatcher *di)
+{
+	if (!di->di || !skysector) return;
+	HWSkyInfo skyinfo;
+	skyinfo.init(di->di, skysector, skyplane, skysector->skytransfer, Colormap.FadeColor);
+	sky = &skyinfo;
+	PutPortal(di, PORTALTYPE_SKY, skyportalplane);
+}
+
 void HWWall::SkyLine(HWWallDispatcher *di, sector_t *fs, line_t *line)
 {
 	FSectorPortal *secport = line->GetTransferredPortal();
@@ -227,6 +238,9 @@ void HWWall::SkyLine(HWWallDispatcher *di, sector_t *fs, line_t *line)
 		if (di->di) skyinfo.init(di->di, fs, sector_t::ceiling, fs->skytransfer, Colormap.FadeColor);
 		ptype = PORTALTYPE_SKY;
 		sky = &skyinfo;
+		skysector = fs;
+		skyplane = sector_t::ceiling;
+		skyportalplane = -1;
 	}
 	ztop[0] = zceil[0];
 	ztop[1] = zceil[1];

@@ -79,11 +79,11 @@ struct PalEntry
 	}
 	constexpr bool isBlack() const
 	{
-		return (d & 0xffffff) == Color::str("#000");
+		return (d & 0xffffff) == Color::Black;
 	}
 	constexpr bool isWhite() const
 	{
-		return (d & 0xffffff) == Color::str("#fff");
+		return (d & 0xffffff) == Color::White;
 	}
 	PalEntry &operator= (const PalEntry &other) = default;
 	constexpr PalEntry &operator= (uint32_t other) { d = other; return *this; }

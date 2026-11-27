@@ -111,6 +111,7 @@ public:
 	PType *Type;
 	uint32_t Flags;
 	int BitValue;
+	bool WriteRequested = false;
 	FString DeprecationMessage;
 	int mDefFileNo = 0;
 protected:

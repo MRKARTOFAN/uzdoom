@@ -17,6 +17,18 @@
 **
 */
 
+#include "dynarrayindex.h"
+#include <cstddef>
+#if defined(__GNUC__) || defined(__clang__)
+#define InterpPrefetch(p) __builtin_prefetch(p)
+#elif defined(_M_X64) || defined(_M_IX86)
+#include <immintrin.h>
+#define InterpPrefetch(p) _mm_prefetch((const char*)(p), _MM_HINT_T0)
+#else
+#define InterpPrefetch(p) ((void)(p))
+#endif
+#include "i_time.h"
+#include "c_dispatch.h"
 #include "p_local.h"
 #include "p_effect.h"
 #include "c_console.h"
@@ -33,6 +45,10 @@
 #include "g_game.h"
 #include "am_map.h"
 #include "i_interface.h"
+#include "d_ticworker.h"
+#include "d_framestages.h"
+
+EXTERN_CVAR(Int, p_rest_tick)
 
 extern gamestate_t wipegamestate;
 extern uint8_t globalfreeze, globalchangefreeze;
@@ -72,6 +88,7 @@ void P_RunClientSideLogic()
 
 		for (auto level : AllLevels())
 		{
+			FFrameStageScope stage(FS_CSThinkers);
 			auto it = level->GetClientSideThinkerIterator<AActor>();
 			AActor* ac = nullptr;
 			while ((ac = it.Next()) != nullptr)
@@ -83,7 +100,10 @@ void P_RunClientSideLogic()
 			level->ClientSideThinkers.RunClientSideThinkers(level);
 		}
 
-		StatusBar->CallTick();
+		{
+			FFrameStageScope stage(FS_StatusBar);
+			StatusBar->CallTick();
+		}
 
 		// TODO: Should this be called on all maps...?
 		if (gamestate == GS_LEVEL)
@@ -138,6 +158,10 @@ void P_ClearLevelInterpolation()
 
 		while ((ac = it.Next()))
 		{
+			if (p_rest_tick && ac->Prev == ac->Pos() && ac->PrevAngles == ac->Angles && ac->PrevScale == ac->Scale &&
+				ac->PrevAlpha == ac->Alpha && ac->PrevPortalGroup == (ac->Sector ? ac->Sector->PortalGroup : 0) && ac->player == nullptr &&
+				ac->PrevFOV == DAngle::fromDeg(ac->CameraFOV))
+				continue;
 			ac->ClearInterpolation();
 			ac->ClearFOVInterpolation();
 		}
@@ -165,15 +189,96 @@ void P_ClearLevelInterpolation()
 //
 // P_Ticker
 //
+EXTERN_CVAR(Float, r_test_ticfrac)
+
+void P_TickerOnMainBeforeWorker()
+{
+	unsigned int i;
+	for (i = 0; i < MAXPLAYERS; i++)
+	{
+		if (playeringame[i] && players[i].timefreezer != 0)
+			break;
+	}
+	if (i == MAXPLAYERS)
+		S_ResumeSound(false);
+}
+
+void P_FinishDeferredLightReleases();
+
+void P_TickerOnMainAfterWorker()
+{
+	P_FinishDeferredLightReleases();
+	R_ClearInterpolationPath();
+	r_NoInterpolate = false;
+}
+
+CVAR(Bool, r_interp_dense, true, 0)
+CVAR(Bool, r_interp_dense_prefetch, true, 0)
+CVAR(Bool, r_interp_dense_verify, false, 0)
+static uint64_t InterpClearNS = 0, InterpClears = 0, InterpVerifyRuns = 0, InterpVerifyMismatches = 0;
+
+CVAR(Int, r_interp_dense_threads, 4, 0)
+void WorldModeParallelFor(int parts, void (*job)(void* context, int part, int parts), void* context);
+
+static void InterpClearPart(void* context, int part, int parts)
+{
+	auto& dense = *static_cast<TArray<AActor*>*>(context);
+	const unsigned total = dense.Size(), count = unsigned(uint64_t(total) * (part + 1) / parts);
+	for (unsigned i = unsigned(uint64_t(total) * part / parts); i < count; ++i)
+	{
+		if (r_interp_dense_prefetch && i + 8 < count)
+		{
+			const char* ahead = reinterpret_cast<const char*>(dense[i + 8]);
+			InterpPrefetch(ahead + offsetof(AActor, __Pos));
+			InterpPrefetch(ahead + offsetof(AActor, Prev));
+			InterpPrefetch(ahead + offsetof(AActor, Prev) + 64);
+			InterpPrefetch(ahead + offsetof(AActor, CameraFOV));
+		}
+		AActor* ac = dense[i];
+		ac->ClearInterpolation();
+		ac->ClearFOVInterpolation();
+	}
+}
+
+static void InterpDenseVerify(FLevelLocals* Level)
+{
+	++InterpVerifyRuns;
+	unsigned count = 0;
+	bool same = true;
+	auto it = Level->GetThinkerIterator<AActor>();
+	for (AActor* ac; (ac = it.Next()) != nullptr; ++count)
+	{
+		const unsigned index = unsigned(ac->DenseIndex);
+		if (index >= Level->Thinkers.DenseActors.Size() || Level->Thinkers.DenseActors[index] != ac) same = false;
+	}
+	InterpVerifyMismatches += !same || count != Level->Thinkers.DenseActors.Size();
+}
+
+CCMD(interp_dense_stats)
+{
+	Printf("INTERPDENSE dense=%d clears=%llu us_per_clear=%.1f verify_runs=%llu verify_mismatches=%llu\n", int(r_interp_dense),
+		(unsigned long long)InterpClears, InterpClears ? double(InterpClearNS) / InterpClears / 1000.0 : 0.0,
+		(unsigned long long)InterpVerifyRuns, (unsigned long long)InterpVerifyMismatches);
+	if (argv.argc() == 2 && stricmp(argv[1], "reset") == 0) InterpClearNS = InterpClears = InterpVerifyRuns = InterpVerifyMismatches = 0;
+}
+
 void P_Ticker (void)
 {
 	unsigned int i;
 
-	for (auto Level : AllLevels())
+	ArrayIndexTic();
+
+	const bool holdInterpolation = r_test_ticfrac >= 0 && (paused || P_CheckTickerPaused());
+	// [Karto] On the worker, renderer globals and the sound engine stay with the main thread (P_TickerOnMain*).
+	const bool onWorker = TicWorkerOnThread();
+	if (!holdInterpolation)
 	{
-		Level->interpolator.UpdateInterpolations();
+		for (auto Level : AllLevels())
+		{
+			Level->interpolator.UpdateInterpolations();
+		}
+		if (!onWorker) r_NoInterpolate = true;
 	}
-	r_NoInterpolate = true;
 
 	if (!demoplayback)
 	{
@@ -229,27 +334,40 @@ void P_Ticker (void)
 			break;
 	}
 
-	if ( i == MAXPLAYERS )
+	if ( i == MAXPLAYERS && !onWorker )
 		S_ResumeSound (false);
 
 	P_ResetSightCounters (false);
-	R_ClearInterpolationPath();
+	if (!onWorker) R_ClearInterpolationPath();
 
 	// Since things will be moving, it's okay to interpolate them in the renderer.
-	r_NoInterpolate = false;
+	if (!onWorker) r_NoInterpolate = false;
 
 	// Reset all actor interpolations on all levels before the current thinking turn so that indirect actor movement gets properly interpolated.
 	for (auto Level : AllLevels())
 	{
-		// todo: set up a sandbox for secondary levels here.
-		auto it = Level->GetThinkerIterator<AActor>();
-		AActor *ac;
-
-		while ((ac = it.Next()))
+		const uint64_t clearStart = I_nsTime();
+		if (r_interp_dense && Level->Thinkers.TracksActors())
 		{
-			ac->ClearInterpolation();
-			ac->ClearFOVInterpolation();
+			auto& dense = Level->Thinkers.DenseActors;
+			if (r_interp_dense_threads > 1 && dense.Size() >= 2048) WorldModeParallelFor(*r_interp_dense_threads, InterpClearPart, &dense);
+			else InterpClearPart(&dense, 0, 1);
+			if (r_interp_dense_verify) InterpDenseVerify(Level);
 		}
+		else
+		{
+			// todo: set up a sandbox for secondary levels here.
+			auto it = Level->GetThinkerIterator<AActor>();
+			AActor *ac;
+
+			while ((ac = it.Next()))
+			{
+				ac->ClearInterpolation();
+				ac->ClearFOVInterpolation();
+			}
+		}
+		InterpClearNS += I_nsTime() - clearStart;
+		++InterpClears;
 
 		P_ThinkParticles(Level);	// [RH] make the particles think
 

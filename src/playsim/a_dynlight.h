@@ -250,6 +250,11 @@ struct FDynamicLight
 		return flags & ILF_SHADOWMAPPED;
 	}
 
+	inline constexpr bool IsVisibleToPlayer() const
+	{
+		return flags & ILF_VISIBLE_TO_PLAYER;
+	}
+
 	inline constexpr bool IsExplicitPitch() const
 	{
 		return flags & ILF_EXPLICIT_PITCH;
@@ -308,6 +313,7 @@ struct FDynamicLight
 
 	void Tick();
 	void UpdateLocation();
+	void UpdateLightGrid();
 	void AddLightNode(FSection *section, side_t *sidedef);
 	void LinkLight();
 	void UnlinkLight();
@@ -348,6 +354,15 @@ public:
 	double lightDefIntensity;
 
 	FDynamicLightTouchLists touchlists;
+	uint32_t LinkSerial = 0;
+
+	// [Karto] A published copy carries its owner's RF2_LIGHTMULTALPHA factor so frames never read the owner, which the tic worker
+	// writes; only the owner's identity (DONTLIGHTSELF, DONTLIGHTOTHERS) is used from the copy.
+	bool PublishedCopy = false;
+	float PublishedOwnerAlpha = 1.f;
+	float OwnerLightAlpha();
+
+	TArray<uint64_t> cellKeys;
 
 	static FDynamicLight *GetLight(FLevelLocals *Level);
 	static void AttachLight(AActor *self);

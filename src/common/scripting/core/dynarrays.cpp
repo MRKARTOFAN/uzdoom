@@ -27,6 +27,223 @@
 #include "types.h"
 #include "v_draw.h"
 #include "TRS.h"
+#include "c_cvars.h"
+#include "x86.h"
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
+#include <atomic>
+#include <climits>
+#include <mutex>
+#include "dynarrayindex.h"
+#include "c_dispatch.h"
+#include "printf.h"
+
+CVAR(Bool, r_find_index, true, 0)
+
+namespace
+{
+	constexpr unsigned IndexMinSize = 256;
+	constexpr unsigned IndexStreak = 4;
+	constexpr int IndexSlots = 16;
+
+	struct FFindIndex
+	{
+		// Read without the lock by the write notes: the buffer this entry describes and its end.
+		std::atomic<const void *> Data{ nullptr };
+		std::atomic<uintptr_t> End{ 0 };
+		unsigned Size = 0;
+		unsigned Streak = 0;
+		int WriteTic = INT_MIN;
+		bool Built = false;
+		uint64_t LastUse = 0;
+		TArray<const void *> Keys;
+		TArray<unsigned> Positions;
+		unsigned Mask = 0;
+	};
+
+	FFindIndex Indexes[IndexSlots];
+	std::atomic<int> IndexesInUse{ 0 };
+	std::atomic<int> IndexTic{ 0 };
+	std::mutex IndexLock;
+	uint64_t IndexClock = 0;
+
+	inline unsigned HashPointer(const void *p, unsigned mask)
+	{
+		uint64_t h = (uint64_t)(uintptr_t)p;
+		h ^= h >> 33;
+		h *= 0xff51afd7ed558ccdull;
+		h ^= h >> 33;
+		return unsigned(h) & mask;
+	}
+
+	// Under IndexLock.
+	void Invalidate(FFindIndex &e)
+	{
+		e.Built = false;
+		e.Streak = 0;
+		e.WriteTic = IndexTic.load(std::memory_order_relaxed);
+	}
+
+	// Under IndexLock.
+	void Release(FFindIndex &e)
+	{
+		e.Data.store(nullptr, std::memory_order_relaxed);
+		e.End.store(0, std::memory_order_relaxed);
+		e.Built = false;
+		e.Keys.Reset();
+		e.Positions.Reset();
+		IndexesInUse.fetch_sub(1, std::memory_order_relaxed);
+	}
+
+	// Under IndexLock.
+	void Build(FFindIndex &e, void *const *data, unsigned count)
+	{
+		unsigned slots = 1;
+		while (slots < count * 2) slots <<= 1;
+		e.Mask = slots - 1;
+		e.Keys.Resize(slots);
+		e.Positions.Resize(slots);
+		for (auto &k : e.Keys) k = nullptr;
+		for (auto &v : e.Positions) v = ~0u;
+		for (unsigned i = 0; i < count; i++)
+		{
+			unsigned h = HashPointer(data[i], e.Mask);
+			while (e.Positions[h] != ~0u && e.Keys[h] != data[i]) h = (h + 1) & e.Mask;
+			// The first position wins, as the scan's answer does.
+			if (e.Positions[h] == ~0u)
+			{
+				e.Keys[h] = data[i];
+				e.Positions[h] = i;
+			}
+		}
+		e.Built = true;
+	}
+
+	// True with the answer in result when the index answered; false when the caller must scan.
+	bool IndexedFind(void *const *data, unsigned count, const void *val, unsigned &result)
+	{
+		std::lock_guard<std::mutex> guard(IndexLock);
+		const int tic = IndexTic.load(std::memory_order_relaxed);
+		FFindIndex *e = nullptr;
+		for (auto &slot : Indexes)
+		{
+			if (slot.Data.load(std::memory_order_relaxed) == data) { e = &slot; break; }
+		}
+		if (e == nullptr)
+		{
+			// Take a free slot, else the least recently used one.
+			for (auto &slot : Indexes)
+			{
+				if (slot.Data.load(std::memory_order_relaxed) == nullptr) { e = &slot; break; }
+				if (e == nullptr || slot.LastUse < e->LastUse) e = &slot;
+			}
+			if (e->Data.load(std::memory_order_relaxed) != nullptr) Release(*e);
+			e->Data.store(data, std::memory_order_relaxed);
+			e->End.store((uintptr_t)(data + count), std::memory_order_relaxed);
+			e->Size = count;
+			e->Streak = 0;
+			e->Built = false;
+			// A buffer seen for the first time may have been written this tic before its entry existed.
+			e->WriteTic = tic;
+			IndexesInUse.fetch_add(1, std::memory_order_relaxed);
+		}
+		e->LastUse = ++IndexClock;
+		if (e->Size != count)
+		{
+			e->Size = count;
+			e->End.store((uintptr_t)(data + count), std::memory_order_relaxed);
+			Invalidate(*e);
+		}
+		if (!e->Built)
+		{
+			if (++e->Streak < IndexStreak || e->WriteTic >= tic) return false;
+			Build(*e, data, count);
+		}
+		unsigned h = HashPointer(val, e->Mask);
+		while (e->Positions[h] != ~0u && e->Keys[h] != val) h = (h + 1) & e->Mask;
+		result = e->Positions[h] == ~0u ? count : e->Positions[h];
+		return true;
+	}
+}
+
+void ArrayIndexNoteData(const void *data)
+{
+	if (data == nullptr || IndexesInUse.load(std::memory_order_relaxed) == 0) return;
+	for (auto &slot : Indexes)
+	{
+		if (slot.Data.load(std::memory_order_relaxed) == data)
+		{
+			std::lock_guard<std::mutex> guard(IndexLock);
+			if (slot.Data.load(std::memory_order_relaxed) == data) Invalidate(slot);
+		}
+	}
+}
+
+void ArrayIndexNoteElement(const void *address)
+{
+	if (IndexesInUse.load(std::memory_order_relaxed) == 0) return;
+	const uintptr_t a = (uintptr_t)address;
+	for (auto &slot : Indexes)
+	{
+		const uintptr_t begin = (uintptr_t)slot.Data.load(std::memory_order_relaxed);
+		if (begin != 0 && a >= begin && a < slot.End.load(std::memory_order_relaxed))
+		{
+			std::lock_guard<std::mutex> guard(IndexLock);
+			if ((uintptr_t)slot.Data.load(std::memory_order_relaxed) == begin) Invalidate(slot);
+		}
+	}
+}
+
+void ArrayIndexDropData(const void *data)
+{
+	if (data == nullptr || IndexesInUse.load(std::memory_order_relaxed) == 0) return;
+	std::lock_guard<std::mutex> guard(IndexLock);
+	for (auto &slot : Indexes)
+	{
+		if (slot.Data.load(std::memory_order_relaxed) == data) Release(slot);
+	}
+}
+
+void ArrayIndexClearAll()
+{
+	std::lock_guard<std::mutex> guard(IndexLock);
+	for (auto &slot : Indexes)
+	{
+		if (slot.Data.load(std::memory_order_relaxed) != nullptr) Release(slot);
+	}
+}
+
+void ArrayIndexTic()
+{
+	IndexTic.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void BuiltinArrayWritten(void *data)
+{
+	ArrayIndexNoteData(data);
+}
+
+DEFINE_ACTION_FUNCTION_NATIVE(DObject, BuiltinArrayWritten, BuiltinArrayWritten)
+{
+	PARAM_PROLOGUE;
+	PARAM_POINTER(data, void);
+	BuiltinArrayWritten(data);
+	return 0;
+}
+
+template<class T> struct FArrayWriteNote
+{
+	T *Self;
+	const void *Old;
+	FArrayWriteNote(T *self) : Self(self), Old(self->Data()) {}
+	~FArrayWriteNote()
+	{
+		ArrayIndexNoteData(Old);
+		ArrayIndexNoteData(Self->Data());
+	}
+};
 
 // We need one specific type for each of the 8 integral VM types and instantiate the needed functions for each of them.
 // Dynamic arrays cannot hold structs because for every type there'd need to be an internal implementation which is impossible.
@@ -43,16 +260,19 @@ typedef TArray<TRS> FDynArray_TRS;
 
 template<class T> void ArrayCopy(T *self, T *other)
 {
+	FArrayWriteNote<T> note(self);
 	*self = *other;
 }
 
 template<class T> void ArrayMove(T *self, T* other)
 {
+	FArrayWriteNote<T> note(self), noteOther(other);
 	*self = std::move(*other);
 }
 
 template<class T> void ArrayAppend(T *self, const T *other)
 {
+	FArrayWriteNote<T> note(self);
 	self->Append(*other);
 }
 
@@ -61,23 +281,87 @@ template<class T, class U> int ArrayFind(T *self, U val)
 	return self->Find(static_cast<typename T::value_type>(val));
 }
 
+CVAR(Bool, r_find_simd, true, 0)
+
+#if defined(_M_X64) || defined(__x86_64__)
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2")))
+#endif
+static unsigned FindPointerAVX2(void* const* data, unsigned count, const void* val)
+{
+	const __m256i key = _mm256_set1_epi64x((long long)(intptr_t)val);
+	unsigned i = 0;
+	for (; i + 16 <= count; i += 16)
+	{
+		const __m256i* at = (const __m256i*)(data + i);
+		const __m256i a = _mm256_cmpeq_epi64(_mm256_loadu_si256(at), key);
+		const __m256i b = _mm256_cmpeq_epi64(_mm256_loadu_si256(at + 1), key);
+		const __m256i c = _mm256_cmpeq_epi64(_mm256_loadu_si256(at + 2), key);
+		const __m256i e = _mm256_cmpeq_epi64(_mm256_loadu_si256(at + 3), key);
+		const __m256i any = _mm256_or_si256(_mm256_or_si256(a, b), _mm256_or_si256(c, e));
+		if (!_mm256_testz_si256(any, any)) break;
+	}
+	for (; i < count; ++i)
+	{
+		if (data[i] == val) break;
+	}
+	return i;
+}
+#endif
+
+static unsigned ScanPointer(void* const* data, unsigned count, const void* val);
+
+static unsigned FindPointer(void* const* data, unsigned count, const void* val)
+{
+	unsigned result;
+	if (count >= IndexMinSize && r_find_index && IndexedFind(data, count, val, result)) return result;
+	return ScanPointer(data, count, val);
+}
+
+static unsigned ScanPointer(void* const* data, unsigned count, const void* val)
+{
+#if defined(_M_X64) || defined(__x86_64__)
+	if (count >= 16 && CPU.bAVX2 && r_find_simd) return FindPointerAVX2(data, count, val);
+#endif
+	unsigned i = 0;
+	for (; i < count; ++i)
+	{
+		if (data[i] == val) break;
+	}
+	return i;
+}
+
+static int ArrayFindPtr(FDynArray_Ptr *self, void *val)
+{
+	return FindPointer(self->Data(), self->Size(), val);
+}
+
+static int ArrayFindObj(FDynArray_Obj *self, DObject *val)
+{
+	return FindPointer(reinterpret_cast<void* const*>(self->Data()), self->Size(), val);
+}
+
 template<class T, class U> int ArrayPush(T *self, U val)
 {
+	FArrayWriteNote<T> note(self);
 	return self->Push(static_cast<typename T::value_type>(val));
 }
 
 template<class T> int ArrayPop(T *self)
 {
+	FArrayWriteNote<T> note(self);
 	return self->Pop();
 }
 
 template<class T> void ArrayDelete(T *self, int index, int count)
 {
+	FArrayWriteNote<T> note(self);
 	self->Delete(index, count);
 }
 
 template<class T, class U, int fill = 1> void ArrayInsert(T *self, int index, U val)
 {
+	FArrayWriteNote<T> note(self);
 	int oldSize = self->Size();
 	self->Insert(index, static_cast<typename T::value_type>(val));
 	if constexpr (fill)
@@ -88,16 +372,19 @@ template<class T, class U, int fill = 1> void ArrayInsert(T *self, int index, U 
 
 template<class T> void ArrayShrinkToFit(T *self)
 {
+	FArrayWriteNote<T> note(self);
 	self->ShrinkToFit();
 }
 
 template<class T> void ArrayGrow(T *self, int amount)
 {
+	FArrayWriteNote<T> note(self);
 	self->Grow(amount);
 }
 
 template<class T, int fill = 1> void ArrayResize(T *self, int amount)
 {
+	FArrayWriteNote<T> note(self);
 	int oldSize = self->Size();
 	self->Resize(amount);
 	if (fill)
@@ -110,11 +397,13 @@ template<class T, int fill = 1> void ArrayResize(T *self, int amount)
 
 template<class T> unsigned int ArrayReserve(T *self, int amount)
 {
+	FArrayWriteNote<T> note(self);
 	return self->Reserve(amount);
 }
 
 template<> unsigned int ArrayReserve(TArray<DObject*> *self, int amount)
 {
+	FArrayWriteNote<TArray<DObject*>> note(self);
 	const unsigned int oldSize = self->Reserve(amount);
 	const unsigned int fillCount = self->Size() - oldSize;
 
@@ -131,6 +420,7 @@ template<class T> int ArrayMax(T *self)
 
 template<class T> void ArrayClear(T *self)
 {
+	FArrayWriteNote<T> note(self);
 	self->Clear();
 }
 
@@ -724,6 +1014,7 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Ptr, Copy, ArrayCopy<FDynArray_Ptr>)
 {
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Ptr);
 	PARAM_POINTER(other, FDynArray_Ptr);
+	FArrayWriteNote<FDynArray_Ptr> note(self);
 	*self = *other;
 	return 0;
 }
@@ -732,6 +1023,7 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Ptr, Move, ArrayMove<FDynArray_Ptr>)
 {
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Ptr);
 	PARAM_POINTER(other, FDynArray_Ptr);
+	FArrayWriteNote<FDynArray_Ptr> note(self), noteOther(other);
 	*self = std::move(*other);
 	return 0;
 }
@@ -740,27 +1032,30 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Ptr, Append, ArrayAppend<FDynArray_Ptr>)
 {
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Ptr);
 	PARAM_POINTER(other, FDynArray_Ptr);
+	FArrayWriteNote<FDynArray_Ptr> note(self);
 	self->Append(*other);
 	return 0;
 }
 
-DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Ptr, Find, ArrayFind<FDynArray_Ptr COMMA void*>)
+DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Ptr, Find, ArrayFindPtr)
 {
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Ptr);
 	PARAM_POINTER(val, void);
-	ACTION_RETURN_INT(self->Find(val));
+	ACTION_RETURN_INT(ArrayFindPtr(self, val));
 }
 
 DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Ptr, Push, ArrayPush<FDynArray_Ptr COMMA void*>)
 {
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Ptr);
 	PARAM_POINTER(val, void);
+	FArrayWriteNote<FDynArray_Ptr> note(self);
 	ACTION_RETURN_INT(self->Push(val));
 }
 
 DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Ptr, Pop, ArrayPop<FDynArray_Ptr>)
 {
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Ptr);
+	FArrayWriteNote<FDynArray_Ptr> note(self);
 	ACTION_RETURN_BOOL(self->Pop());
 }
 
@@ -769,6 +1064,7 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Ptr, Delete, ArrayDelete<FDynArray_Ptr>)
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Ptr);
 	PARAM_INT(index);
 	PARAM_INT(count);
+	FArrayWriteNote<FDynArray_Ptr> note(self);
 	self->Delete(index, count);
 	return 0;
 }
@@ -785,6 +1081,7 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Ptr, Insert, ArrayInsert<FDynArray_Ptr C
 DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Ptr, ShrinkToFit, ArrayShrinkToFit<FDynArray_Ptr>)
 {
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Ptr);
+	FArrayWriteNote<FDynArray_Ptr> note(self);
 	self->ShrinkToFit();
 	return 0;
 }
@@ -793,6 +1090,7 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Ptr, Grow, ArrayGrow<FDynArray_Ptr>)
 {
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Ptr);
 	PARAM_INT(count);
+	FArrayWriteNote<FDynArray_Ptr> note(self);
 	self->Grow(count);
 	return 0;
 }
@@ -809,6 +1107,7 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Ptr, Reserve, ArrayReserve<FDynArray_Ptr
 {
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Ptr);
 	PARAM_INT(count);
+	FArrayWriteNote<FDynArray_Ptr> note(self);
 	ACTION_RETURN_INT(self->Reserve(count));
 }
 
@@ -821,6 +1120,7 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Ptr, Max, ArrayMax<FDynArray_Ptr>)
 DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Ptr, Clear, ArrayClear<FDynArray_Ptr>)
 {
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Ptr);
+	FArrayWriteNote<FDynArray_Ptr> note(self);
 	self->Clear();
 	return 0;
 }
@@ -834,6 +1134,7 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Ptr, Clear, ArrayClear<FDynArray_Ptr>)
 
 void ObjArrayCopy(FDynArray_Obj *self, FDynArray_Obj *other)
 {
+	FArrayWriteNote<FDynArray_Obj> note(self);
 	for (auto& elem : *other) GC::WriteBarrier(elem);
 	*self = *other;
 }
@@ -848,6 +1149,7 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Obj, Copy, ObjArrayCopy)
 
 void ObjArrayMove(FDynArray_Obj *self, FDynArray_Obj *other)
 {
+	FArrayWriteNote<FDynArray_Obj> note(self), noteOther(other);
 	for (auto& elem : *other) GC::WriteBarrier(elem);
 	*self = std::move(*other);
 }
@@ -862,6 +1164,7 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Obj, Move, ObjArrayMove)
 
 void ObjArrayAppend(FDynArray_Obj *self, FDynArray_Obj *other)
 {
+	FArrayWriteNote<FDynArray_Obj> note(self);
 	for (auto& elem : *other) GC::WriteBarrier(elem);
 	self->Append(*other);
 }
@@ -874,15 +1177,16 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Obj, Append, ObjArrayAppend)
 	return 0;
 }
 
-DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Obj, Find, ArrayFind<FDynArray_Obj COMMA DObject*>)
+DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Obj, Find, ArrayFindObj)
 {
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Obj);
 	PARAM_OBJECT(val, DObject);
-	ACTION_RETURN_INT(self->Find(val));
+	ACTION_RETURN_INT(ArrayFindObj(self, val));
 }
 
 int ObjArrayPush(FDynArray_Obj *self, DObject *obj)
 {
+	FArrayWriteNote<FDynArray_Obj> note(self);
 	GC::WriteBarrier(obj);
 	return self->Push(obj);
 }
@@ -897,6 +1201,7 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Obj, Push, ObjArrayPush)
 DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Obj, Pop, ArrayPop<FDynArray_Obj>)
 {
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Obj);
+	FArrayWriteNote<FDynArray_Obj> note(self);
 	ACTION_RETURN_BOOL(self->Pop());
 }
 
@@ -905,12 +1210,14 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Obj, Delete, ArrayDelete<FDynArray_Obj>)
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Obj);
 	PARAM_INT(index);
 	PARAM_INT(count);
+	FArrayWriteNote<FDynArray_Obj> note(self);
 	self->Delete(index, count);
 	return 0;
 }
 
 void ObjArrayInsert(FDynArray_Obj *self,int index, DObject *obj)
 {
+	FArrayWriteNote<FDynArray_Obj> note(self);
 	int oldSize = self->Size();
 	GC::WriteBarrier(obj);
 	self->Insert(index, obj);
@@ -929,6 +1236,7 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Obj, Insert, ObjArrayInsert)
 DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Obj, ShrinkToFit, ArrayShrinkToFit<FDynArray_Obj>)
 {
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Obj);
+	FArrayWriteNote<FDynArray_Obj> note(self);
 	self->ShrinkToFit();
 	return 0;
 }
@@ -937,6 +1245,7 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Obj, Grow, ArrayGrow<FDynArray_Obj>)
 {
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Obj);
 	PARAM_INT(count);
+	FArrayWriteNote<FDynArray_Obj> note(self);
 	self->Grow(count);
 	return 0;
 }
@@ -965,6 +1274,7 @@ DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Obj, Max, ArrayMax<FDynArray_Obj>)
 DEFINE_ACTION_FUNCTION_NATIVE(FDynArray_Obj, Clear, ArrayClear<FDynArray_Obj>)
 {
 	PARAM_SELF_STRUCT_PROLOGUE(FDynArray_Obj);
+	FArrayWriteNote<FDynArray_Obj> note(self);
 	self->Clear();
 	return 0;
 }

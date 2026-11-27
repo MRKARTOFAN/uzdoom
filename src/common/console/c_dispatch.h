@@ -64,6 +64,10 @@ void AddCommandString (const char *text, int keynum=0);
 
 void C_RunDelayedCommands();
 void C_ClearDelayedCommands();
+// [Karto] Worker tics skip the queue, so they may only run while no queued command would fire.
+bool C_DelayedCommandsQuiet(int tics);
+unsigned C_DelayedCommandCount();
+void C_SkipDelayedCommandTics(unsigned count, int tics);
 
 // Process a single console command. Does not handle wait.
 void C_DoCommand (const char *cmd, int keynum=0);

@@ -26,6 +26,7 @@
 //       It's less than ideal, but it's the only solution I have right now.
 
 #include <cstdint>
+#include "d_ticworkercheck.h"
 #include <string.h>
 #include <string_view>
 #include <vector>
@@ -132,22 +133,65 @@ int FName::NameManager::FindName (const char *text, size_t textLen, bool noCreat
 	return FindName(std::string_view(text, textLen), noCreate);
 }
 
+// [Karto] Name lookups run before any cvar exists, so the switch is a plain flag its cvar writes.
+bool NameFastLookup = true;
+bool NameCacheLookup = true;
+
+// [Karto] Per-thread cache in front of the map, since the tic worker and main thread look names up concurrently.
+namespace
+{
+	struct FNameCacheEntry { const char* Text; size_t Length; int Index; char Copy[40]; };
+	thread_local FNameCacheEntry NameCache[256];
+
+	FNameCacheEntry& NameCacheSlot(const char* text, size_t length)
+	{
+		const uintptr_t key = reinterpret_cast<uintptr_t>(text) ^ length;
+		return NameCache[(key >> 3 ^ key >> 11) & 255];
+	}
+}
+
 int FName::NameManager::FindName (const std::string_view str, bool noCreate)
 {
+	FNameCacheEntry* slot = nullptr;
+	if (NameCacheLookup && str.size() <= sizeof(FNameCacheEntry::Copy) && str.data() != nullptr)
+	{
+		slot = &NameCacheSlot(str.data(), str.size());
+		if (slot->Text == str.data() && slot->Length == str.size() && memcmp(slot->Copy, str.data(), str.size()) == 0) return slot->Index;
+	}
+	auto remember = [&](int index)
+	{
+		if (slot != nullptr)
+		{
+			slot->Text = str.data();
+			slot->Length = str.size();
+			memcpy(slot->Copy, str.data(), str.size());
+			slot->Index = index;
+		}
+		return index;
+	};
+	char buffer[128];
+	if (NameFastLookup && str.size() <= sizeof(buffer))
+	{
+		for (size_t i = 0; i < str.size(); ++i) buffer[i] = absl::ascii_tolower(static_cast<unsigned char>(str[i]));
+		auto found = StringToName.find(std::string_view(buffer, str.size()));
+		if (found != StringToName.end()) return remember(found->second);
+		if (noCreate) return 0;
+	}
 	auto lowered = absl::AsciiStrToLower(str);
 	auto nameIndex = StringToName.find(lowered);
 	if (nameIndex != StringToName.end()) {
-		return nameIndex->second;
+		return remember(nameIndex->second);
 	}
 
 	if (noCreate) {
 		return 0;
 	}
+	TicWorkerCheckNote(TWS_NameInsert);
 	auto num = NumNames;
 	NumNames += 1;
 	auto allocatedString = std::string(str);
 	StringToName.insert({lowered, num});
 	NameToString.push_back(allocatedString);
 
-	return num;
+	return remember(num);
 }

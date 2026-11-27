@@ -89,7 +89,8 @@ struct particle_t
 	ERenderStyle style; //+4 = 88
 	float Roll, RollVel, RollAcc; //+12 = 100
 	uint16_t    tnext, snext, tprev; //+6 = 106
-	// uint16_t padding; //+2 = 108
+	// [Karto] p_particle_poolorder: 1 while on the active list, 2 once this tic's pass found it expired.
+	uint16_t    live; //+2 = 108
 	uint32_t flags; //+4 = 112
 	FStandaloneAnimation animData; //+16 = 128
 	float	fadeoutstep; //+4 = 132

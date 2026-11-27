@@ -44,6 +44,10 @@
 
 #include "i_time.h"
 #include "g_levellocals.h"
+#include "hw_clock.h"
+
+struct FLevelLocals;
+int WorldModeFrameTimer(FLevelLocals* level);
 
 EXTERN_CVAR(Int, gl_dither_bpc)
 
@@ -82,7 +86,8 @@ void VkPostprocess::PostProcessScene(int fixedcm, float flash, const std::functi
 
 	renderstate.TimeDelta = static_cast<float>(GetDeltaTime());
 	renderstate.Time = static_cast<float>(fb->FrameTime / 1000.0);
-	renderstate.TimeGame = static_cast<float>(primaryLevel->LocalWorldTimer / (double)GameTicRate);
+	// [Karto] Shader game time follows the tic that frames draw, which can lag the simulation.
+	renderstate.TimeGame = static_cast<float>(WorldModeFrameTimer(primaryLevel) / (double)GameTicRate);
 
 	// Upload automatic uniforms to buffer
 	struct AutomaticUniforms {
@@ -101,10 +106,21 @@ void VkPostprocess::PostProcessScene(int fixedcm, float flash, const std::functi
 	memcpy(data, &autoUniforms, sizeof(autoUniforms));
 	AutomaticUniformsBuffer->Unmap();
 
+	const bool profileStages = IsGPUProfilingEnabled();
+	if (profileStages) fb->GetCommands()->PushGroup("pp_pass1");
 	hw_postprocess.Pass1(&renderstate, fixedcm, sceneWidth, sceneHeight);
 	SetActiveRenderTarget();
+	if (profileStages) fb->GetCommands()->PopGroup();
 	afterBloomDrawEndScene2D();
+	if (profileStages) fb->GetCommands()->PushGroup("pp_pass2");
 	hw_postprocess.Pass2(&renderstate, fixedcm, flash, sceneWidth, sceneHeight);
+	if (profileStages) fb->GetCommands()->PopGroup();
+}
+
+void VkPostprocess::PrepareSceneInput()
+{
+	fb->GetRenderState()->EndRenderPass();
+	mCurrentPipelineImage = 0;
 }
 
 void VkPostprocess::BlitSceneToPostprocess()

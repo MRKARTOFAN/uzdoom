@@ -332,86 +332,98 @@ double DEarthquake::GetFalloff(double dist, double radius) const
 //
 //==========================================================================
 
-int DEarthquake::StaticGetQuakeIntensities(double ticFrac, AActor *victim, FQuakeJiggers &jiggers)
+int DEarthquake::AddQuakeIntensities(double ticFrac, AActor *victim, FQuakeJiggers &jiggers)
+{
+	if (m_Spot != nullptr && !(m_Flags & QF_GROUNDONLY && victim->Z() > victim->floorz))
+	{
+		double dist;
+
+		if (m_Flags & QF_3D)	dist = m_Spot->Distance3D(victim);
+		else						dist = m_Spot->Distance2D(victim);
+
+		if (dist < m_TremorRadius)
+		{
+			const double falloff = GetFalloff(dist, m_TremorRadius);
+			const double r = GetModIntensity(m_RollIntensity);
+			const double strength = GetModIntensity(1.0, true);
+			DVector3 intensity;
+			intensity.X = GetModIntensity(m_Intensity.X);
+			intensity.Y = GetModIntensity(m_Intensity.Y);
+			intensity.Z = GetModIntensity(m_Intensity.Z);
+
+			if (!(m_Flags & QF_WAVE))
+			{
+				jiggers.RollIntensity = max(r, jiggers.RollIntensity) * falloff;
+
+				intensity *= falloff;
+				if (m_Flags & QF_RELATIVE)
+				{
+					jiggers.RelIntensity.X = max(intensity.X, jiggers.RelIntensity.X);
+					jiggers.RelIntensity.Y = max(intensity.Y, jiggers.RelIntensity.Y);
+					jiggers.RelIntensity.Z = max(intensity.Z, jiggers.RelIntensity.Z);
+				}
+				else
+				{
+					jiggers.Intensity.X = max(intensity.X, jiggers.Intensity.X);
+					jiggers.Intensity.Y = max(intensity.Y, jiggers.Intensity.Y);
+					jiggers.Intensity.Z = max(intensity.Z, jiggers.Intensity.Z);
+				}
+			}
+			else
+			{
+				jiggers.RollWave = r * GetModWave(ticFrac, m_RollWave) * falloff * strength;
+
+
+				intensity.X *= GetModWave(ticFrac, m_WaveSpeed.X);
+				intensity.Y *= GetModWave(ticFrac, m_WaveSpeed.Y);
+				intensity.Z *= GetModWave(ticFrac, m_WaveSpeed.Z);
+				intensity *= strength * falloff;
+
+				// [RH] This only gives effect to the last sine quake. I would
+				// prefer if some way was found to make multiples coexist
+				// peacefully, but just summing them together is undesirable
+				// because they could cancel each other out depending on their
+				// relative phases.
+
+				// [MC] Now does so. And they stack rather well. I'm a little
+				// surprised at how easy it was.
+
+
+				if (m_Flags & QF_RELATIVE)
+				{
+					jiggers.RelOffset += intensity;
+				}
+				else
+				{
+					jiggers.Offset += intensity;
+				}
+			}
+			return 1;
+		}
+	}
+	return 0;
+}
+
+int DEarthquake::StaticGetQuakeIntensities(double ticFrac, AActor *victim, FQuakeJiggers &jiggers, DEarthquake* const* published, int publishedCount)
 {
 	if (victim->player != NULL && (victim->player->cheats & CF_NOCLIP))
 	{
 		return 0;
 	}
 
+	int count = 0;
+	if (publishedCount >= 0)
+	{
+		for (int i = 0; i < publishedCount; ++i) count += published[i]->AddQuakeIntensities(ticFrac, victim, jiggers);
+		return count;
+	}
+
 	auto iterator = victim->Level->GetThinkerIterator<DEarthquake>(NAME_None, STAT_EARTHQUAKE);
 	DEarthquake *quake;
-	int count = 0;
 
 	while ( (quake = iterator.Next()) != nullptr)
 	{
-		if (quake->m_Spot != nullptr && !(quake->m_Flags & QF_GROUNDONLY && victim->Z() > victim->floorz))
-		{
-			double dist;
-
-			if (quake->m_Flags & QF_3D)	dist = quake->m_Spot->Distance3D(victim);
-			else						dist = quake->m_Spot->Distance2D(victim);
-
-			if (dist < quake->m_TremorRadius)
-			{
-				++count;
-				const double falloff = quake->GetFalloff(dist, quake->m_TremorRadius);
-				const double r = quake->GetModIntensity(quake->m_RollIntensity);
-				const double strength = quake->GetModIntensity(1.0, true);
-				DVector3 intensity;
-				intensity.X = quake->GetModIntensity(quake->m_Intensity.X);
-				intensity.Y = quake->GetModIntensity(quake->m_Intensity.Y);
-				intensity.Z = quake->GetModIntensity(quake->m_Intensity.Z);
-
-				if (!(quake->m_Flags & QF_WAVE))
-				{
-					jiggers.RollIntensity = max(r, jiggers.RollIntensity) * falloff;
-
-					intensity *= falloff;
-					if (quake->m_Flags & QF_RELATIVE)
-					{
-						jiggers.RelIntensity.X = max(intensity.X, jiggers.RelIntensity.X);
-						jiggers.RelIntensity.Y = max(intensity.Y, jiggers.RelIntensity.Y);
-						jiggers.RelIntensity.Z = max(intensity.Z, jiggers.RelIntensity.Z);
-					}
-					else
-					{
-						jiggers.Intensity.X = max(intensity.X, jiggers.Intensity.X);
-						jiggers.Intensity.Y = max(intensity.Y, jiggers.Intensity.Y);
-						jiggers.Intensity.Z = max(intensity.Z, jiggers.Intensity.Z);
-					}
-				}
-				else
-				{
-					jiggers.RollWave = r * quake->GetModWave(ticFrac, quake->m_RollWave) * falloff * strength;
-
-
-					intensity.X *= quake->GetModWave(ticFrac, quake->m_WaveSpeed.X);
-					intensity.Y *= quake->GetModWave(ticFrac, quake->m_WaveSpeed.Y);
-					intensity.Z *= quake->GetModWave(ticFrac, quake->m_WaveSpeed.Z);
-					intensity *= strength * falloff;
-
-					// [RH] This only gives effect to the last sine quake. I would
-					// prefer if some way was found to make multiples coexist
-					// peacefully, but just summing them together is undesirable
-					// because they could cancel each other out depending on their
-					// relative phases.
-
-					// [MC] Now does so. And they stack rather well. I'm a little
-					// surprised at how easy it was.
-
-
-					if (quake->m_Flags & QF_RELATIVE)
-					{
-						jiggers.RelOffset += intensity;
-					}
-					else
-					{
-						jiggers.Offset += intensity;
-					}
-				}
-			}
-		}
+		count += quake->AddQuakeIntensities(ticFrac, victim, jiggers);
 	}
 	return count;
 }

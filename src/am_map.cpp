@@ -167,6 +167,16 @@ CVAR(Float, am_thingsspritescale, 1.0, CVAR_ARCHIVE);
 CVAR (Bool, am_showkeys_always, false, CVAR_ARCHIVE);
 CVAR(Bool, am_match_statusbar, true, CVAR_ARCHIVE)
 
+player_t* WorldModeRenderPlayer(int pnum);
+void TicWorkerWaitForPlayAccess();
+
+// [Karto] Frames show the published tic, which the worker's live player can be a tic ahead of; following the live one
+// made the map jump against the view.
+static player_t& AM_ViewPlayer()
+{
+	return *WorldModeRenderPlayer(consoleplayer);
+}
+
 CUSTOM_CVAR(Int, am_emptyspacemargin, 0, CVAR_ARCHIVE)
 {
 	if (self < 0)
@@ -1165,8 +1175,8 @@ void DAutomap::restoreScaleAndLoc ()
 	}
 	else
 	{
-		m_x = players[consoleplayer].camera->X() - m_w/2;
-		m_y = players[consoleplayer].camera->Y() - m_h/2;
+		m_x = AM_ViewPlayer().camera->X() - m_w/2;
+		m_y = AM_ViewPlayer().camera->Y() - m_h/2;
 	}
 	m_x2 = m_x + m_w;
 	m_y2 = m_y + m_h;
@@ -1331,7 +1341,7 @@ void DAutomap::changeWindowLoc ()
 	oincy = incy = m_paninc.y * twod->GetHeight() / 200;
 	if (am_rotate == 1 || (am_rotate == 2 && viewactive))
 	{
-		rotate(&incx, &incy, players[consoleplayer].camera->InterpolatedAngles(r_viewpoint.TicFrac).Yaw - DAngle::fromDeg(90.));
+		rotate(&incx, &incy, AM_ViewPlayer().camera->InterpolatedAngles(r_viewpoint.TicFrac).Yaw - DAngle::fromDeg(90.));
 	}
 
 	m_x += incx;
@@ -1577,7 +1587,7 @@ void DAutomap::changeWindowScale (double delta)
 void DAutomap::doFollowPlayer ()
 {
 	double sx, sy;
-	auto cam = players[consoleplayer].camera;
+	auto cam = AM_ViewPlayer().camera;
 	if (cam != nullptr)
 	{
 		double delta = cam->player ? cam->player->viewz - cam->Z() : cam->GetCameraHeight();
@@ -2078,80 +2088,87 @@ void DAutomap::drawSubsectors()
 {
 	std::vector<uint32_t> indices;
 	double scale = scale_mtof;
-	DAngle rotation;
-	sector_t tempsec;
-	int floorlight;
-	double scalex, scaley;
-	double originx, originy;
-	double alpha;
-	FColormap colormap;
-	//PalEntry flatcolor;
-	mpoint_t originpt;
 
 	auto lm = getRealLightmode(Level, false);
 	bool softlightramp = !V_IsHardwareRenderer() || lm == ELightMode::Doom || lm == ELightMode::DoomDark;
+	const bool textured = am_textured && !viewactive;
+	const bool rotated = am_rotate == 1 || (am_rotate == 2 && viewactive);
 
-	auto &subsectors = Level->subsectors;
-	for (unsigned i = 0; i < subsectors.Size(); ++i)
+	struct FMaterial
 	{
-		auto sub = &subsectors[i];
-		if (sub->flags & SSECF_POLYORG)
-		{
-			continue;
-		}
+		FGameTexture* Texture;
+		double OriginX, OriginY, ScaleX, ScaleY, Alpha, FadeLevel;
+		DAngle Rotation;
+		FColormap Colormap;
+		int Group[2];	// per tint: index into groups, -1 until used
+	};
+	static std::vector<FMaterial> materials;
+	static std::vector<int> materialOf;
+	static std::vector<unsigned> materialStamp;
+	static unsigned materialFrame;
+	if (materialOf.size() != Level->sectors.Size())
+	{
+		materialOf.assign(Level->sectors.Size(), -1);
+		materialStamp.assign(Level->sectors.Size(), 0);
+	}
+	if (++materialFrame == 0)
+	{
+		std::fill(materialStamp.begin(), materialStamp.end(), 0);
+		materialFrame = 1;
+	}
+	materials.clear();
 
-		if ((!(sub->flags & SSECMF_DRAWN) || (sub->flags & SSECF_HOLE) || (sub->render_sector->MoreFlags & SECMF_HIDDEN)) && am_cheat == 0)
-		{
-			continue;
-		}
+	auto fadeLevelOf = [&](int floorlight)
+	{
+		// Use an equation similar to player sprites to determine shade
 
-		// [XA] don't draw hidden subsectors for am_cheat 4 and up
-		if (am_cheat >= 4 && (sub->render_sector->MoreFlags & SECMF_HIDDEN))
+		// Convert a light level into an unbounded colormap index (shade).
+		// Why the +12? I wish I knew, but experimentation indicates it
+		// is necessary in order to best reproduce Doom's original lighting.
+		if (softlightramp)
 		{
-			continue;
+			double map = (NUMCOLORMAPS * 2.) - ((floorlight + 12) * (NUMCOLORMAPS / 128.));
+			return clamp((map - 12) / NUMCOLORMAPS, 0.0, 1.0);
 		}
+		// for the hardware renderer's light modes that use a linear light scale this must do the same. Otherwise the automap gets too dark.
+		return 1. - clamp(floorlight, 0, 255) / 255.;
+	};
 
-		if (am_portaloverlay && sub->render_sector->PortalGroup != MapPortalGroup && sub->render_sector->PortalGroup != 0)
-		{
-			continue;
-		}
+	// Returns -1 for a floor that is not drawn.
+	auto materialFor = [&](sector_t* renderSector) -> int
+	{
+		const int index = renderSector->Index();
+		if (materialStamp[index] == materialFrame) return materialOf[index];
+		materialStamp[index] = materialFrame;
+		materialOf[index] = -1;
 
-		// Fill the points array from the subsector.
-		points.Resize(sub->numlines);
-		for (uint32_t j = 0; j < sub->numlines; ++j)
-		{
-			mpoint_t pt = { sub->firstline[j].v1->fX(),
-							sub->firstline[j].v1->fY() };
-			if (am_rotate == 1 || (am_rotate == 2 && viewactive))
-			{
-				rotatePoint(&pt.x, &pt.y);
-			}
-			points[j].X = float(f_x + ((pt.x - m_x) * scale));
-			points[j].Y = float(f_y + (f_h - (pt.y - m_y) * scale));
-		}
-
+		FMaterial m = {};
+		m.Group[0] = m.Group[1] = -1;
+		mpoint_t originpt = { 0, 0 };
+		int floorlight = 0;
 		FTextureID maptex;
 
 		// Textured mode
-		if (am_textured && !viewactive)
+		if (textured)
 		{
-			alpha = 1.0;
+			sector_t tempsec;
+			m.Alpha = 1.0;
 
 			// For lighting and texture determination
-			sector_t *sec = AM_FakeFlat(players[consoleplayer].camera, sub->render_sector, &tempsec);
+			sector_t *sec = AM_FakeFlat(AM_ViewPlayer().camera, renderSector, &tempsec);
 			floorlight = sec->GetFloorLight();
 			// Find texture origin.
 			originpt.x = -sec->GetXOffset(sector_t::floor);
 			originpt.y = sec->GetYOffset(sector_t::floor);
-			rotation = -sec->GetAngle(sector_t::floor);
+			m.Rotation = -sec->GetAngle(sector_t::floor);
 			// Coloring for the polygon
-			colormap = sec->Colormap;
+			m.Colormap = sec->Colormap;
 
 			maptex = sec->GetTexture(sector_t::floor);
 			//flatcolor = sec->SpecialColors[sector_t::floor];
 
-			scalex = sec->GetXScale(sector_t::floor);
-			scaley = sec->GetYScale(sector_t::floor);
+			m.ScaleX = sec->GetXScale(sector_t::floor);
+			m.ScaleY = sec->GetYScale(sector_t::floor);
 
 			if (sec->e->XFloor.ffloors.Size())
 			{
@@ -2168,7 +2185,7 @@ void DAutomap::drawSubsectors()
 				auto &vp = r_viewpoint;
 				double cmpz = vp.Pos.Z;
 
-				if (players[consoleplayer].camera && sec == players[consoleplayer].camera->Sector)
+				if (AM_ViewPlayer().camera && sec == AM_ViewPlayer().camera->Sector)
 				{
 					// For the actual camera sector use the current viewpoint as reference.
 					secx = vp.Pos.X;
@@ -2202,9 +2219,9 @@ void DAutomap::drawSubsectors()
 						sector_t *model = rover->top.model;
 						int selector = (rover->flags & FF_INVERTPLANES) ? sector_t::floor : sector_t::ceiling;
 						//flatcolor = model->SpecialColors[selector];
-						rotation = -model->GetAngle(selector);
-						scalex = model->GetXScale(selector);
-						scaley = model->GetYScale(selector);
+						m.Rotation = -model->GetAngle(selector);
+						m.ScaleX = model->GetXScale(selector);
+						m.ScaleY = model->GetYScale(selector);
 						originpt.x = -model->GetXOffset(selector);
 						originpt.y = model->GetYOffset(selector);
 						break;
@@ -2213,111 +2230,194 @@ void DAutomap::drawSubsectors()
 
 				lightlist_t *light = P_GetPlaneLight(sec, floorplane, false);
 				floorlight = *light->p_lightlevel;
-				colormap = light->extra_colormap;
+				m.Colormap = light->extra_colormap;
 			}
 			if (maptex == skyflatnum)
 			{
-				continue;
+				return -1;
 			}
 
 			// Apply the floor's rotation to the texture origin.
-			if (rotation != nullAngle)
+			if (m.Rotation != nullAngle)
 			{
-				rotate(&originpt.x, &originpt.y, rotation);
+				rotate(&originpt.x, &originpt.y, m.Rotation);
 			}
 			// Apply the automap's rotation to the texture origin.
-			if (am_rotate == 1 || (am_rotate == 2 && viewactive))
+			if (rotated)
 			{
-				rotation = rotation + DAngle::fromDeg(90.) - players[consoleplayer].camera->InterpolatedAngles(r_viewpoint.TicFrac).Yaw;
+				m.Rotation = m.Rotation + DAngle::fromDeg(90.) - AM_ViewPlayer().camera->InterpolatedAngles(r_viewpoint.TicFrac).Yaw;
 				rotatePoint(&originpt.x, &originpt.y);
 			}
-			originx = f_x + ((originpt.x - m_x) * scale);
-			originy = f_y + (f_h - (originpt.y - m_y) * scale);
+			m.OriginX = f_x + ((originpt.x - m_x) * scale);
+			m.OriginY = f_y + (f_h - (originpt.y - m_y) * scale);
 
-			// If this subsector has not actually been seen yet (because you are cheating
-			// to see it on the map), tint and desaturate it.
-			// [XA] show it at its true color on am_cheat 4 though, since that's the intent of the feature.
-			if (!(sub->flags & SSECMF_DRAWN) && am_cheat < 4)
-			{
-				colormap.LightColor = PalEntry(
-					(colormap.LightColor.r + 255) / 2,
-					(colormap.LightColor.g + 200) / 2,
-					(colormap.LightColor.b + 160) / 2);
-				colormap.Desaturation = 255 - (255 - colormap.Desaturation) / 4;
-			}
 			// make table based fog visible on the automap as well.
 			if (Level->flags & LEVEL_HASFADETABLE)
 			{
-				colormap.FadeColor = PalEntry(0, 128, 128, 128);
+				m.Colormap.FadeColor = PalEntry(0, 128, 128, 128);
 			}
 		}
 		else if(AMColors.isValid(AMColors.SectorFillColor))
 		{
 			// [XA] Use sector fill color if defined (and not drawing a texture)
 			maptex = TexMan.GetWhiteTexture();
-			colormap.LightColor = PalEntry(AMColors[AMColors.SectorFillColor].RGB);
+			m.Colormap.LightColor = PalEntry(AMColors[AMColors.SectorFillColor].RGB);
 			floorlight = 255;
-			alpha = AMColors.fillAlpha;
-			rotation = nullAngle;
-			scalex = 1.0;
-			scaley = 1.0;
-			originx = 0;
-			originy = 0;
-			originpt.x = 0;
-			originpt.y = 0;
+			m.Alpha = AMColors.fillAlpha;
+			m.Rotation = nullAngle;
+			m.ScaleX = 1.0;
+			m.ScaleY = 1.0;
 		}
 
-		// Draw the polygon.
-		if (maptex.isValid())
+		if (!maptex.isValid()) return -1;
+		m.Texture = TexMan.GetGameTexture(maptex, true);
+		m.ScaleX = scale / m.ScaleX;
+		m.ScaleY = scale / m.ScaleY;
+		m.FadeLevel = fadeLevelOf(floorlight);
+		materialOf[index] = int(materials.size());
+		materials.push_back(m);
+		return materialOf[index];
+	};
+
+	// If this subsector has not actually been seen yet (because you are cheating
+	// to see it on the map), tint and desaturate it.
+	// [XA] show it at its true color on am_cheat 4 though, since that's the intent of the feature.
+	auto colormapOf = [](const FMaterial& m, bool tinted)
+	{
+		FColormap colormap = m.Colormap;
+		if (tinted)
 		{
-			// Hole filling "subsectors" are not necessarily convex so they require real triangulation.
-			// These things are extremely rare so performance is secondary here.
-			if (sub->flags & SSECF_HOLE && sub->numlines > 3)
-			{
-				using Point = std::pair<double, double>;
-				std::vector<std::vector<Point>> polygon;
-				std::vector<Point> *curPoly;
-
-				polygon.resize(1);
-				curPoly = &polygon.back();
-				curPoly->resize(points.Size());
-
-				for (unsigned i = 0; i < points.Size(); i++)
-				{
-					(*curPoly)[i] = { points[i].X, points[i].Y };
-				}
-				indices = mapbox::earcut(polygon);
-			}
-			else indices.clear();
-
-			// Use an equation similar to player sprites to determine shade
-
-			// Convert a light level into an unbounded colormap index (shade).
-			// Why the +12? I wish I knew, but experimentation indicates it
-			// is necessary in order to best reproduce Doom's original lighting.
-			double fadelevel;
-			if (softlightramp)
-			{
-				double map = (NUMCOLORMAPS * 2.) - ((floorlight + 12) * (NUMCOLORMAPS / 128.));
-				fadelevel = clamp((map - 12) / NUMCOLORMAPS, 0.0, 1.0);
-			}
-			else
-			{
-				// for the hardware renderer's light modes that use a linear light scale this must do the same. Otherwise the automap gets too dark.
-				fadelevel = 1. - clamp(floorlight, 0, 255) / 255.f;
-			}
-
-			twod->AddPoly(TexMan.GetGameTexture(maptex, true),
-				&points[0], points.Size(),
-				originx, originy,
-				scale / scalex,
-				scale / scaley,
-				rotation,
-				colormap,
-				alpha,
-				fadelevel,
-				indices.data(), indices.size());
+			colormap.LightColor = PalEntry(
+				(colormap.LightColor.r + 255) / 2,
+				(colormap.LightColor.g + 200) / 2,
+				(colormap.LightColor.b + 160) / 2);
+			colormap.Desaturation = 255 - (255 - colormap.Desaturation) / 4;
 		}
+		return colormap;
+	};
+
+	struct FGroupKey
+	{
+		FGameTexture* Texture;
+		uint32_t Fade;
+		int Desaturate;
+		bool Translucent;
+	};
+	struct FPolyItem
+	{
+		int Material, Group;
+		bool Tinted, Hole;
+		unsigned First, Count;
+	};
+	static std::vector<FGroupKey> groups;
+	static std::vector<FPolyItem> items;
+	static std::vector<FVector2> itemPoints;
+	static std::vector<unsigned> groupStart, order;
+	groups.clear();
+	items.clear();
+	itemPoints.clear();
+	const float screenW = float(twod->GetWidth()), screenH = float(twod->GetHeight());
+
+	auto &subsectors = Level->subsectors;
+	for (unsigned i = 0; i < subsectors.Size(); ++i)
+	{
+		auto sub = &subsectors[i];
+		if (sub->flags & SSECF_POLYORG)
+		{
+			continue;
+		}
+
+		if ((!(sub->flags & SSECMF_DRAWN) || (sub->flags & SSECF_HOLE) || (sub->render_sector->MoreFlags & SECMF_HIDDEN)) && am_cheat == 0)
+		{
+			continue;
+		}
+
+		// [XA] don't draw hidden subsectors for am_cheat 4 and up
+		if (am_cheat >= 4 && (sub->render_sector->MoreFlags & SECMF_HIDDEN))
+		{
+			continue;
+		}
+
+		if (am_portaloverlay && sub->render_sector->PortalGroup != MapPortalGroup && sub->render_sector->PortalGroup != 0)
+		{
+			continue;
+		}
+		if (sub->numlines < 3)
+		{
+			continue;
+		}
+
+		// Fill the points array from the subsector.
+		const unsigned first = unsigned(itemPoints.size());
+		itemPoints.resize(first + sub->numlines);
+		FVector2* points = &itemPoints[first];
+		float minX = FLT_MAX, maxX = -FLT_MAX, minY = FLT_MAX, maxY = -FLT_MAX;
+		for (uint32_t j = 0; j < sub->numlines; ++j)
+		{
+			mpoint_t pt = { sub->firstline[j].v1->fX(),
+							sub->firstline[j].v1->fY() };
+			if (rotated)
+			{
+				rotatePoint(&pt.x, &pt.y);
+			}
+			points[j].X = float(f_x + ((pt.x - m_x) * scale));
+			points[j].Y = float(f_y + (f_h - (pt.y - m_y) * scale));
+			minX = std::min(minX, points[j].X);
+			maxX = std::max(maxX, points[j].X);
+			minY = std::min(minY, points[j].Y);
+			maxY = std::max(maxY, points[j].Y);
+		}
+		const bool offscreen = maxX < 0 || maxY < 0 || minX > screenW || minY > screenH;
+		const int material = offscreen ? -1 : materialFor(sub->render_sector);
+		if (material < 0)
+		{
+			itemPoints.resize(first);
+			continue;
+		}
+
+		FMaterial& m = materials[material];
+		const bool tinted = textured && !(sub->flags & SSECMF_DRAWN) && am_cheat < 4;
+		if (m.Group[tinted] < 0)
+		{
+			const FColormap colormap = colormapOf(m, tinted);
+			const FGroupKey key = { m.Texture, uint32_t(uint8_t(colormap.FadeColor.r * m.FadeLevel) | uint8_t(colormap.FadeColor.g * m.FadeLevel) << 8 |
+				uint8_t(colormap.FadeColor.b * m.FadeLevel) << 16), colormap.Desaturation, m.Alpha < 1.0 };
+			int group = 0;
+			while (group < int(groups.size()) && !(groups[group].Texture == key.Texture && groups[group].Fade == key.Fade &&
+				groups[group].Desaturate == key.Desaturate && groups[group].Translucent == key.Translucent)) ++group;
+			if (group == int(groups.size())) groups.push_back(key);
+			m.Group[tinted] = group;
+		}
+		items.push_back({ material, m.Group[tinted], tinted, (sub->flags & SSECF_HOLE) && sub->numlines > 3, first, sub->numlines });
+	}
+
+	groupStart.assign(groups.size() + 1, 0);
+	for (const auto& item : items) ++groupStart[item.Group + 1];
+	for (size_t g = 1; g < groupStart.size(); ++g) groupStart[g] += groupStart[g - 1];
+	order.resize(items.size());
+	for (unsigned i = 0; i < items.size(); ++i) order[groupStart[items[i].Group]++] = i;
+
+	for (unsigned index : order)
+	{
+		const FPolyItem& item = items[index];
+		const FMaterial& m = materials[item.Material];
+		FVector2* polyPoints = &itemPoints[item.First];
+		// Hole filling "subsectors" are not necessarily convex so they require real triangulation.
+		// These things are extremely rare so performance is secondary here.
+		if (item.Hole)
+		{
+			using Point = std::pair<double, double>;
+			std::vector<std::vector<Point>> polygon(1);
+			polygon[0].resize(item.Count);
+			for (unsigned i = 0; i < item.Count; i++)
+			{
+				polygon[0][i] = { polyPoints[i].X, polyPoints[i].Y };
+			}
+			indices = mapbox::earcut(polygon);
+		}
+		else indices.clear();
+		twod->AddPoly(m.Texture, polyPoints, item.Count, m.OriginX, m.OriginY, m.ScaleX, m.ScaleY, m.Rotation,
+			colormapOf(m, item.Tinted), m.Alpha, m.FadeLevel, indices.data(), indices.size());
 	}
 }
 
@@ -2837,7 +2937,7 @@ void DAutomap::rotatePoint (double *x, double *y)
 	double pivoty = m_y + m_h/2;
 	*x -= pivotx;
 	*y -= pivoty;
-	rotate (x, y, -players[consoleplayer].camera->InterpolatedAngles(r_viewpoint.TicFrac).Yaw + DAngle::fromDeg(90.));
+	rotate (x, y, -AM_ViewPlayer().camera->InterpolatedAngles(r_viewpoint.TicFrac).Yaw + DAngle::fromDeg(90.));
 	*x += pivotx;
 	*y += pivoty;
 }
@@ -2911,7 +3011,7 @@ void DAutomap::drawPlayers ()
 		mline_t* arrow = nullptr;
 		uint8_t numarrowlines = 0;
 
-		DVector2 pos = players[consoleplayer].mo->InterpolatedPosition(r_viewpoint.TicFrac).XY();
+		DVector2 pos = AM_ViewPlayer().mo->InterpolatedPosition(r_viewpoint.TicFrac).XY();
 		pt.x = pos.X;
 		pt.y = pos.Y;
 		if (am_rotate == 1 || (am_rotate == 2 && viewactive))
@@ -2921,7 +3021,7 @@ void DAutomap::drawPlayers ()
 		}
 		else
 		{
-			angle = players[consoleplayer].mo->InterpolatedAngles(r_viewpoint.TicFrac).Yaw;
+			angle = AM_ViewPlayer().mo->InterpolatedAngles(r_viewpoint.TicFrac).Yaw;
 		}
 
 		if (am_cheat != 0 && CheatMapArrow.Size() > 0)
@@ -2985,7 +3085,7 @@ void DAutomap::drawPlayers ()
 			if (am_rotate == 1 || (am_rotate == 2 && viewactive))
 			{
 				rotatePoint (&pt.x, &pt.y);
-				angle -= players[consoleplayer].camera->InterpolatedAngles(r_viewpoint.TicFrac).Yaw - DAngle::fromDeg(90.);
+				angle -= AM_ViewPlayer().camera->InterpolatedAngles(r_viewpoint.TicFrac).Yaw - DAngle::fromDeg(90.);
 			}
 
 			drawLineCharacter(&MapArrow[0], MapArrow.Size(), 0, angle, color, pt.x, pt.y);
@@ -3005,6 +3105,8 @@ void DAutomap::drawKeys ()
 	mpoint_t p;
 	DAngle  angle;
 
+	// [Karto] Live thinkers, which a worker tic may be changing.
+	TicWorkerWaitForPlayAccess();
 	auto it = Level->GetThinkerIterator<AActor>(NAME_Inventory);
 	AActor *key;
 
@@ -3026,7 +3128,7 @@ void DAutomap::drawKeys ()
 		if (am_rotate == 1 || (am_rotate == 2 && viewactive))
 		{
 			rotatePoint (&p.x, &p.y);
-			angle += -players[consoleplayer].camera->InterpolatedAngles(r_viewpoint.TicFrac).Yaw + DAngle::fromDeg(90.);
+			angle += -AM_ViewPlayer().camera->InterpolatedAngles(r_viewpoint.TicFrac).Yaw + DAngle::fromDeg(90.);
 		}
 
 		if (key->flags & MF_SPECIAL)
@@ -3050,6 +3152,7 @@ void DAutomap::drawKeys ()
 //=============================================================================
 void DAutomap::drawThings (bool allmap)
 {
+	if (allmap || (am_cheat >= 2 && am_cheat != 4) || am_show_seen_things) TicWorkerWaitForPlayAccess();
 	bool allthings = allmap && players[consoleplayer].mo->FindInventory(NAME_PowerScanner, true) != nullptr;
 
 	// if there is nothing to draw, abort early.
@@ -3115,7 +3218,7 @@ void DAutomap::drawThings (bool allmap)
 						if (frame->Texture[0] != frame->Texture[1]) angle += DAngle::fromDeg(180. / 16);
 						if (am_rotate == 1 || (am_rotate == 2 && viewactive))
 						{
-							angle += players[consoleplayer].camera->InterpolatedAngles(r_viewpoint.TicFrac).Yaw - DAngle::fromDeg(90.);
+							angle += AM_ViewPlayer().camera->InterpolatedAngles(r_viewpoint.TicFrac).Yaw - DAngle::fromDeg(90.);
 						}
 						rotation = int((angle.Normalized360() * (16. / 360.)).Degrees());
 
@@ -3142,7 +3245,7 @@ void DAutomap::drawThings (bool allmap)
 					if (am_rotate == 1 || (am_rotate == 2 && viewactive))
 					{
 						rotatePoint (&p.x, &p.y);
-						angle += -players[consoleplayer].camera->InterpolatedAngles(r_viewpoint.TicFrac).Yaw + DAngle::fromDeg(90.);
+						angle += -AM_ViewPlayer().camera->InterpolatedAngles(r_viewpoint.TicFrac).Yaw + DAngle::fromDeg(90.);
 					}
 
 					color = AMColors[AMColors.ThingColor];
@@ -3423,8 +3526,8 @@ void DAutomap::Drawer (int bottom)
 	if (am_portaloverlay)
 	{
 		sector_t *sec;
-		double vh = players[consoleplayer].viewheight;
-		players[consoleplayer].camera->GetPortalTransition(vh, &sec);
+		double vh = AM_ViewPlayer().viewheight;
+		AM_ViewPlayer().camera->GetPortalTransition(vh, &sec);
 		MapPortalGroup = sec->PortalGroup;
 	}
 	else MapPortalGroup = 0;

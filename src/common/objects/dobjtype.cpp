@@ -26,6 +26,7 @@
 
 #include "autosegs.h"
 #include "c_cvars.h"
+#include "c_dispatch.h"
 #include "dobject.h"
 #include "printf.h"
 #include "serializer.h"
@@ -437,6 +438,200 @@ PClass *PClass::FindClass (FName zaname)
 	return k ? *k : nullptr;
 }
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+#include <algorithm>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
+#include <thread>
+
+CVAR(Int, actor_arena, 2, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
+CVAR(Int, actor_arena_spares, 8, 0)
+
+namespace
+{
+	constexpr size_t ArenaChunk = size_t(2) << 20;
+
+	struct FArenaFree { size_t Size; void* Head; };
+
+	std::mutex ArenaLock;
+	int ArenaMode = -1;		// -1 not yet decided, 0 off, 1 ordinary pages, 2 large pages
+	std::atomic<bool> ArenaLarge{ false };	// the spare thread clears it too
+	int ArenaSpareTarget = 0;
+	TArray<uintptr_t> ArenaChunks;	// chunk bases, sorted
+	uint8_t* ArenaCursor = nullptr;
+	uint8_t* ArenaEnd = nullptr;
+	TArray<FArenaFree> ArenaFree;
+
+	bool EnableLockMemory()
+	{
+#ifdef _WIN32
+		HANDLE token;
+		if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) return false;
+		TOKEN_PRIVILEGES tp = {};
+		tp.PrivilegeCount = 1;
+		tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+		bool ok = LookupPrivilegeValueA(nullptr, "SeLockMemoryPrivilege", &tp.Privileges[0].Luid) &&
+			AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) && GetLastError() == ERROR_SUCCESS;
+		CloseHandle(token);
+		return ok && GetLargePageMinimum() == ArenaChunk;
+#else
+		return false;
+#endif
+	}
+
+	void* ArenaCommitChunk()
+	{
+#ifdef _WIN32
+		void* chunk = nullptr;
+		if (ArenaLarge)
+		{
+			chunk = VirtualAlloc(nullptr, ArenaChunk, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+			if (chunk == nullptr) ArenaLarge = false;
+		}
+		if (chunk == nullptr) chunk = VirtualAlloc(nullptr, ArenaChunk, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+		return chunk;
+#else
+		return nullptr;
+#endif
+	}
+
+	struct FArenaSpares
+	{
+		std::mutex Lock;
+		std::condition_variable Wake;
+		TArray<void*> Chunks;
+		bool Failed = false;
+	};
+
+	// [Karto] Never destroyed: the spare thread is detached and may still be waiting on it when the process exits.
+	FArenaSpares& ArenaSpares()
+	{
+		static FArenaSpares* spares = new FArenaSpares;
+		return *spares;
+	}
+
+	void ArenaFillSpares()
+	{
+		auto& spares = ArenaSpares();
+		std::unique_lock<std::mutex> lock(spares.Lock);
+		while (!spares.Failed)
+		{
+			spares.Wake.wait(lock, [&] { return int(spares.Chunks.Size()) < ArenaSpareTarget; });
+			lock.unlock();
+			void* chunk = ArenaCommitChunk();
+			lock.lock();
+			if (chunk == nullptr) spares.Failed = true;
+			else spares.Chunks.Push(chunk);
+		}
+	}
+
+	void ArenaInit()
+	{
+#ifdef _WIN32
+		ArenaMode = std::clamp(*actor_arena, 0, 2);
+		ArenaLarge = ArenaMode == 2 && EnableLockMemory();
+		if (ArenaMode == 2 && !ArenaLarge) Printf("Actor arena: large pages unavailable (Lock pages in memory), using ordinary pages\n");
+		ArenaSpareTarget = ArenaMode != 0 && *actor_arena_spares > 0 ? *actor_arena_spares : 0;
+		if (ArenaSpareTarget > 0) std::thread(ArenaFillSpares).detach();
+#else
+		ArenaMode = 0;
+#endif
+	}
+
+	bool ArenaGrow()
+	{
+#ifdef _WIN32
+		void* chunk = nullptr;
+		if (ArenaSpareTarget > 0)
+		{
+			auto& spares = ArenaSpares();
+			std::lock_guard<std::mutex> lock(spares.Lock);
+			if (spares.Chunks.Size() > 0) spares.Chunks.Pop(chunk);
+			spares.Wake.notify_one();
+		}
+		if (chunk == nullptr) chunk = ArenaCommitChunk();
+		if (chunk == nullptr) return false;
+		const uintptr_t base = reinterpret_cast<uintptr_t>(chunk);
+		unsigned at = 0;
+		while (at < ArenaChunks.Size() && ArenaChunks[at] < base) ++at;
+		ArenaChunks.Insert(at, base);
+		ArenaCursor = static_cast<uint8_t*>(chunk);
+		ArenaEnd = ArenaCursor + ArenaChunk;
+		return true;
+#else
+		return false;
+#endif
+	}
+
+	bool ArenaOwns(const void* block)
+	{
+		const uintptr_t at = reinterpret_cast<uintptr_t>(block);
+		auto first = ArenaChunks.begin(), last = ArenaChunks.end();
+		auto it = std::upper_bound(first, last, at);
+		return it != first && at - *(it - 1) < ArenaChunk;
+	}
+}
+
+static void* ArenaAlloc(size_t size)
+{
+	std::lock_guard<std::mutex> lock(ArenaLock);
+	if (ArenaMode < 0) ArenaInit();
+	if (ArenaMode == 0) return nullptr;
+	size = (size + 63) & ~size_t(63);
+	if (size > ArenaChunk / 4) return nullptr;
+	for (auto& list : ArenaFree)
+	{
+		if (list.Size == size && list.Head != nullptr)
+		{
+			void* block = list.Head;
+			list.Head = *(void**)block;
+			GC::ReportAlloc(size);
+			return block;
+		}
+	}
+	if (size_t(ArenaEnd - ArenaCursor) < size && !ArenaGrow())
+	{
+		ArenaMode = 0;
+		return nullptr;
+	}
+	void* block = ArenaCursor;
+	ArenaCursor += size;
+	GC::ReportAlloc(size);
+	return block;
+}
+
+bool ArenaRelease(void* block, size_t size)
+{
+	std::lock_guard<std::mutex> lock(ArenaLock);
+	if (!ArenaOwns(block)) return false;
+	size = (size + 63) & ~size_t(63);
+	GC::ReportDealloc(size);
+	for (auto& list : ArenaFree)
+	{
+		if (list.Size == size)
+		{
+			*(void**)block = list.Head;
+			list.Head = block;
+			return true;
+		}
+	}
+	*(void**)block = nullptr;
+	ArenaFree.Push({ size, block });
+	return true;
+}
+
+CCMD(actor_arena_stats)
+{
+	std::lock_guard<std::mutex> lock(ArenaLock);
+	Printf("ACTORARENA mode=%d large=%d chunks=%u mb=%u\n", ArenaMode, int(ArenaLarge.load()), ArenaChunks.Size(), unsigned(ArenaChunks.Size() * (ArenaChunk >> 20)));
+}
+
 //==========================================================================
 //
 // PClass :: CreateNew
@@ -447,7 +642,8 @@ PClass *PClass::FindClass (FName zaname)
 
 DObject *PClass::CreateNew()
 {
-	uint8_t *mem = (uint8_t *)M_Malloc (Size);
+	uint8_t *mem = IsDescendantOf(NAME_Actor) ? (uint8_t *)ArenaAlloc(Size) : nullptr;
+	if (mem == nullptr) mem = (uint8_t *)M_Malloc (Size);
 	assert (mem != nullptr);
 
 	// Set this object's defaults before constructing it.
@@ -458,7 +654,7 @@ DObject *PClass::CreateNew()
 
 	if (ConstructNative == nullptr || bAbstract)
 	{
-		M_Free(mem);
+		if (!ArenaRelease(mem, Size)) M_Free(mem);
 		I_Error("Attempt to instantiate abstract class %s.", TypeName.GetChars());
 	}
 	ConstructNative (mem);

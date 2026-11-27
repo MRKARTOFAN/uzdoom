@@ -105,6 +105,7 @@ extern FViewWindow r_viewwindow;
 extern int				setblocks;
 extern bool				r_NoInterpolate;
 extern int				validcount;
+extern int				rendervalidcount;
 extern int				dl_validcount;			// For use with FSection. validcount is in use by the renderer and any quick section exclusion needs another variable.
 
 extern angle_t			LocalViewAngle;			// [RH] Added to consoleplayer's angle
@@ -155,6 +156,7 @@ void R_AddInterpolationPoint(const DVector3a &vec);
 void R_SetViewSize (int blocks);
 void R_SetFOV (FRenderViewpoint &viewpoint, DAngle fov);
 void R_SetupFrame(FRenderViewpoint& viewPoint, const FViewWindow& viewWindow, AActor* const camera);
+double R_RenderTicFrac();
 void R_SetViewAngle (FRenderViewpoint &viewpoint, const FViewWindow &viewwindow);
 
 // Called by startup code.

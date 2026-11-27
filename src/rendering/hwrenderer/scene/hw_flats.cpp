@@ -30,6 +30,7 @@
 #include "hw_cvars.h"
 #include "hw_clock.h"
 #include "hw_lighting.h"
+#include "hw_portal.h"
 #include "hw_material.h"
 #include "hwrenderer/scene/hw_drawinfo.h"
 #include "flatvertices.h"
@@ -39,6 +40,10 @@
 #include "texturemanager.h"
 #include "hw_viewpointbuffer.h"
 #include "m_round.h"
+#include <vector>
+
+EXTERN_CVAR(Int, vk_retainedworld)
+CVAR(Bool, r_flatindirect, true, 0)
 
 #ifdef _DEBUG
 CVAR(Int, gl_breaksec, -1, 0)
@@ -188,7 +193,17 @@ void HWFlat::DrawSubsectors(HWDrawInfo *di, FRenderState &state)
 	state.SetLightIndex(dynlightindex);
 
 
-	state.DrawIndexed(DT_Triangles, iboindex + section->vertexindex, section->vertexcount);
+	if (RetainedSurface >= 0 && vk_retainedworld == 2 && !di->Level->HasDynamicLights && screen->mVertexData->RetainedFlatIDBuffer)
+	{
+		auto vertices = screen->mVertexData;
+		state.SetVertexBuffer(vertices->mVertexBuffer, 0, 0, vertices->RetainedFlatIDBuffer.get());
+		state.DrawRetainedTriangles(iboindex + section->vertexindex, section->vertexcount, RetainedSurface);
+		state.SetVertexBuffer(vertices);
+	}
+	else
+	{
+		state.DrawIndexed(DT_Triangles, iboindex + section->vertexindex, section->vertexcount);
+	}
 	flatvertices += section->vertexcount;
 	flatprimitives++;
 }
@@ -210,6 +225,22 @@ void HWFlat::DrawOtherPlanes(HWDrawInfo *di, FRenderState &state)
 
 	if (!pNode) return;
 	auto node = *pNode;
+
+	if (r_flatindirect)
+	{
+		static thread_local std::vector<FRenderState::FIndirectFan> fans;
+		fans.clear();
+		while (node)
+		{
+			auto num = node->sub->numlines;
+			fans.push_back({ unsigned(node->vertexindex), unsigned(num), node->lightindex });
+			flatvertices += num;
+			flatprimitives++;
+			node = node->next;
+		}
+		if (!fans.empty()) state.DrawIndirectFans(fans.data(), int(fans.size()));
+		return;
+	}
 
 	while (node)
 	{
@@ -290,6 +321,9 @@ void HWFlat::DrawFloodPlanes(HWDrawInfo *di, FRenderState &state)
 //
 //
 //==========================================================================
+EXTERN_CVAR(Int, r_distance_cull_type)
+EXTERN_CVAR(Bool, vk_sharedappearance)
+
 void HWFlat::DrawFlat(HWDrawInfo *di, FRenderState &state, bool translucent)
 {
 #ifdef _DEBUG
@@ -303,8 +337,49 @@ void HWFlat::DrawFlat(HWDrawInfo *di, FRenderState &state, bool translucent)
 
 	state.SetNormal(plane.plane.Normal().X, plane.plane.Normal().Z, plane.plane.Normal().Y);
 
-	SetColor(state, di->Level, di->lightmode, lightlevel, rel, di->isFullbrightScene(), Colormap, alpha);
-	SetFog(state, di->Level, di->lightmode, lightlevel, rel, di->isFullbrightScene(), &Colormap, false);
+	if (translucent || RetainedSurface < 0 || !vk_retainedworld ||
+		!ApplyRetainedSectorLighting(di, state, sector, int(ceiling), lightlevel, rel, Colormap, alpha))
+	{
+		bool appearanceDone = false;
+		if (vk_sharedappearance && !vk_retainedworld && !translucent && !di->Level->HasDynamicLights)
+		{
+			FSharedAppearanceKey key = {};
+			key.LightMode = int(di->lightmode);
+			key.LightLevel = lightlevel;
+			key.RelativeLight = rel;
+			key.LightColor = Colormap.LightColor.d;
+			key.FadeColor = Colormap.FadeColor.d;
+			key.Desaturation = Colormap.Desaturation;
+			key.BlendFactor = Colormap.BlendFactor;
+			key.FogDensity = Colormap.FogDensity;
+			key.Alpha = alpha;
+			key.Additive = false;
+			key.Fullbright = di->isFullbrightScene();
+			key.SoftwareLighting = isSoftwareLighting(di->lightmode);
+			key.FogMode = gl_fogmode;
+			key.CullType = r_distance_cull_type;
+			key.LevelFlags = di->Level->flags;
+			key.CullDist = di->Level->culldist;
+			key.CullColor = di->Level->cullcolor.d;
+			key.OutsideFog = di->Level->info->outsidefog;
+			key.BrightFog = di->Level->brightfog;
+			key.InSkybox = portalState.inskybox;
+			key.Level = di->Level;
+			appearanceDone = state.SelectSharedAppearance(key);
+			if (!appearanceDone)
+			{
+				SetColor(state, di->Level, di->lightmode, lightlevel, rel, di->isFullbrightScene(), Colormap, alpha);
+				SetFog(state, di->Level, di->lightmode, lightlevel, rel, di->isFullbrightScene(), &Colormap, false);
+				state.StoreSharedAppearance(key);
+				appearanceDone = true;
+			}
+		}
+		if (!appearanceDone)
+		{
+			SetColor(state, di->Level, di->lightmode, lightlevel, rel, di->isFullbrightScene(), Colormap, alpha);
+			SetFog(state, di->Level, di->lightmode, lightlevel, rel, di->isFullbrightScene(), &Colormap, false);
+		}
+	}
 	state.SetObjectColor(FlatColor | 0xff000000);
 	state.SetAddColor(AddColor | 0xff000000);
 	state.ApplyTextureManipulation(TextureFx);
@@ -396,7 +471,12 @@ inline void HWFlat::PutFlat(HWDrawInfo *di, bool fog)
 
 void HWFlat::Process(HWDrawInfo *di, sector_t * model, int whichplane, bool fog)
 {
-	plane.GetFromSector(model, whichplane);
+	RetainedSurface = -1;
+	const auto appearance = QueryRetainedSectorAppearance(model, whichplane);
+	if (appearance && !appearance->Planes[whichplane].plane.dithertransflag)
+		plane = appearance->Planes[whichplane];
+	else
+		plane.GetFromSector(model, whichplane);
 	model->ceilingplane.dithertransflag = false; // Resetting this every frame
 	model->floorplane.dithertransflag = false; // Resetting this every frame
 	if (whichplane != int(ceiling))
@@ -420,6 +500,15 @@ void HWFlat::Process(HWDrawInfo *di, sector_t * model, int whichplane, bool fog)
 		texture = NULL;
 		lightlevel = abs(lightlevel);
 	}
+
+	if (appearance && RetainedWorldShadersCompatible() && model == sector && whichplane == int(ceiling) && !fog && !hacktype && !stack &&
+		alpha == 1.f && !plane.plane.dithertransflag && sector->special != GLSector_Skybox &&
+		screen->IsVulkan() && sector->Index() < 16384 &&
+		!di->mCurrentPortal && !di->Viewpoint.bDoOob && !di->Viewpoint.bDoOrtho &&
+		texture && texture->GetShaderIndex() == 0 && !texture->isHardwareCanvas() &&
+		!texture->GetTranslucency() && !texture->isMasked() && !di->Level->HasDynamicLights &&
+		!sector->HasLightmaps)
+		RetainedSurface = 32768 + sector->Index() * 2 + whichplane;
 
 	z = plane.plane.ZatPoint(0.f, 0.f);
 	if (sector->special == GLSector_Skybox)
@@ -491,6 +580,7 @@ void HWFlat::ProcessSector(HWDrawInfo *di, sector_t * frontsector, int which)
 
 	// Get the real sector for this one.
 	sector = &di->Level->sectors[frontsector->sectornum];
+	const auto appearance = QueryRetainedSectorAppearance(frontsector);
 	extsector_t::xfloor &x = sector->e->XFloor;
 	dynlightindex = -1;
 	hacktype = (which & (SSRF_PLANEHACK|SSRF_FLOODHACK));
@@ -512,8 +602,8 @@ void HWFlat::ProcessSector(HWDrawInfo *di, sector_t * frontsector, int which)
 
 		srf |= SSRF_RENDERFLOOR;
 
-		lightlevel = RescaleLightLevel(frontsector->GetFloorLight());
-		Colormap = frontsector->Colormap;
+		lightlevel = appearance ? appearance->PlaneLight[0] : RescaleLightLevel(frontsector->GetFloorLight());
+		Colormap = appearance ? appearance->Colormap : frontsector->Colormap;
 		FlatColor = frontsector->SpecialColors[sector_t::floor];
 		AddColor = frontsector->AdditiveColors[sector_t::floor];
 		TextureFx = &frontsector->planes[sector_t::floor].TextureFx;
@@ -570,8 +660,8 @@ void HWFlat::ProcessSector(HWDrawInfo *di, sector_t * frontsector, int which)
 
 		srf |= SSRF_RENDERCEILING;
 
-		lightlevel = RescaleLightLevel(frontsector->GetCeilingLight());
-		Colormap = frontsector->Colormap;
+		lightlevel = appearance ? appearance->PlaneLight[1] : RescaleLightLevel(frontsector->GetCeilingLight());
+		Colormap = appearance ? appearance->Colormap : frontsector->Colormap;
 		FlatColor = frontsector->SpecialColors[sector_t::ceiling];
 		AddColor = frontsector->AdditiveColors[sector_t::ceiling];
 		TextureFx = &frontsector->planes[sector_t::ceiling].TextureFx;
@@ -636,7 +726,7 @@ void HWFlat::ProcessSector(HWDrawInfo *di, sector_t * frontsector, int which)
 		// is no longer necessary.
 
 		ceiling = true;
-		Colormap = frontsector->Colormap;
+		Colormap = appearance ? appearance->Colormap : frontsector->Colormap;
 		for (k = 0; k < (int)x.ffloors.Size(); k++)
 		{
 			rover = x.ffloors[k];

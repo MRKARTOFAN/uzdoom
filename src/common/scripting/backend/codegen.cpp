@@ -7635,6 +7635,7 @@ FxStructMember::~FxStructMember()
 bool FxStructMember::RequestAddress(FCompileContext &ctx, bool *writable)
 {
 	AddressRequested = true;
+	if (writable != nullptr) membervar->WriteRequested = true;
 	if (membervar->Flags & VARF_Meta)
 	{
 		// Meta variables are read only.
@@ -7965,6 +7966,7 @@ FxExpression *FxArrayElement::Resolve(FCompileContext &ctx)
 	{
 		PDynArray *darraytype = static_cast<PDynArray*>(Array->ValueType);
 		elementtype = darraytype->ElementType;
+		NoteWrite = elementtype->isPointer();
 		Array->ValueType = NewPointer(NewStaticArray(elementtype));	// change type so that this can use the code for resizable arrays unchanged.
 		arrayispointer = true;
 	}
@@ -8184,6 +8186,16 @@ ExpEmit FxArrayElement::Emit(VMFunctionBuilder *build)
 	else
 	{
 		start = Array->Emit(build);
+	}
+
+	// [Karto] Script writes elements by address without a native, so taking an address must note the buffer (r_find_index).
+	if (NoteWrite && AddressRequested && !start.Konst)
+	{
+		auto sym = FindBuiltinFunction(NAME_BuiltinArrayWritten);
+		assert(sym);
+		FunctionCallEmitter emitters(sym->Variants[0].Implementation);
+		emitters.AddParameterPointer(start.RegNum, false);
+		emitters.EmitCall(build);
 	}
 
 	if (index->isConstant())

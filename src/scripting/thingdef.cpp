@@ -450,6 +450,7 @@ void LoadActors()
 	timer.Reset(); timer.Clock();
 	FScriptPosition::ResetErrorCounter();
 
+	ShadowBlockPossible = false;
 	SetDoomCompileEnvironment();
 	InitThingdef();
 	FScriptPosition::StrictErrors = true;
@@ -472,6 +473,9 @@ void LoadActors()
 	SynthesizeFlagFields();
 
 	FunctionBuildList.Build();
+
+	if (auto field = dyn_cast<PField>(RUNTIME_CLASS(AActor)->VMType->Symbols.FindSymbol("bShadowBlock", true)); field && field->WriteRequested)
+		ShadowBlockPossible = true;
 
 	if (FScriptPosition::ErrorCounter > 0)
 	{

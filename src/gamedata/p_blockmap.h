@@ -25,6 +25,7 @@
 #define __P_BLOCKMAP_H
 
 #include "doomtype.h"
+#include "tarray.h"
 
 class AActor;
 
@@ -38,11 +39,31 @@ struct FBlockNode
 	FBlockNode *NextActor;			// next actor in this block
 	FBlockNode **PrevBlock;			// previous block this actor is in
 	FBlockNode *NextBlock;			// next block this actor is in
+	double X, Y, Radius;
+	int FirstBlock;
+	bool Spans;
+	int Slot;
 
 	static FBlockNode *Create (AActor *who, int x, int y, int group = -1);
 	void Release ();
 
 	static FBlockNode *FreeBlocks;
+};
+
+// [Karto] Index order is link order; removals leave a tombstone (Node == nullptr) so slots stay put.
+struct FBlockEntry
+{
+	AActor *Me;
+	FBlockNode *Node;
+	double X, Y, Radius;
+	int FirstBlock;
+	bool Spans;
+};
+
+struct FBlockArray
+{
+	TArray<FBlockEntry> Entries;
+	unsigned Dead = 0;
 };
 
 // BLOCKMAP
@@ -63,6 +84,20 @@ struct FBlockmap
 	double				bmaporgx;
 	double				bmaporgy;		// origin of block map
 	FBlockNode**		blocklinks; 	// for thing chains
+	FBlockArray*		blockarrays = nullptr;
+
+	void DropMirrorUnless(bool oneGroup)
+	{
+		if (!oneGroup && blockarrays != nullptr)
+		{
+			delete[] blockarrays;
+			blockarrays = nullptr;
+		}
+	}
+	void MirrorAdd(FBlockNode *node);
+	void MirrorRemove(FBlockNode *node);
+	void MirrorUpdate(FBlockNode *node);
+	void MirrorRebuild(int index);
 
 	// mapblocks are used to check movement
 	// against lines and things
@@ -106,6 +141,11 @@ struct FBlockmap
 		{
 			delete[] blocklinks;
 			blocklinks = nullptr;
+		}
+		if (blockarrays != nullptr)
+		{
+			delete[] blockarrays;
+			blockarrays = nullptr;
 		}
 	}
 

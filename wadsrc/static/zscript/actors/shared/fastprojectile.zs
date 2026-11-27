@@ -64,8 +64,15 @@ class FastProjectile : Actor
 	//
 	//----------------------------------------------------------------------------
 
+	private native void NativeTick();
+
 	override void Tick ()
 	{
+		if (p_fastprojectile_native)
+		{
+			NativeTick();
+			return;
+		}
 		ClearInterpolation();
 		double oldz = pos.Z;
 

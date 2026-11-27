@@ -25,6 +25,7 @@
 #include <zvulkan/vulkanbuilders.h>
 #include <zvulkan/vulkanswapchain.h>
 #include "vulkan/system/vk_renderdevice.h"
+#include "vulkan/system/vk_commandbuffer.h"
 #include "vulkan/renderer/vk_postprocess.h"
 #include "vk_framebuffer.h"
 
@@ -36,9 +37,12 @@ VkFramebufferManager::VkFramebufferManager(VulkanRenderDevice* fb) : fb(fb)
 	SwapChain = VulkanSwapChainBuilder()
 		.Create(fb->device.get());
 
-	SwapChainImageAvailableSemaphore = SemaphoreBuilder()
-		.DebugName("SwapChainImageAvailableSemaphore")
-		.Create(fb->device.get());
+	for (auto& semaphore : SwapChainImageAvailableSemaphore)
+	{
+		semaphore = SemaphoreBuilder()
+			.DebugName("SwapChainImageAvailableSemaphore")
+			.Create(fb->device.get());
+	}
 }
 
 VkFramebufferManager::~VkFramebufferManager()
@@ -50,6 +54,8 @@ void VkFramebufferManager::AcquireImage()
 	bool exclusiveFullscreen = fb->IsFullscreen() && vk_exclusivefullscreen;
 	if (SwapChain->Lost() || fb->GetClientWidth() != CurrentWidth || fb->GetClientHeight() != CurrentHeight || fb->GetVSync() != CurrentVSync || CurrentHdr != vk_hdr || CurrentExclusiveFullscreen != exclusiveFullscreen)
 	{
+		// [Karto] The parked frame may still render into these framebuffers and present from the old swapchain.
+		fb->GetCommands()->WaitForPendingFrame();
 		Framebuffers.clear();
 
 		CurrentWidth = fb->GetClientWidth();
@@ -69,7 +75,8 @@ void VkFramebufferManager::AcquireImage()
 		}
 	}
 
-	PresentImageIndex = SwapChain->AcquireImage(SwapChainImageAvailableSemaphore.get());
+	AcquireSlot = fb->GetCommands()->GetFrameSlot();
+	PresentImageIndex = SwapChain->AcquireImage(GetImageAvailableSemaphore());
 	if (PresentImageIndex != -1)
 	{
 		fb->GetPostprocess()->DrawPresentTexture(fb->mOutputLetterbox, true, false);

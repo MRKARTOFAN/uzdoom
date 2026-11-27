@@ -27,6 +27,10 @@ class IDataBuffer;
 class IShadowMap
 {
 public:
+	// [Karto] main.fp's shadowmapAttenuation and shadowAttenuation repeat this value.
+	static constexpr int Rows = 4096;
+	int RowsUsed = 0;
+
 	IShadowMap() { }
 	virtual ~IShadowMap();
 
@@ -81,11 +85,15 @@ public:
 
 protected:
 	// Upload the AABB-tree to the GPU
-	void UploadAABBTree();
-	void UploadLights();
+	bool UploadAABBTree();
+	bool UploadLights();
 
 	// Working buffer for creating the list of lights. Stored here to avoid allocating memory each frame
 	TArray<float> mLights;
+
+	TArray<float> mDrawnLights;
+	int mDrawnRows = -1, mDrawnQuality = -1;
+	bool mRedraw = true;
 
 	// AABB-tree of the level, used for ray tests, owned by the playsim, not the renderer.
 	hwrenderer::LevelAABBTree* mAABBTree = nullptr;

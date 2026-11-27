@@ -126,6 +126,8 @@ namespace GC
 
 	// Handles the grunt work for a write barrier.
 	void Barrier(DObject *pointing, DObject *pointed);
+	void LinkNewObject(DObject* obj, DObject*& objNext);
+	bool LinkLocked();
 
 	// Handles a write barrier.
 	static inline void WriteBarrier(DObject *pointing, DObject *pointed);

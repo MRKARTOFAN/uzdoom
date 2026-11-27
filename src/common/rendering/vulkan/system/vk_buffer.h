@@ -49,6 +49,15 @@ public:
 	void AddBuffer(VkHardwareBuffer* buffer);
 	void RemoveBuffer(VkHardwareBuffer* buffer);
 
+	struct StreamPair
+	{
+		std::unique_ptr<VulkanBuffer> Buffer, Staging;
+		VkBufferUsageFlags Usage = 0;
+		uint64_t Frame = 0;
+	};
+	bool AcquireStream(VkBufferUsageFlags usage, size_t bytes, StreamPair& out);
+	void RetireStream(StreamPair&& pair);
+
 	VkHardwareDataBuffer* ViewpointUBO = nullptr;
 	VkHardwareDataBuffer* LightBufferSSO = nullptr;
 	VkHardwareDataBuffer* LightNodes = nullptr;
@@ -60,13 +69,42 @@ public:
 	std::unique_ptr<VkStreamBuffer> StreamBuffer;
 
 	std::unique_ptr<IIndexBuffer> FanToTrisIndexBuffer;
+	IIndexBuffer* GetQuadBatchIndexBuffer();
+	std::unique_ptr<IDataBuffer> RetainedParameters;
+	std::unique_ptr<IIndexBuffer> RetainedIndices;
+	std::unique_ptr<IDataBuffer> SectorAppearance;
+	std::unique_ptr<IDataBuffer> Coverage;
+	std::unique_ptr<IDataBuffer> StaticGeometry;
+	std::unique_ptr<IDataBuffer> StaticIndices;
+	std::unique_ptr<IDataBuffer> PrimitiveTable;
+
+	std::unique_ptr<IDataBuffer> PrimitiveGrid;
+	std::unique_ptr<IDataBuffer> PrimitiveRefs;
+	std::unique_ptr<IDataBuffer> GpuCullVisible;
+	std::unique_ptr<IDataBuffer> GpuCullArgs;
+	std::unique_ptr<IDataBuffer> GpuCullCommands;
+	std::unique_ptr<IDataBuffer> GpuCullDrawMaterials;
+	std::unique_ptr<IDataBuffer> GpuCullAdmission;
+	std::unique_ptr<IDataBuffer> GpuWorldAppearance;
+	std::unique_ptr<IDataBuffer> GpuResidentAppearance;
+	std::unique_ptr<IDataBuffer> GpuResidentReferences;
+	std::unique_ptr<IDataBuffer> PrimitiveBounds;
+	std::unique_ptr<IDataBuffer> PrimitiveMaterials;
+	std::unique_ptr<IIndexBuffer> GpuQuadIndices;
+
+	std::unique_ptr<IVertexBuffer> StaticGeometryVB;
+	std::unique_ptr<IVertexBuffer> StaticSurfaceID;
+	std::unique_ptr<IIndexBuffer> StaticIndicesIB;
+	void UploadStaticBakeGeometry(const void* verts, size_t vertBytes, const void* indices, size_t indexBytes);
 
 private:
+	std::unique_ptr<IIndexBuffer> QuadBatchIndexBuffer;
 	void CreateFanToTrisIndexBuffer();
 
 	VulkanRenderDevice* fb = nullptr;
 
 	std::list<VkHardwareBuffer*> Buffers;
+	std::vector<StreamPair> StreamPool;
 };
 
 class VkStreamBuffer
@@ -76,11 +114,14 @@ public:
 	~VkStreamBuffer();
 
 	uint32_t NextStreamDataBlock();
-	void Reset() { mStreamDataOffset = 0; }
+	// [Karto] The region is chosen at the first block after a reset: EndFrame resets before the frame slot advances.
+	void Reset() { mRegionPending = true; }
 
 	VkHardwareDataBuffer* UniformBuffer = nullptr;
 
 private:
 	uint32_t mBlockSize = 0;
 	uint32_t mStreamDataOffset = 0;
+	uint32_t mRegionSize = 0, mRegionStart = 0;
+	bool mRegionPending = true;
 };

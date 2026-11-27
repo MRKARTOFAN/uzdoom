@@ -40,6 +40,15 @@ struct HWWallDispatcher
 	HWDrawInfo* di;
 	HWMeshHelper* mh;
 	ELightMode lightmode;
+	HWMeshHelper* PreparedCapture = nullptr;
+	HWMeshHelper* PreparedReplay = nullptr;
+	bool SuppressSubmit = false;
+	bool OwnedLightingReady = false;
+	uint64_t OwnedLightingContext = 0;
+	int OwnedExtraLight = 0;
+	unsigned SubmissionOrder = 0;
+	unsigned SubmissionPart = 0;
+	bool OwnedBatch = false;
 
 	HWWallDispatcher(HWDrawInfo* info)
 	{
@@ -59,6 +68,7 @@ struct HWWallDispatcher
 
 	void AddUpperMissingTexture(side_t* side, subsector_t* sub, float height)
 	{
+		if (SuppressSubmit) return;
 		if (di) di->AddUpperMissingTexture(side, sub, height);
 		else
 		{
@@ -68,6 +78,7 @@ struct HWWallDispatcher
 	}
 	void AddLowerMissingTexture(side_t* side, subsector_t* sub, float height)
 	{
+		if (SuppressSubmit) return;
 		if (di) di->AddLowerMissingTexture(side, sub, height);
 		else
 		{
@@ -82,9 +93,11 @@ struct HWWallDispatcher
 		return di && di->isFullbrightScene();
 	}
 
-	void AddWall(HWWall* wal)
+	void AddWall(HWWall* wal, bool retained = false)
 	{
-		if (di) di->AddWall(wal);
+		if (PreparedCapture) PreparedCapture->list.Push(*wal);
+		if (SuppressSubmit) return;
+		if (di) di->AddWall(wal, retained, SubmissionOrder, SubmissionPart++, OwnedBatch);
 		else if (!(wal->flags & HWWall::HWF_TRANSLUCENT)) mh->list.Push(*wal);
 		else mh->translucent.Push(*wal);
 	}

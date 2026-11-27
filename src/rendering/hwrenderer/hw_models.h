@@ -29,6 +29,20 @@ class HWSprite;
 struct HWDrawInfo;
 class FRenderState;
 
+struct FModelDrawState
+{
+	FModel* Model = nullptr;
+	const void* Buffer = nullptr;
+	FGameTexture* Skin = nullptr;
+	int Translation = 0;
+	unsigned Frame1 = 0, Frame2 = 0;
+	int Bone = -1;
+	bool Culled = false, Mirrored = false, Hud = false;
+};
+extern bool ModelCensusArmed;
+void ModelCensusDraw(const FModelDrawState& draw, bool indexed, size_t first, int count);
+void ModelCensusActor(const HWSprite* sprite, HWDrawInfo* di, bool translucent, bool clipping);
+
 
 class FHWModelRenderer : public FModelRenderer
 {
@@ -37,6 +51,7 @@ class FHWModelRenderer : public FModelRenderer
 	int boneIndexBase = -1;
 	HWDrawInfo *di;
 	FRenderState &state;
+	FModelDrawState census;
 public:
 	FHWModelRenderer(HWDrawInfo *d, FRenderState &st, int mli) : modellightindex(mli), di(d), state(st)
 	{}

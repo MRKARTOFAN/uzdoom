@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <variant>
 #include "dobject.h"
 #include "serializer.h"
@@ -283,6 +284,9 @@ public:
 	EventManager *owner;
 	DStaticEventHandler* prev;
 	DStaticEventHandler* next;
+	enum { HotSpawned = 1, HotReplacement = 2, HotDestroyed = 4, HotKnown = 1u << 31 };
+	std::atomic<uint32_t> HotEvents { 0 };
+	uint32_t HotEventMask();
 	virtual bool IsStatic() { return true; }
 
 	//

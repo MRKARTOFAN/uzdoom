@@ -201,6 +201,9 @@ int				setblocks;
 
 unsigned int	R_OldBlend = ~0;
 int 			validcount = 1; 	// increment every time a check is made
+// [Karto] The renderer's own visit stamps count up from INT_MIN so they never equal play's counter; a render stamp
+// left on a line or sector never reads as a play visit.
+int 			rendervalidcount = INT_MIN + 1;
 int 			dl_validcount = 1; 	// increment every time a check is made
 int			freelookviewheight;
 
@@ -499,11 +502,13 @@ void R_Shutdown ()
 
 //CVAR (Int, tf, 0, 0)
 
+int WorldModePlayerIndex(const player_t* player);
+
 bool P_NoInterpolation(player_t const *player, AActor const *actor)
 {
 	return player != nullptr
 		&& !(player->cheats & CF_INTERPVIEW)
-		&& player - players == consoleplayer
+		&& WorldModePlayerIndex(player) == consoleplayer
 		&& actor == player->mo
 		&& !demoplayback
 		&& !(player->cheats & (CF_TOTALLYFROZEN | CF_FROZEN))
@@ -519,6 +524,17 @@ bool P_NoInterpolation(player_t const *player, AActor const *actor)
 //
 // R_InterpolateView
 //
+bool TicPendingView(int& yaw, int& pitch);
+bool TicPublishIndex(int& index);
+int TicPublishedGametic();
+
+static struct
+{
+	bool RenderTime;
+	angle_t Local;
+	int Pending;
+} ViewMotionLook;
+
 //==========================================================================
 
 void R_InterpolateView(FRenderViewpoint& viewPoint, const player_t* const player, const double ticFrac, InterpolationViewer* const iView)
@@ -654,13 +670,17 @@ void R_InterpolateView(FRenderViewpoint& viewPoint, const player_t* const player
 
 	if (P_NoInterpolation(player, viewPoint.camera))
 	{
-		viewPoint.Angles.Yaw = curYaw + DAngle::fromBam(LocalViewAngle);
-		const DAngle delta = player->centering ? nullAngle : DAngle::fromBam(LocalViewPitch);
+		int pendingYaw = 0, pendingPitch = 0;
+		TicPendingView(pendingYaw, pendingPitch);
+		ViewMotionLook = { true, LocalViewAngle, pendingYaw };
+		viewPoint.Angles.Yaw = curYaw + DAngle::fromBam(LocalViewAngle + pendingYaw);
+		const DAngle delta = player->centering ? nullAngle : DAngle::fromBam(LocalViewPitch + pendingPitch);
 		viewPoint.Angles.Pitch = clamp<DAngle>((iView->New.Angles.Pitch - delta).Normalized180(), player->MinPitch, player->MaxPitch);
 		viewPoint.Angles.Roll = iView->New.Angles.Roll;
 	}
 	else
 	{
+		ViewMotionLook = {};
 		viewPoint.Angles.Pitch = iView->Old.Angles.Pitch + deltaangle(iView->Old.Angles.Pitch, iView->New.Angles.Pitch) * ticFrac;
 		viewPoint.Angles.Yaw = prevYaw + deltaangle(prevYaw, curYaw) * ticFrac;
 		viewPoint.Angles.Roll = iView->Old.Angles.Roll + deltaangle(iView->Old.Angles.Roll, iView->New.Angles.Roll) * ticFrac;
@@ -811,8 +831,12 @@ bool FRenderViewpoint::IsOrtho()
 //
 //==========================================================================
 
+AActor* WorldModeLiveActor(AActor* actor);
+
 static InterpolationViewer *FindPastViewer (AActor *actor)
 {
+	// [Karto] The camera may be a published copy that moves every tic; view history follows the actor.
+	actor = WorldModeLiveActor(actor);
 	for (unsigned int i = 0; i < PastViewers.Size(); ++i)
 	{
 		if (PastViewers[i].ViewActor == actor)
@@ -968,13 +992,118 @@ static void R_DoActorTickerAngleChanges(player_t* const player, DRotator& angles
 EXTERN_CVAR(Float, chase_dist)
 EXTERN_CVAR(Float, chase_height)
 
+CVAR(Float, r_test_ticfrac, -1.f, 0)
+
+void WorldModePublishedQuakes(FLevelLocals* level, DEarthquake* const*& quakes, int& count);
+FDynamicLight* WorldModePublishedLight(FDynamicLight* light);
+bool TicPublishFrac(double& frac);
+bool TicPublishIndex(int& index);
+
+double R_RenderTicFrac()
+{
+	if (r_test_ticfrac >= 0) return std::min(1.0, double(r_test_ticfrac));
+	double frac;
+	if (TicPublishFrac(frac)) return frac;
+	return I_GetTimeFrac();
+}
+
+static struct FViewMotionStats
+{
+	DVector3 LastPos;
+	DAngle LastYaw;
+	uint64_t LastNS = 0, Frames = 0, Still = 0, Moving = 0, YawLeft = 0, YawRight = 0, YawStill = 0;
+	double SpeedSum = 0, SpeedSqSum = 0;
+	double TurnSum = 0, TurnSqSum = 0;
+	uint64_t Turning = 0;
+	bool Started = false;
+} ViewMotion;
+
+struct FViewMotionFrame
+{
+	uint64_t NS;
+	double Frac, X, Y, Yaw;
+	int Publish, Gametic, Pending;
+	angle_t Local;
+	bool RenderTime;
+};
+static TArray<FViewMotionFrame> ViewMotionFrames;
+
+static void ViewMotionNote(const DVector3& pos, DAngle yaw)
+{
+	auto& m = ViewMotion;
+	const uint64_t now = I_GetTimeNS();
+	if (m.Started && now != m.LastNS)
+	{
+		const double step = (pos - m.LastPos).XY().Length();
+		const double speed = step / (double(now - m.LastNS) / 1e9);
+		++m.Frames;
+		if (step == 0) ++m.Still;
+		else
+		{
+			++m.Moving;
+			m.SpeedSum += speed;
+			m.SpeedSqSum += speed * speed;
+		}
+		const double turn = deltaangle(m.LastYaw, yaw).Degrees();
+		if (turn > 0) ++m.YawLeft;
+		else if (turn < 0) ++m.YawRight;
+		else ++m.YawStill;
+		const double turnSpeed = turn / (double(now - m.LastNS) / 1e9);
+		m.TurnSum += turnSpeed;
+		m.TurnSqSum += turnSpeed * turnSpeed;
+		++m.Turning;
+	}
+	if (m.Started && now != m.LastNS && ViewMotionFrames.Size() < 20000)
+	{
+		int publish = -1;
+		TicPublishIndex(publish);
+		ViewMotionFrames.Push({ now, r_viewpoint.TicFrac, pos.X, pos.Y, yaw.Degrees(), publish, TicPublishedGametic(), ViewMotionLook.Pending,
+			ViewMotionLook.Local, ViewMotionLook.RenderTime });
+	}
+	m.Started = true;
+	m.LastYaw = yaw;
+	m.LastPos = pos;
+	m.LastNS = now;
+}
+
+CCMD(view_motion_stats)
+{
+	auto& m = ViewMotion;
+	const double n = m.Moving ? double(m.Moving) : 1.0, mean = m.SpeedSum / n;
+	const double spread = sqrt(std::max(0.0, m.SpeedSqSum / n - mean * mean));
+	const double turns = m.Turning ? double(m.Turning) : 1.0, turnMean = m.TurnSum / turns;
+	const double turnSpread = sqrt(std::max(0.0, m.TurnSqSum / turns - turnMean * turnMean));
+	Printf("VIEWMOTION frames=%llu still=%llu moving=%llu mean_speed=%.1f speed_spread=%.1f cv=%.3f yaw_left=%llu yaw_right=%llu yaw_still=%llu turn_mean=%.1f turn_spread=%.1f turn_cv=%.3f\n",
+		(unsigned long long)m.Frames, (unsigned long long)m.Still, (unsigned long long)m.Moving, mean, spread,
+		mean > 0 ? spread / mean : 0.0, (unsigned long long)m.YawLeft, (unsigned long long)m.YawRight,
+		(unsigned long long)m.YawStill, turnMean, turnSpread, turnMean != 0 ? fabs(turnSpread / turnMean) : 0.0);
+	if (argv.argc() == 2 && stricmp(argv[1], "reset") == 0)
+	{
+		m = FViewMotionStats();
+		ViewMotionFrames.Clear();
+	}
+}
+
+CCMD(view_motion_dump)
+{
+	if (argv.argc() != 2) return;
+	FILE* f = fopen(argv[1], "w");
+	if (f == nullptr) return;
+	fprintf(f, "ns,frac,publish,gametic,x,y,yaw,rendertime,local,pending\n");
+	for (auto& fr : ViewMotionFrames)
+		fprintf(f, "%llu,%.4f,%d,%d,%.3f,%.3f,%.4f,%d,%d,%d\n", (unsigned long long)fr.NS, fr.Frac, fr.Publish, fr.Gametic,
+			fr.X, fr.Y, fr.Yaw, int(fr.RenderTime), int(fr.Local), fr.Pending);
+	fclose(f);
+}
+
 void R_SetupFrame(FRenderViewpoint& viewPoint, const FViewWindow& viewWindow, AActor* const actor)
 {
-	viewPoint.TicFrac = I_GetTimeFrac();
+	viewPoint.TicFrac = R_RenderTicFrac();
 	if (cl_capfps || r_NoInterpolate)
 		viewPoint.TicFrac = 1.0;
 
-	const int curTic = I_GetTime();
+	int curTic = I_GetTime();
+	TicPublishIndex(curTic);
 
 	if (actor == nullptr)
 		I_Error("Tried to render from a null actor.");
@@ -1015,7 +1144,9 @@ void R_SetupFrame(FRenderViewpoint& viewPoint, const FViewWindow& viewWindow, AA
 	if (player != nullptr && player->mo == actor)
 	{
 		if (player->camera == nullptr)
+		{
 			player->camera = player->mo;
+		}
 
 		viewPoint.camera = player->camera; // [RH] Use camera instead of view player.
 	}
@@ -1124,7 +1255,10 @@ void R_SetupFrame(FRenderViewpoint& viewPoint, const FViewWindow& viewWindow, AA
 	if (!WorldPaused(true))
 	{
 		FQuakeJiggers jiggers;
-		int intensity = DEarthquake::StaticGetQuakeIntensities(viewPoint.TicFrac, viewPoint.camera, jiggers);
+		DEarthquake* const* publishedQuakes;
+		int publishedCount;
+		WorldModePublishedQuakes(viewPoint.ViewLevel, publishedQuakes, publishedCount);
+		int intensity = DEarthquake::StaticGetQuakeIntensities(viewPoint.TicFrac, viewPoint.camera, jiggers, publishedQuakes, publishedCount);
 		if (intensity > 0)
 		{
 			if (haptics_do_world)
@@ -1166,7 +1300,9 @@ void R_SetupFrame(FRenderViewpoint& viewPoint, const FViewWindow& viewWindow, AA
 
 	// If currently tracking the player's real view, don't do any sort of interpolating.
 	if (matchPlayer && !usePawn)
+	{
 		viewPoint.camera->renderflags |= RF_NOINTERPOLATEVIEW;
+	}
 
 	if (viewPoint.camera->player != nullptr)
 		player = viewPoint.camera->player;
@@ -1179,10 +1315,13 @@ void R_SetupFrame(FRenderViewpoint& viewPoint, const FViewWindow& viewWindow, AA
 	}
 
 	R_InterpolateView(viewPoint, player, viewPoint.TicFrac, iView);
+	if (&viewPoint == &r_viewpoint) ViewMotionNote(viewPoint.Pos, viewPoint.Angles.Yaw);
 
 	// Update any spotlights to offset the camera's actual angle.
-	for (auto l : viewPoint.camera->AttachedLights)
+	for (auto attached : viewPoint.camera->AttachedLights)
 	{
+		// [Karto] Aim the published copy, which frames light from; the live light stays play's.
+		auto l = WorldModePublishedLight(attached);
 		if (l->IsSpot() && l->IsActive())
 		{
 			l->Yaw = viewPoint.Angles.Yaw;
@@ -1263,7 +1402,8 @@ void R_SetupFrame(FRenderViewpoint& viewPoint, const FViewWindow& viewWindow, AA
 	if (R_OldBlend != newBlend)
 		R_OldBlend = newBlend;
 
-	++validcount;
+	if (!V_IsHardwareRenderer()) ++validcount;
+	++rendervalidcount;
 
 	if (r_clearbuffer != 0)
 	{

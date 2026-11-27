@@ -131,9 +131,11 @@ CUSTOM_CVAR (Float, sv_gravity, 800.f, CVAR_SERVERINFO|CVAR_NOSAVE|CVAR_NOINITCA
 }
 
 CVAR (Bool, cl_missiledecals, true, CVAR_ARCHIVE)
+CVAR (Bool, p_xy_idle_skip, true, 0)
 CVAR (Bool, addrocketexplosion, true, CVAR_ARCHIVE)
 CVAR (Int, cl_pufftype, 0, CVAR_ARCHIVE);
 CVAR (Int, cl_bloodtype, 0, CVAR_ARCHIVE);
+bool ShadowBlockPossible;
 
 // CODE --------------------------------------------------------------------
 
@@ -268,6 +270,7 @@ void AActor::Serialize(FSerializer &arc)
 		("target", target)
 		("lastenemy", lastenemy)
 		("lastheard", LastHeard)
+		A("closetflags", ClosetFlags)
 		A("reactiontime", reactiontime)
 		A("threshold", threshold)
 		A("player", player)
@@ -414,6 +417,7 @@ void AActor::Serialize(FSerializer &arc)
 		{
 			arc("userlights", UserLights, def->UserLights);
 		}
+		if (arc.isReading() && (flags9 & MF9_SHADOWBLOCK)) ShadowBlockPossible = true;
 }
 
 #undef A
@@ -560,6 +564,8 @@ DEFINE_ACTION_FUNCTION_NATIVE(AActor, AddBehavior, AddBehavior)
 	PARAM_CLASS_NOT_NULL(type, DBehavior);
 	ACTION_RETURN_OBJECT(self->AddBehavior(*type));
 }
+
+EXTERN_CVAR(Bool, p_tick_direct)
 
 void AActor::TickBehaviors()
 {
@@ -951,12 +957,18 @@ bool AActor::SetState (FState *newstate, bool nofunction)
 	if (GetInfo()->LightAssociations.Size() || (state && state->Light > 0) || (oldstate && oldstate->Light > 0))
 	{
 		flags8 |= MF8_RECREATELIGHTS;
+		QueueRecreate();
 		Level->flags3 |= LEVEL3_LIGHTCREATED;
 	}
 	return true;
 }
 
-DEFINE_ACTION_FUNCTION(AActor, SetState)
+static int ZS_SetState(AActor* self, FState* state, int nofunction)
+{
+	return self->SetState(state, !!nofunction);
+}
+
+DEFINE_ACTION_FUNCTION_NATIVE(AActor, SetState, ZS_SetState)
 {
 	PARAM_SELF_PROLOGUE(AActor);
 	PARAM_POINTER(state, FState);
@@ -1090,7 +1102,12 @@ AActor *AActor::FindInventory (FName type, bool subclass)
 	return FindInventory(PClass::FindActor(type), subclass);
 }
 
-DEFINE_ACTION_FUNCTION(AActor, FindInventory)
+static AActor* ZS_FindInventory(AActor* self, PClassActor* type, int subclass)
+{
+	return self->FindInventory(type, !!subclass);
+}
+
+DEFINE_ACTION_FUNCTION_NATIVE(AActor, FindInventory, ZS_FindInventory)
 {
 	PARAM_SELF_PROLOGUE(AActor);
 	PARAM_CLASS(type, AActor);
@@ -1119,7 +1136,12 @@ AActor *AActor::GiveInventoryType (PClassActor *type)
 	return nullptr;
 }
 
-DEFINE_ACTION_FUNCTION(AActor, GiveInventoryType)
+static AActor* ZS_GiveInventoryType(AActor* self, PClassActor* type)
+{
+	return self->GiveInventoryType(type);
+}
+
+DEFINE_ACTION_FUNCTION_NATIVE(AActor, GiveInventoryType, ZS_GiveInventoryType)
 {
 	PARAM_SELF_PROLOGUE(AActor);
 	PARAM_CLASS(type, AActor);
@@ -1562,6 +1584,7 @@ static int Grind(AActor* actor, int items)
 			actor->flags3 |= MF3_DONTGIB;
 			actor->Height = 0;
 			actor->radius = 0;
+			actor->UpdateBlockNodes();
 			actor->Vel.Zero();
 			return false;
 		}
@@ -1589,6 +1612,7 @@ static int Grind(AActor* actor, int items)
 			actor->flags3 |= MF3_DONTGIB;
 			actor->Height = 0;
 			actor->radius = 0;
+			actor->UpdateBlockNodes();
 			actor->Vel.Zero();
 			actor->SetState (state);
 			if (isgeneric)	// Not a custom crush state, so colorize it appropriately.
@@ -1626,6 +1650,7 @@ static int Grind(AActor* actor, int items)
 				actor->flags3 |= MF3_DONTGIB;
 				actor->Height = 0;
 				actor->radius = 0;
+				actor->UpdateBlockNodes();
 				actor->Vel.Zero();
 				return false;
 			}
@@ -1637,6 +1662,7 @@ static int Grind(AActor* actor, int items)
 				gib->Alpha = actor->Alpha;
 				gib->Height = 0;
 				gib->radius = 0;
+				gib->UpdateBlockNodes();
 				gib->Translation = actor->BloodTranslation;
 			}
 			S_Sound (actor, CHAN_BODY, 0, "misc/fallingsplat", 1, ATTN_IDLE);
@@ -4507,8 +4533,85 @@ void AActor::GetObjectToWorldMatrix(double *outMat)
 //
 // P_MobjThinker
 //
+//==========================================================================
+//
+// [Karto] Resting actors (p_rest_tick): when every test below holds, Tick provably changes nothing but the state
+// countdown. Each test names the part of Tick it rules out.
+//
+//==========================================================================
+
+CVAR(Int, p_rest_tick, 1, 0)
+
+int P_RestTickReason(AActor* a)
+{
+	// Unmorph check, freeze countdown, bones, behaviors, no-interaction branch, inventory DoEffect, unmorphed return.
+	if (a->player != nullptr || a->alternative != nullptr || a->freezetics > 0 || (a->flags9 & MF9_DECOUPLEDANIMATIONS) ||
+		a->modelData != nullptr || a->Behaviors.CountUsed() > 0 || (a->flags5 & MF5_NOINTERACTION) || a->Inventory != nullptr)
+		return 1;
+	// Unmorphed and stealth returns and fades, missiles' minimum speed, skull fly, wind, blasted and touchy at rest.
+	if (a->flags & (MF_UNMORPHED | MF_STEALTH | MF_MISSILE | MF_SKULLFLY)) return 2;
+	if (a->flags2 & (MF2_WINDTHRUST | MF2_BLASTED)) return 20;
+	if (a->flags6 & MF6_TOUCHY) return 21;
+	if (a->flags4 & (MF4_VFRICTION | MF4_SCROLLMOVE)) return 22;
+	// The carrying branch, which also clears this flag, runs only on levels with scrollers.
+	if ((a->flags8 & MF8_INSCROLLSEC) && a->Level->Scrolls.Size() > 0) return 23;
+	if (a->flags7 & MF7_HANDLENODELAY) return 24;
+	if (a->effects != 0) return 25;
+	if (a->PoisonDurationReceived != 0) return 26;
+	// The state countdown must not reach a transition (SetState, actions, CalcBones) this tic.
+	if (a->state == nullptr || (a->tics != -1 && a->tics <= 1)) return 3;
+	// No movement at all: X/Y skipped as by p_xy_idle_skip, no Z movement, on the floor, nothing blocking left over.
+	if (!a->Vel.isZero() || a->Z() != a->floorz || a->BlockingMobj != nullptr || a->MovementBlockingLine != nullptr ||
+		a->Blocking3DFloor != nullptr || a->BlockingFloor != nullptr || a->BlockingCeiling != nullptr)
+		return 4;
+	// Crash() would enter the crash state once.
+	if (!(a->flags6 & MF6_DONTCORPSE) && ((a->flags & MF_CORPSE) || (a->flags6 & MF6_KILLED)) && !(a->flags3 & MF3_CRASHED) &&
+		!(a->flags & MF_ICECORPSE))
+		return 5;
+	// Render sector list: OldRenderPos is never updated, so it runs every tic, and on a map without linked portals
+	// (tested below) it only clears the two portal lists, which must already be empty.
+	if (a->touching_lineportallist != nullptr || a->touching_sectorportallist != nullptr) return 6;
+	auto Level = a->Level;
+	if (a->isFrozen() || Level->BotInfo.botnum != 0) return 7;
+	sector_t* sec = a->Sector;
+	sector_t* floorsec = a->floorsector;
+	if (sec == nullptr || floorsec == nullptr) return 8;
+	// Water level (no heightsec, 3D floors or underwater flag), 3D floor specials, killer and damaging sectors.
+	if (sec->GetHeightSec() != nullptr || sec->e->XFloor.ffloors.Size() != 0 || (sec->MoreFlags & SECMF_UNDERWATER) ||
+		a->waterlevel != 0 || a->waterdepth != 0 || a->boomwaterlevel != 0 || (sec->Flags & SECF_KILLMONSTERS) ||
+		checkForSpecialSector(a, sec))
+		return 9;
+	// The slope push for solid actors on a floor too steep to stand on.
+	if ((a->flags & MF_SOLID) && !(a->flags & (MF_NOCLIP | MF_NOGRAVITY | MF_NOBLOCKMAP)) &&
+		(floorsec->e->XFloor.ffloors.Size() != 0 || floorsec->floorplane.fC() < a->MaxSlopeSteepness))
+		return 10;
+	// Portal transitions: only on maps without linked portals.
+	if (Level->linePortals.Size() != 0 || (sec->planes[sector_t::floor].Flags & PLANEF_LINKED) ||
+		(sec->planes[sector_t::ceiling].Flags & PLANEF_LINKED))
+		return 11;
+	// Nightmare respawn: the countdown and its roll run in the final state or a raisable one.
+	if (a->tics == -1 || a->state->GetCanRaise())
+	{
+		if (a->flags5 & MF5_ALWAYSRESPAWN) return 12;
+		if (G_SkillProperty(SKILLP_Respawn) && (a->flags3 & MF3_ISMONSTER) && !(a->flags2 & MF2_DORMANT) && !(a->flags5 & MF5_NEVERRESPAWN))
+			return 13;
+	}
+	return 0;
+}
+
+bool P_RestTickEligible(AActor* a)
+{
+	return P_RestTickReason(a) == 0;
+}
+
 void AActor::Tick ()
 {
+	if (p_rest_tick == 1 && P_RestTickEligible(this))
+	{
+		if (tics != -1) --tics;
+		return;
+	}
+
 	// [RH] Data for Heretic/Hexen scrolling sectors
 	static const int8_t HexenCompatSpeeds[] = {-25, 0, -10, -5, 0, 5, 10, 0, 25 };
 	static const int8_t HexenScrollies[24][2] =
@@ -4568,7 +4671,7 @@ void AActor::Tick ()
 
 	// These should always tick regardless of prediction or not (let the behavior itself
 	// handle this).
-	if (!isFrozen())
+	if (!isFrozen() && (!p_tick_direct || Behaviors.CountUsed() > 0))
 		TickBehaviors();
 
 	if (flags5 & MF5_NOINTERACTION)
@@ -4951,7 +5054,14 @@ void AActor::Tick ()
 		Blocking3DFloor = nullptr;
 		BlockingFloor = nullptr;
 		BlockingCeiling = nullptr;
-		double oldfloorz = P_XYMovement (this, cumm);
+		// [Karto] With no X/Y velocity, scroll, wind or skull fly, P_XYMovement only clears MF4_SCROLLMOVE and returns floorz.
+		double oldfloorz;
+		if (p_xy_idle_skip && Vel.X == 0 && Vel.Y == 0 && cumm.isZero() && !(flags2 & MF2_WINDTHRUST) && !(flags & MF_SKULLFLY))
+		{
+			flags4 &= ~MF4_SCROLLMOVE;
+			oldfloorz = floorz;
+		}
+		else oldfloorz = P_XYMovement (this, cumm);
 		if (ObjectFlags & OF_EuthanizeMe)
 		{ // actor was destroyed
 			return;
@@ -5629,10 +5739,26 @@ AActor *AActor::StaticSpawn(FLevelLocals *Level, PClassActor *type, const DVecto
 	}
 
 	ConstructActor(actor, pos, SpawningMapThing);
+	// [Karto] An actor spawned after the thinker loop has not ticked, but the end-of-tic pass still reaches it; enter it now.
+	if (!actor->IsClientSide() && (actor->effects || actor->fountaincolor)) actor->QueueRecreate();
 	return actor;
 }
 
-DEFINE_ACTION_FUNCTION(AActor, Spawn)
+static AActor* ZS_Spawn(PClassActor* type, double x, double y, double z, int flags)
+{
+	if (type == nullptr) NullParam("type");
+	return AActor::StaticSpawn(currentVMLevel, type, DVector3(x, y, z), replace_t(flags));
+}
+
+CVAR(Bool, zs_direct_spawn, true, 0)
+
+bool ZSDirectAllowed(const void* direct)
+{
+	if (zs_direct_spawn) return true;
+	return direct != (void*)ZS_Spawn && direct != (void*)ZS_GiveInventoryType && direct != (void*)ZS_FindInventory && direct != (void*)ZS_SetState;
+}
+
+DEFINE_ACTION_FUNCTION_NATIVE(AActor, Spawn, ZS_Spawn)
 {
 	PARAM_PROLOGUE;
 	PARAM_CLASS_NOT_NULL(type, AActor);
@@ -5803,6 +5929,7 @@ void AActor::PostBeginPlay ()
 	if (GetInfo()->LightAssociations.Size() || (state && state->Light > 0))
 	{
 		flags8 |= MF8_RECREATELIGHTS;
+		QueueRecreate();
 		Level->flags3 |= LEVEL3_LIGHTCREATED;
 	}
 }
@@ -7621,6 +7748,151 @@ DEFINE_ACTION_FUNCTION(AActor, HitFloor)
 {
 	PARAM_SELF_PROLOGUE(AActor);
 	ACTION_RETURN_BOOL(P_HitFloor(self));
+}
+
+CVAR(Bool, p_fastprojectile_native, true, 0)
+
+static void FastProjectileTick(AActor *self)
+{
+	static const FName fastProjectileName("FastProjectile");
+
+	self->ClearInterpolation();
+	double oldz = self->Z();
+
+	if (self->isFrozen())
+		return;
+
+	FCheckPosition tm;
+	tm.DoRipping = !!(self->flags2 & MF2_RIP);
+
+	int count = 8;
+	if (self->radius > 0)
+	{
+		while (fabs(self->Vel.X) >= self->radius * count || fabs(self->Vel.Y) >= self->radius * count)
+		{
+			count += count;
+		}
+	}
+
+	if (self->Height > 0)
+	{
+		while (fabs(self->Vel.Z) >= self->Height * count)
+		{
+			count += count;
+		}
+	}
+
+	bool ismoved = !self->Vel.isZero()
+		|| ((self->Z() != self->floorz) && (self->Z() != self->ceilingz - self->Height));
+
+	if (ismoved)
+	{
+		if ((self->flags & MF_MISSILE) && self->Vel.X == 0 && self->Vel.Y == 0 && !self->IsZeroDamage())
+		{
+			self->VelFromAngle(MinVel);
+		}
+
+		// [Karto] Component division, as the VM does; DVector3's operator/ multiplies by the reciprocal.
+		const DVector3 frac(self->Vel.X / count, self->Vel.Y / count, self->Vel.Z / count);
+		const bool changexy = frac.X != 0 || frac.Y != 0;
+		int ripcount = count / 8;
+		for (int i = 0; i < count; i++)
+		{
+			if (changexy)
+			{
+				if (--ripcount <= 0)
+				{
+					if (tm.LastRippedMap) tm.LastRippedMap->Clear();
+				}
+
+				if (!P_TryMove(self, self->Pos().XY() + frac.XY(), true, nullptr, tm, false))
+				{
+					if (!(self->flags3 & MF3_SKYEXPLODE))
+					{
+						line_t *l = tm.ceilingline;
+						if (l && l->backsector && l->backsector->GetTexture(sector_t::ceiling) == skyflatnum)
+						{
+							DVector3 posr = self->PosRelative(l->backsector);
+							if (self->Z() >= l->backsector->ceilingplane.ZatPoint(posr.XY()))
+							{
+								self->Destroy();
+								return;
+							}
+						}
+						if (self->BlockingLine != nullptr && self->BlockingLine->special == Line_Horizon)
+						{
+							self->Destroy();
+							return;
+						}
+					}
+
+					P_ExplodeMissile(self, self->BlockingLine, self->BlockingMobj);
+					return;
+				}
+			}
+			self->AddZ(frac.Z);
+			self->UpdateWaterLevel();
+			oldz = self->Z();
+			if (oldz <= self->floorz)
+			{
+				if (self->floorpic == skyflatnum && !(self->flags3 & MF3_SKYEXPLODE))
+				{
+					self->Destroy();
+					return;
+				}
+
+				self->SetZ(self->floorz);
+				P_HitFloor(self);
+				P_ProjectileHitPlane(self, SECPART_Floor);
+				P_ExplodeMissile(self, nullptr, nullptr);
+				return;
+			}
+			if (self->Z() + self->Height > self->ceilingz)
+			{
+				if (self->ceilingpic == skyflatnum && !(self->flags3 & MF3_SKYEXPLODE))
+				{
+					self->Destroy();
+					return;
+				}
+
+				self->SetZ(self->ceilingz - self->Height);
+				P_ProjectileHitPlane(self, SECPART_Ceiling);
+				P_ExplodeMissile(self, nullptr, nullptr);
+				return;
+			}
+			self->CheckPortalTransition(true);
+			if (changexy && ripcount <= 0)
+			{
+				ripcount = count >> 3;
+
+				IFVIRTUALPTRNAME(self, fastProjectileName, Effect)
+				{
+					VMValue params[1] = { self };
+					VMCall(func, params, 1, nullptr, 0);
+				}
+			}
+		}
+	}
+	if (!self->CheckNoDelay())
+		return;
+	if (self->tics != -1)
+	{
+		if (self->tics > 0) self->tics--;
+		while (!self->tics)
+		{
+			if (!self->SetState(self->state->GetNextState()))
+			{
+				return;
+			}
+		}
+	}
+}
+
+DEFINE_ACTION_FUNCTION(AFastProjectile, NativeTick)
+{
+	PARAM_SELF_PROLOGUE(AActor);
+	FastProjectileTick(self);
+	return 0;
 }
 
 //---------------------------------------------------------------------------

@@ -21,13 +21,30 @@
 #include "hw_clock.h"
 #include "hw_drawinfo.h"
 #include "hw_renderstate.h"
+#include "hw_vertexbuilder.h"
 #include "hw_walldispatcher.h"
 #include "hwrenderer/scene/hw_drawlist.h"
 #include "hwrenderer/scene/hw_drawstructs.h"
+#include "hwrenderer/scene/hw_spriterecord.h"
+#include "hwrenderer/scene/hw_lighting.h"
 #include "r_sky.h"
 #include "r_utility.h"
+#include "c_dispatch.h"
+#include "printf.h"
+#include "d_framestages.h"
+#include "doomstat.h"
+#include "d_net.h"
 
 FMemArena RenderDataAllocator(1024*1024);	// Use large blocks to reduce allocation time.
+
+CVAR(Bool, r_sprite_solidruns, true, 0)
+EXTERN_CVAR(Bool, vk_worldruns)
+EXTERN_CVAR(Int, vk_retainedworld)
+EXTERN_CVAR(Bool, vk_drawreuse)
+EXTERN_CVAR(Bool, gl_seamless)
+EXTERN_CVAR(Bool, vk_gpu_driven_resident)
+EXTERN_CVAR(Bool, vk_gpu_driven_persistent)
+EXTERN_CVAR(Bool, vk_gpu_driven_bakerow)
 
 void ResetRenderDataAllocator()
 {
@@ -69,6 +86,10 @@ static StaticSortNodeArray SortNodes;
 //==========================================================================
 void HWDrawList::Reset()
 {
+	OwnedWalls.Clear();
+	FallbackWalls.Clear();
+	VisibleWalls.Clear();
+	UseOwnedOrder = false;
 	if (sorted) SortNodes.Release(SortNodeStart);
 	sorted=NULL;
 	walls.Clear();
@@ -470,6 +491,7 @@ EXTERN_CVAR(Int, gl_billboard_mode)
 EXTERN_CVAR(Bool, gl_billboard_faces_camera)
 EXTERN_CVAR(Bool, hw_force_cambbpref)
 EXTERN_CVAR(Bool, gl_billboard_particles)
+EXTERN_CVAR(Int, gl_particles_style)
 
 inline double CalcIntersectionVertex(HWSprite *s, HWWall * w2)
 {
@@ -509,15 +531,16 @@ void HWDrawList::SortSpriteIntoWall(HWDrawInfo *di, SortNode * head,SortNode * s
 	}
 	else
 	{
-		const bool drawWithXYBillboard = ((ss->particle && gl_billboard_particles) || (!(ss->actor && ss->actor->renderflags & RF_FORCEYBILLBOARD)
-			&& (gl_billboard_mode == 1 || (ss->actor && ss->actor->renderflags & RF_FORCEXYBILLBOARD))));
+		const ActorRenderFlags ssflags = ss->actor ? ss->actor->renderflags : ss->record ? ss->record->renderflags : ActorRenderFlags::FromInt(0);
+		const bool drawWithXYBillboard = ((ss->particle && gl_billboard_particles) || (!(ssflags & RF_FORCEYBILLBOARD)
+			&& (gl_billboard_mode == 1 || (ssflags & RF_FORCEXYBILLBOARD))));
 
 		const bool drawBillboardFacingCamera = hw_force_cambbpref ? gl_billboard_faces_camera :
 			(gl_billboard_faces_camera && (ss->actor && !(ss->actor->renderflags2 & RF2_BILLBOARDNOFACECAMERA)))
 			|| (ss->actor && ss->actor->renderflags2 & RF2_BILLBOARDFACECAMERA);
 
 		// [Nash] has +ROLLSPRITE
-		const bool rotated = (ss->actor != nullptr && ss->actor->renderflags & (RF_ROLLSPRITE | RF_WALLSPRITE | RF_FLATSPRITE));
+		const bool rotated = !!(ssflags & (RF_ROLLSPRITE | RF_WALLSPRITE | RF_FLATSPRITE));
 
 		// cannot sort them at the moment. This requires more complex splitting.
 		if (drawWithXYBillboard || drawBillboardFacingCamera || rotated)
@@ -713,8 +736,502 @@ void HWDrawList::Sort(HWDrawInfo *di)
 //
 //==========================================================================
 
+void HWDrawList::PrepareOwnedWalls(HWDrawInfo* di)
+{
+	HWSceneScopeTimer timer(SceneMainSurfaceProfile.OwnedVisibleAssemblyNS);
+	UseOwnedOrder = true;
+	VisibleWalls.Clear();
+	{
+		HWSceneScopeTimer orderTimer(SceneMainSurfaceProfile.OwnedOrderNS);
+		unsigned fallback = 0, owned = 0;
+		while (fallback < FallbackWalls.Size() && owned < OwnedWalls.Size())
+		{
+			const auto& ordinary = FallbackWalls[fallback];
+			const auto& selected = OwnedWalls[owned];
+			const unsigned order = ordinary.Order ? ordinary.Order : di->OwnedNextOrder;
+			if (order < selected.Order || (order == selected.Order && ordinary.Part <= selected.Part))
+				VisibleWalls.Push(FallbackWalls[fallback++]);
+			else VisibleWalls.Push(OwnedWalls[owned++]);
+		}
+		while (fallback < FallbackWalls.Size()) VisibleWalls.Push(FallbackWalls[fallback++]);
+		while (owned < OwnedWalls.Size()) VisibleWalls.Push(OwnedWalls[owned++]);
+	}
+	if (SceneProfiling)
+	{
+		const uint64_t bytes = (uint64_t(OwnedWalls.Max()) + FallbackWalls.Max() + VisibleWalls.Max()) * sizeof(HWOwnedWallDraw);
+		SceneMainSurfaceProfile.OwnedSubmissionBytes = std::max(SceneMainSurfaceProfile.OwnedSubmissionBytes, bytes);
+	}
+}
+
+// [Karto] Solid sprites are opaque and depth-tested, so order does not change the image: group equal texture and
+// lighting for long runs. The draw-item index breaks ties to keep the order stable per frame.
+void HWDrawList::SortSolidSprites()
+{
+	if (drawitems.Size() < 2) return;
+	std::sort(drawitems.begin(), drawitems.end(), [this](const HWDrawItem& a, const HWDrawItem& b) -> bool
+	{
+		const HWSprite* s1 = sprites[a.index];
+		const HWSprite* s2 = sprites[b.index];
+		if (s1->texture != s2->texture) return s1->texture < s2->texture;
+		if (s1->translation != s2->translation) return s1->translation.index() < s2->translation.index();
+		if (s1->lightlevel != s2->lightlevel) return s1->lightlevel < s2->lightlevel;
+		if (s1->fullbright != s2->fullbright) return s1->fullbright < s2->fullbright;
+		if (s1->Colormap.LightColor.d != s2->Colormap.LightColor.d) return s1->Colormap.LightColor.d < s2->Colormap.LightColor.d;
+		if (s1->Colormap.FadeColor.d != s2->Colormap.FadeColor.d) return s1->Colormap.FadeColor.d < s2->Colormap.FadeColor.d;
+		return a.index < b.index;
+	});
+}
+
+// [Karto] Additive sprites with depth writes off sum the same in any order, so they are grouped by draw key; the
+// draw-item index breaks ties to keep the order stable per frame.
+void HWDrawList::DrawAdditiveSprites(HWDrawInfo *di, FRenderState &state)
+{
+	if (drawitems.Size() == 0) return;
+	std::sort(drawitems.begin(), drawitems.end(), [this](const HWDrawItem& a, const HWDrawItem& b) -> bool
+	{
+		const HWSprite* s1 = sprites[a.index];
+		const HWSprite* s2 = sprites[b.index];
+		if (s1->texture != s2->texture) return s1->texture < s2->texture;
+		if (s1->RenderStyle.AsDWORD != s2->RenderStyle.AsDWORD) return s1->RenderStyle.AsDWORD < s2->RenderStyle.AsDWORD;
+		if (s1->translation != s2->translation) return s1->translation.index() < s2->translation.index();
+		if (s1->lightlevel != s2->lightlevel) return s1->lightlevel < s2->lightlevel;
+		if (s1->fullbright != s2->fullbright) return s1->fullbright < s2->fullbright;
+		if (s1->trans != s2->trans) return s1->trans < s2->trans;
+		if (s1->Colormap.LightColor.d != s2->Colormap.LightColor.d) return s1->Colormap.LightColor.d < s2->Colormap.LightColor.d;
+		if (s1->Colormap.FadeColor.d != s2->Colormap.FadeColor.d) return s1->Colormap.FadeColor.d < s2->Colormap.FadeColor.d;
+		return a.index < b.index;
+	});
+	HWSpriteRunKey run, next;
+	bool open = false;
+	for (auto& item : drawitems)
+	{
+		HWSprite* s = sprites[item.index];
+		next.Set(di, *s);
+		if (open && !next.dynlight && next == run)
+		{
+			s->DrawRunRepeat(di, state);
+			continue;
+		}
+		if (open) HWSprite::FinishAdditiveRun(state);
+		run = next;
+		s->DrawSprite(di, state, true, true);
+		open = true;
+	}
+	HWSprite::FinishAdditiveRun(state);
+}
+
+// [Karto] polyoffset is known only once CreateVertices ran, so a sprite clipped into the floor still joins; its depth
+// bias is cleared right after its quad.
+void HWDrawList::DrawSolidSprites(HWDrawInfo *di, FRenderState &state)
+{
+	HWSpriteRunKey run, next;
+	bool open = false;
+	const bool persistent = screen->BuffersArePersistent();
+	for (auto& item : drawitems)
+	{
+		HWSprite* s = sprites[item.index];
+		const bool runnable = persistent && (s->record || s->actor) && s->particle == nullptr && s->modelframe == nullptr &&
+			s->lightlist == nullptr && s->topclip == LARGE_VALUE && s->bottomclip == -LARGE_VALUE &&
+			s->RenderStyle.BlendOp != STYLEOP_RevSub && s->RenderStyle.BlendOp != STYLEOP_Sub;
+		if (runnable)
+		{
+			next.Set(di, *s);
+			if (!next.dynlight)
+			{
+				if (open && next == run)
+				{
+					s->DrawRunRepeat(di, state);
+					if (s->polyoffset) state.ClearDepthBias();
+					continue;
+				}
+				if (open) HWSprite::FinishSolidRun(state);
+				run = next;
+				s->DrawSprite(di, state, false, true);
+				if (s->polyoffset) state.ClearDepthBias();
+				open = true;
+				continue;
+			}
+		}
+		if (open)
+		{
+			HWSprite::FinishSolidRun(state);
+			open = false;
+		}
+		s->DrawSprite(di, state, false);
+	}
+	if (open) HWSprite::FinishSolidRun(state);
+}
+
+// [Karto] A bucket's first particle sets the state for the rest. That matches the shader only while nothing applies
+// between, so desaturation and per-particle dynamic light go elsewhere (AddSprite).
+namespace
+{
+	struct FParticleVertex
+	{
+		float x, z, y, u, v, lu, lv, lindex;
+		float r, g, b, a;
+	};
+
+	struct FParticleKey
+	{
+		FGameTexture* texture;
+		FColormap Colormap;
+		uint32_t style, sectorAdd;
+		int lightlevel, OverrideShader;
+		uint8_t foglevel, hw_styleflags;
+		bool fullbright;
+
+		void Set(const HWSprite& s)
+		{
+			memset(this, 0, sizeof(*this));
+			texture = s.texture;
+			Colormap = s.Colormap;
+			style = s.RenderStyle.AsDWORD;
+			sectorAdd = s.particle->subsector->sector->AdditiveColors[sector_t::sprites].d;
+			lightlevel = s.lightlevel;
+			OverrideShader = s.OverrideShader;
+			foglevel = s.foglevel;
+			hw_styleflags = s.hw_styleflags;
+			fullbright = s.fullbright;
+		}
+		bool operator==(const FParticleKey& o) const { return memcmp(this, &o, sizeof(*this)) == 0; }
+		bool operator<(const FParticleKey& o) const { return memcmp(this, &o, sizeof(*this)) < 0; }
+	};
+
+	IVertexBuffer* ParticleBuffer = nullptr;
+	TArray<FParticleVertex> ParticleVertices;
+	IVertexBuffer* GpuParticleBuffer = nullptr;
+	TArray<uint32_t> GpuParticleEntries;
+	TArray<float> GpuParticleRangeData;
+	uint64_t GpuParticleExpanded, GpuParticleFailed;
+}
+
+CVAR(Bool, r_particle_group, true, 0)
+CVAR(Bool, r_particle_group_verify, false, 0)
+CVAR(Bool, r_particle_gpu_lightpass, true, 0)
+EXTERN_CVAR(Bool, r_particle_lit)
+static constexpr float LitParticleOffset = 0.4f;
+EXTERN_CVAR(Bool, gl_light_particles)
+static uint64_t ParticleVerifyPasses, ParticleVerifyMismatches;
+
+static uint64_t ParticlePasses, ParticleItems, ParticleRuns, ParticleKeyChanges, ParticleMaxItems, ParticleMaxRuns;
+
+CCMD(particle_bucket_stats)
+{
+	const double p = ParticlePasses ? double(ParticlePasses) : 1.0;
+	Printf("PARTICLEBUCKETS passes=%llu particles_per_pass=%.1f runs_per_pass=%.2f key_changes_per_pass=%.1f max_particles=%llu max_runs=%llu\n",
+		(unsigned long long)ParticlePasses, ParticleItems / p, ParticleRuns / p, ParticleKeyChanges / p, (unsigned long long)ParticleMaxItems,
+		(unsigned long long)ParticleMaxRuns);
+	Printf("PARTICLEGPU expanded=%llu failed=%llu\n", (unsigned long long)GpuParticleExpanded, (unsigned long long)GpuParticleFailed);
+	Printf("PARTICLEGROUP enabled=%d verify_passes=%llu verify_mismatches=%llu\n", int(r_particle_group),
+		(unsigned long long)ParticleVerifyPasses, (unsigned long long)ParticleVerifyMismatches);
+	if (argv.argc() == 2 && stricmp(argv[1], "reset") == 0)
+		ParticlePasses = ParticleItems = ParticleRuns = ParticleKeyChanges = ParticleMaxItems = ParticleMaxRuns = 0;
+}
+
+void HWDrawList::DrawParticleBuckets(HWDrawInfo *di, FRenderState &state)
+{
+	if (drawitems.Size() == 0) return;
+	FFrameStageScope keyStage(FS_ParticleKeys);
+	TArray<FParticleKey> keys(drawitems.Size(), true);
+	for (unsigned i = 0; i < drawitems.Size(); ++i) keys[i].Set(*sprites[drawitems[i].index]);
+	TArray<unsigned> order(drawitems.Size(), true);
+	TArray<unsigned> group;
+	bool grouped = false;
+	if (r_particle_group)
+	{
+		static constexpr unsigned MaxGroups = 32;
+		unsigned firsts[MaxGroups], counts[MaxGroups] = {}, ranks[MaxGroups], starts[MaxGroups];
+		unsigned groups = 0;
+		group.Resize(keys.Size());
+		grouped = true;
+		for (unsigned i = 0; i < keys.Size() && grouped; ++i)
+		{
+			if (i > 0 && keys[i] == keys[i - 1])
+			{
+				group[i] = group[i - 1];
+			}
+			else
+			{
+				unsigned g = 0;
+				while (g < groups && !(keys[firsts[g]] == keys[i])) ++g;
+				if (g == groups)
+				{
+					if (groups == MaxGroups)
+					{
+						grouped = false;
+						break;
+					}
+					firsts[groups++] = i;
+				}
+				group[i] = g;
+				++ParticleKeyChanges;
+			}
+			++counts[group[i]];
+		}
+		if (grouped)
+		{
+			for (unsigned g = 0; g < groups; ++g) ranks[g] = g;
+			std::sort(ranks, ranks + groups, [&](unsigned a, unsigned b) { return keys[firsts[a]] < keys[firsts[b]]; });
+			unsigned at = 0;
+			for (unsigned r = 0; r < groups; ++r)
+			{
+				starts[ranks[r]] = at;
+				at += counts[ranks[r]];
+			}
+			for (unsigned i = 0; i < keys.Size(); ++i) order[starts[group[i]]++] = i;
+		}
+	}
+	if (!grouped || r_particle_group_verify)
+	{
+		TArray<unsigned> sorted(drawitems.Size(), true);
+		for (unsigned i = 0; i < sorted.Size(); ++i) sorted[i] = i;
+		std::sort(sorted.begin(), sorted.end(), [&](unsigned a, unsigned b) { return keys[a] < keys[b] || (keys[a] == keys[b] && a < b); });
+		if (grouped)
+		{
+			++ParticleVerifyPasses;
+			bool same = true;
+			for (unsigned k = 0; k < sorted.Size() && same; ++k)
+				same = sorted[k] == order[k] && (k == 0 || (group[order[k]] == group[order[k - 1]]) == (keys[order[k]] == keys[order[k - 1]]));
+			ParticleVerifyMismatches += !same;
+		}
+		else order = std::move(sorted);
+	}
+	auto sameKey = [&](unsigned a, unsigned b) { return grouped ? group[a] == group[b] : keys[a] == keys[b]; };
+
+	if (keyStage.Active) FrameStageEnd(FS_ParticleKeys);
+	keyStage.Active = false;
+	struct FSegment { bool Gpu; unsigned First, Count; };
+	struct FRun { HWSprite* first; unsigned segment, segments; };
+	TArray<FRun> runs;
+	TArray<FSegment> segments;
+	auto addSegment = [&](bool gpu, unsigned first, unsigned count)
+	{
+		auto& run = runs.Last();
+		if (run.segments > 0)
+		{
+			auto& last = segments.Last();
+			if (last.Gpu == gpu && last.First + last.Count == first) { last.Count += count; return; }
+		}
+		segments.Push({ gpu, first, count });
+		++run.segments;
+	};
+	FFrameStageScope buildStage(FS_ParticleBuild);
+	ParticleVertices.Clear();
+	const auto& vp = di->Viewpoint;
+	const int rel = getExtraLight();
+	const bool gpu = di->GpuParticles;
+	GpuParticleEntries.Clear();
+	GpuParticleRangeData.Clear();
+	const bool lit = r_particle_lit && gl_light_particles && di->Level->HasDynamicLights && !di->isFullbrightScene();
+	FGpuLightPack lightPack;
+	const bool gpuLit = lit && gpu && r_particle_gpu_lightpass && WorldModeGpuLightPack(di->Level, lightPack);
+	const bool perParticle = lit && !gpuLit;
+	FGpuParticleIndices indices;
+	GpuParticleProgramStore(indices);
+	indices.Frame = di->GpuParticleIndices.data();
+	indices.FrameCount = uint32_t(di->GpuParticleIndices.size());
+	auto indexOf = [&](uint32_t first, uint32_t n) -> uint32_t
+	{
+		return (first & HWDrawInfo::GpuParticleProgramRange) ? indices.Program[(first & ~HWDrawInfo::GpuParticleProgramRange) + n] :
+			di->GpuParticleIndices[first + n];
+	};
+	uint32_t entryCount = 0;
+	struct FParticleLight { uint64_t Serial; float Rgb[3]; };
+	static std::vector<FParticleLight> lightCache(65536, { 0, { 0, 0, 0 } });
+	auto particleLight = [&](const particle_t* base, uint32_t index, float* out)
+	{
+		auto& cached = lightCache[index];
+		if (cached.Serial != di->GpuParticleSerial + 1)
+		{
+			di->GetDynSpriteLight(nullptr, const_cast<particle_t*>(base + index), cached.Rgb);
+			cached.Serial = di->GpuParticleSerial + 1;
+		}
+		memcpy(out, cached.Rgb, sizeof(cached.Rgb));
+	};
+	auto emitRange = [&](HWSprite* s, bool skipFirst)
+	{
+		const auto& range = di->GpuParticleRanges[s->GpuParticleRange];
+		const unsigned from = skipFirst ? 1 : 0;
+		if (range.Count <= from) return;
+		const uint32_t slot = GpuParticleRangeData.Size() / 8;
+		PalEntry light = PalEntry(255, 255, 255, 255);
+		if (!di->isFullbrightScene())
+		{
+			const int level = CalcLightLevel(di->lightmode, s->lightlevel, s->fullbright ? 0 : rel, false, s->Colormap.BlendFactor);
+			light = CalcLightColor(di->lightmode, level, s->Colormap.LightColor, s->Colormap.BlendFactor);
+		}
+		const PalEntry special = s->particle->subsector->sector->SpecialColors[sector_t::sprites];
+		const float scale = 1.0f / 255.0f;
+		const float data[8] = { light.r * scale, light.g * scale, light.b * scale, s->fullbright ? 1.0f : 0.0f,
+			float(special.r), float(special.g), float(special.b), float(special.a) };
+		for (float f : data) GpuParticleRangeData.Push(f);
+		const unsigned at = entryCount;
+		entryCount += range.Count - from;
+		addSegment(true, at * 6, (range.Count - from) * 6);
+		if (!perParticle)
+		{
+			const uint32_t record[4] = { range.First + from, range.Count - from, at, slot };
+			memcpy(&GpuParticleEntries[GpuParticleEntries.Reserve(4)], record, sizeof(record));
+			return;
+		}
+		const particle_t* base = s->particle - indexOf(range.First, 0);
+		const bool litRange = !s->fullbright;
+		uint32_t* out = &GpuParticleEntries[GpuParticleEntries.Reserve((range.Count - from) * 5)];
+		for (unsigned n = from; n < range.Count; ++n)
+		{
+			const uint32_t index = indexOf(range.First, n);
+			*out++ = index;
+			*out++ = slot;
+			float dyn[3] = { 0, 0, 0 };
+			if (litRange) particleLight(base, index, dyn);
+			memcpy(out, dyn, sizeof(dyn));
+			out += 3;
+		}
+	};
+	for (unsigned k = 0; k < order.Size(); ++k)
+	{
+		HWSprite* s = sprites[drawitems[order[k]].index];
+		const bool ranged = gpu && s->GpuParticleRange >= 0;
+		if (k == 0 || !sameKey(order[k], order[k - 1]))
+		{
+			runs.Push({ s, segments.Size(), 0 });
+			if (ranged) emitRange(s, true);
+			continue;
+		}
+		if (ranged)
+		{
+			emitRange(s, false);
+			continue;
+		}
+		FVector3 v[4];
+		s->CalculateVertices(di, v, const_cast<DVector3*>(&vp.Pos));
+		const sector_t* cursec = s->particle->subsector->sector;
+		const PalEntry object = s->fullbright ? s->ThingColor : s->ThingColor.Modulate(cursec->SpecialColors[sector_t::sprites]);
+		PalEntry light = PalEntry(255, 255, 255, 255);
+		if (!di->isFullbrightScene())
+		{
+			const int level = CalcLightLevel(di->lightmode, s->lightlevel, s->fullbright ? 0 : rel, false, s->Colormap.BlendFactor);
+			light = CalcLightColor(di->lightmode, level, s->Colormap.LightColor, s->Colormap.BlendFactor);
+		}
+		const float scale = 1.0f / 255.0f;
+		float lr = light.r * scale, lg = light.g * scale, lb = light.b * scale;
+		if (lit && !s->fullbright)
+		{
+			// [Karto] r_particle_lit: the shader's clamp(colour + dynamic light, 0, 1.4), applied before the particle colour.
+			float dyn[3] = { 0, 0, 0 };
+			di->GetDynSpriteLight(nullptr, s->particle, dyn);
+			lr = std::clamp(lr + dyn[0], 0.0f, 1.4f);
+			lg = std::clamp(lg + dyn[1], 0.0f, 1.4f);
+			lb = std::clamp(lb + dyn[2], 0.0f, 1.4f);
+		}
+		// [Karto] The shader caps the vertex colour at 1 before adding dynamic light, so followers carry a uniform dynamic light
+		// of LitParticleOffset and the vertex colour the rest; clamp(min(c - 0.4, 1) + 0.4, 0, 1.4) returns c up to 1.4.
+		const float offset = lit ? LitParticleOffset : 0.0f;
+		const float r = lr * (object.r * scale) - offset, g = lg * (object.g * scale) - offset;
+		const float b = lb * (object.b * scale) - offset, a = s->trans * (object.a * scale);
+		const float u[4] = { s->ul, s->ur, s->ul, s->ur }, t[4] = { s->vt, s->vt, s->vb, s->vb };
+		static const int corners[6] = { 0, 1, 2, 2, 1, 3 };
+		const unsigned at = ParticleVertices.Size();
+		for (int c : corners)
+			ParticleVertices.Push({ v[c][0], v[c][1], v[c][2], u[c], t[c], 0, 0, -1.0f, r, g, b, a });
+		addSegment(false, at, 6);
+	}
+
+	if (buildStage.Active) FrameStageEnd(FS_ParticleBuild);
+	buildStage.Active = false;
+	FFrameStageScope uploadStage(FS_ParticleUpload);
+	static const FVertexBufferAttribute format[] = {
+		{ 0, VATTR_VERTEX, VFmt_Float3, (int)myoffsetof(FParticleVertex, x) },
+		{ 0, VATTR_TEXCOORD, VFmt_Float2, (int)myoffsetof(FParticleVertex, u) },
+		{ 0, VATTR_LIGHTMAP, VFmt_Float3, (int)myoffsetof(FParticleVertex, lu) },
+		{ 0, VATTR_COLOR, VFmt_Float4, (int)myoffsetof(FParticleVertex, r) },
+	};
+	if (ParticleVertices.Size() > 0)
+	{
+		if (ParticleBuffer == nullptr)
+		{
+			ParticleBuffer = screen->CreateVertexBuffer();
+			ParticleBuffer->SetFormat(1, 4, sizeof(FParticleVertex), format);
+		}
+		// [Karto] One upload per view; SetData keeps earlier buffers alive for draws already recorded from them.
+		ParticleBuffer->SetData(ParticleVertices.Size() * sizeof(FParticleVertex), ParticleVertices.Data(), BufferUsageType::Stream);
+	}
+	bool expanded = false;
+	if (GpuParticleEntries.Size() > 0)
+	{
+		if (GpuParticleBuffer == nullptr)
+		{
+			GpuParticleBuffer = screen->CreateVertexBuffer();
+			GpuParticleBuffer->SetFormat(1, 4, sizeof(FParticleVertex), format);
+		}
+		const float* data;
+		uint32_t count;
+		uint64_t serial;
+		if (WorldModeGpuParticleData(di->Level, data, count, serial))
+		{
+			FGpuParticleParams params = {};
+			params.ViewVector[0] = float(vp.ViewVector.X);
+			params.ViewVector[1] = float(vp.ViewVector.Y);
+			params.TimeFrac = float(Net_ModifyParticleFrac(nullptr, vp.TicFrac));
+			params.PixelStretch = di->Level->pixelstretch;
+			params.Yaw = vp.HWAngles.Yaw.Degrees();
+			params.Pitch = vp.HWAngles.Pitch.Degrees();
+			params.ViewPos[0] = float(vp.Pos.X);
+			params.ViewPos[1] = float(vp.Pos.Y);
+			params.Flags = (paused ? 1u : 0u) | (di->Level->isFrozen() ? 2u : 0u) | ((gl_billboard_particles || gl_billboard_mode == 1) ? 4u : 0u) |
+				(gl_billboard_faces_camera ? 8u : 0u) | (hw_force_cambbpref ? 16u : 0u);
+			params.Style = gl_particles_style;
+			params.EntryCount = entryCount;
+			params.Pad = gpuLit ? 2u : lit ? 1u : 0u;
+			params.RecordCount = perParticle ? 0 : GpuParticleEntries.Size() / 4;
+			expanded = state.ExpandParticles(GpuParticleBuffer, data, count, serial, GpuParticleEntries.Data(), GpuParticleRangeData.Data(),
+				GpuParticleRangeData.Size() / 8, params, indices, gpuLit ? &lightPack : nullptr);
+		}
+		++(expanded ? GpuParticleExpanded : GpuParticleFailed);
+	}
+
+	if (uploadStage.Active) FrameStageEnd(FS_ParticleUpload);
+	uploadStage.Active = false;
+	FFrameStageScope drawStage(FS_ParticleDraw);
+	++ParticlePasses;
+	ParticleItems += order.Size();
+	ParticleRuns += runs.Size();
+	ParticleMaxItems = max<uint64_t>(ParticleMaxItems, order.Size());
+	ParticleMaxRuns = max<uint64_t>(ParticleMaxRuns, runs.Size());
+	for (auto& run : runs)
+	{
+		run.first->DrawSprite(di, state, true, true);
+		if (run.segments)
+		{
+			state.SetObjectColor(0xffffffff);
+			if (lit) state.SetDynLight(LitParticleOffset, LitParticleOffset, LitParticleOffset);
+			else state.SetDynLight(0, 0, 0);
+			for (unsigned n = run.segment; n < run.segment + run.segments; ++n)
+			{
+				const auto& seg = segments[n];
+				if (seg.Gpu && !expanded) continue;
+				state.SetVertexBuffer(seg.Gpu ? GpuParticleBuffer : ParticleBuffer, 0, 0);
+				state.Draw(DT_Triangles, seg.First, seg.Count);
+			}
+			state.SetVertexBuffer(screen->mVertexData);
+		}
+		HWSprite::FinishAdditiveRun(state);
+	}
+}
+
 void HWDrawList::SortWalls()
 {
+	HWSceneScopeTimer timer(SceneMainSurfaceProfile.SortWallsNS);
+	if (UseOwnedOrder)
+	{
+		if (VisibleWalls.Size() > 1) std::sort(VisibleWalls.begin(), VisibleWalls.end(), [](const HWOwnedWallDraw& a, const HWOwnedWallDraw& b)
+		{
+			return a.Wall->texture != b.Wall->texture ? a.Wall->texture < b.Wall->texture :
+				(a.Wall->flags & 3) < (b.Wall->flags & 3);
+		});
+		return;
+	}
 	if (drawitems.Size() > 1)
 	{
 		std::sort(drawitems.begin(), drawitems.end(), [this](const HWDrawItem &a, const HWDrawItem &b) -> bool
@@ -731,6 +1248,7 @@ void HWDrawList::SortWalls()
 
 void HWDrawList::SortFlats()
 {
+	HWSceneScopeTimer timer(SceneMainSurfaceProfile.SortFlatsNS);
 	if (drawitems.Size() > 1)
 	{
 		std::sort(drawitems.begin(), drawitems.end(), [this](const HWDrawItem &a, const HWDrawItem &b)
@@ -749,9 +1267,9 @@ void HWDrawList::SortFlats()
 //
 //==========================================================================
 
-HWWall *HWDrawList::NewWall()
+HWWall *HWDrawList::NewWall(HWWall* retained)
 {
-	auto wall = (HWWall*)RenderDataAllocator.Alloc(sizeof(HWWall));
+	auto wall = retained ? retained : (HWWall*)RenderDataAllocator.Alloc(sizeof(HWWall));
 	drawitems.Push(HWDrawItem(DrawType_WALL, walls.Push(wall)));
 	return wall;
 }
@@ -837,10 +1355,150 @@ void HWDrawList::Draw(HWDrawInfo *di, FRenderState &state, bool translucent)
 //
 //
 //==========================================================================
+void HWDrawList::PrepareGpuDrivenWalls()
+{
+	GPUBakeBeginView();
+	for (auto& item : drawitems)
+	{
+		auto wall = walls[item.index];
+		if (!wall->CanGpuDriveWall(true)) continue;
+		FFlatVertex current[4];
+		FFlatVertex* cursor = current;
+		wall->CreateVertices(cursor, false);
+		GPUBakeAdmitWall(wall->seg, wall->type, current);
+	}
+}
+
+// [Karto] Slot order follows the original sorted list, including gaps, so coplanar ties and fallback boundaries remain ordered.
+bool HWDrawList::DrawGpuDrivenWalls(HWDrawInfo* di, FRenderState& state)
+{
+	if (di->outer || di->mCurrentPortal || di->mClipPortal || di->Viewpoint.bDoOob || di->Viewpoint.bDoOrtho ||
+		UseOwnedOrder || !screen->IsVulkan() || drawitems.Size() == 0 || drawitems.Size() > 1024 * 1024) return false;
+	TArray<uint32_t> rows;
+	rows.Resize(drawitems.Size());
+	uint32_t eligible = 0;
+	{
+		HWSceneScopeTimer candidateTimer(SceneMainSurfaceProfile.GpuCandidateBuildNS);
+		for (unsigned i = 0; i < drawitems.Size(); ++i)
+		{
+			rows[i] = UINT32_MAX;
+			auto wall = walls[drawitems[i].index];
+			if (vk_gpu_driven_resident && wall->GpuAppearanceRevision && wall->GpuResidentEpoch && wall->GpuResidentEpoch == GPUBakeEpoch())
+			{
+				rows[i] = wall->GpuResidentRow;
+				++eligible;
+				continue;
+			}
+			if (!wall->CanGpuDriveWall(true)) continue;
+			if (vk_gpu_driven_persistent && wall->GpuResidentEpoch && wall->GpuResidentEpoch == GPUBakeEpoch())
+			{
+				rows[i] = wall->GpuResidentRow;
+				++eligible;
+				continue;
+			}
+			if (vk_gpu_driven_bakerow)
+			{
+				uint32_t row;
+				if (GPUBakeLookupRow(wall->seg, wall->type, &row))
+				{
+					rows[i] = row;
+					++eligible;
+					continue;
+				}
+			}
+			FFlatVertex current[4];
+			auto cursor = current;
+			wall->CreateVertices(cursor, false);
+			uint32_t offset, count;
+			if (GPUBakeLookupWall(wall->seg, wall->type, current, &offset, &count, &rows[i])) ++eligible;
+		}
+	}
+	if (!eligible) return false;
+	VSMatrix vpm = di->VPUniforms.ProjectionMatrix;
+	vpm.multMatrix(di->VPUniforms.ViewMatrix);
+	const float* matrix = vpm.get();
+	float planes[24];
+	for (int p = 0; p < 6; ++p)
+		for (int k = 0; k < 4; ++k)
+			planes[p * 4 + k] = matrix[k * 4 + 3] + ((p & 1) ? -1.f : 1.f) * matrix[k * 4 + (p >> 1)];
+	GPUBakeRunCull(planes, true, rows.Data(), rows.Size());
+	if (!state.BeginGpuDrivenWalls()) return false;
+	HWWallDispatcher dis(di);
+	RenderWall.Clock();
+	for (unsigned i = 0; i < drawitems.Size(); ++i)
+	{
+		auto wall = walls[drawitems[i].index];
+		if (rows[i] != UINT32_MAX && vk_gpu_driven_resident &&
+			state.DrawGpuResidentWall(i, wall->GpuAppearanceId, wall->GpuAppearanceRevision))
+		{
+			vertexcount += 4;
+			continue;
+		}
+		state.EndGpuResidentBatch();
+		state.SetGpuResidentCapture(wall->GpuAppearanceId, wall->GpuAppearanceRevision);
+		wall->GpuBakeRow = rows[i];
+		wall->DrawWall(&dis, state, false, rows[i] != UINT32_MAX ? i : UINT32_MAX);
+		state.SetGpuResidentCapture(UINT32_MAX, 0);
+	}
+	state.EndGpuDrivenWalls();
+	RenderWall.Unclock();
+	return true;
+}
+
 void HWDrawList::DrawWalls(HWDrawInfo *di, FRenderState &state, bool translucent)
 {
 	HWWallDispatcher dis(di);
 	RenderWall.Clock();
+	if (UseOwnedOrder)
+	{
+		HWPreparedWallRun run;
+		for (const auto& item : VisibleWalls)
+		{
+			if (item.Version || (vk_worldruns && vk_drawreuse && !translucent))
+			{
+				if (item.Wall->DrawPreparedWall(&dis, state, run, item.Version)) continue;
+				if (SceneProfiling)
+				{
+					++SceneMainSurfaceProfile.PreparedDrawFallbacks;
+					if (item.Version) ++SceneMainSurfaceProfile.OwnedDrawFallbacks;
+				}
+			}
+			state.EndRetainedWallRun();
+			if (run.Buffer)
+			{
+				state.SetVertexBuffer(screen->mVertexData);
+				run = {};
+			}
+			item.Wall->DrawWall(&dis, state, translucent);
+		}
+		state.EndRetainedWallRun();
+		if (run.Buffer) state.SetVertexBuffer(screen->mVertexData);
+		RenderWall.Unclock();
+		return;
+	}
+	if (vk_worldruns && vk_retainedworld == 2 && vk_drawreuse && !translucent && !gl_seamless &&
+		screen->IsVulkan() && screen->BuffersArePersistent() && !di->Level->HasDynamicLights &&
+		!di->mCurrentPortal && !di->Viewpoint.bDoOob && !di->Viewpoint.bDoOrtho && !sysCallbacks.PreBindTexture)
+	{
+		HWPreparedWallRun run;
+		for (auto& item : drawitems)
+		{
+			auto wall = walls[item.index];
+			if (wall->DrawPreparedWall(&dis, state, run)) continue;
+			state.EndRetainedWallRun();
+			if (run.Buffer)
+			{
+				state.SetVertexBuffer(screen->mVertexData);
+				run = {};
+			}
+			if (SceneProfiling) ++SceneMainSurfaceProfile.PreparedDrawFallbacks;
+			wall->DrawWall(&dis, state, translucent);
+		}
+		state.EndRetainedWallRun();
+		if (run.Buffer) state.SetVertexBuffer(screen->mVertexData);
+		RenderWall.Unclock();
+		return;
+	}
 	for (auto &item : drawitems)
 	{
 		walls[item.index]->DrawWall(&dis, state, translucent);

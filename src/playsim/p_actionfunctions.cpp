@@ -2022,6 +2022,7 @@ DEFINE_ACTION_FUNCTION(AActor, A_Respawn)
 	self->flags |= MF_SOLID;
 	self->Height = self->GetDefault()->Height;
 	self->radius = self->GetDefault()->radius;
+	self->UpdateBlockNodes();
 	self->RestoreSpecialPosition();
 
 	if (flags & RSF_TELEFRAG)

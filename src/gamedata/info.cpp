@@ -23,6 +23,7 @@
 **
 */
 
+#include "d_logiccensus.h"
 #include "actor.h"
 #include "c_dispatch.h"
 #include "d_main.h"
@@ -132,7 +133,7 @@ void FState::CheckCallerType(AActor *self, AActor *stateowner)
 
 	if (ActionFunc->ImplicitArgs >= 1)
 	{
-		auto argtypes = ActionFunc->Proto->ArgumentTypes;
+		const auto& argtypes = ActionFunc->Proto->ArgumentTypes;
 
 		CheckType(self, argtypes[0]);
 
@@ -147,6 +148,7 @@ TArray<VMValue> actionParams;
 
 bool FState::CallAction(AActor *self, AActor *stateowner, FStateParamInfo *info, FState **stateret)
 {
+	if (LogicCensusArmed) ++LogicCensus.CallActions;
 	if (ActionFunc != nullptr)
 	{
 		ActionCycles.Clock();
@@ -176,7 +178,7 @@ bool FState::CallAction(AActor *self, AActor *stateowner, FStateParamInfo *info,
 
 			if (ActionFunc->DefaultArgs.Size() > 0)
 			{
-				auto defs = ActionFunc->DefaultArgs;
+				const auto& defs = ActionFunc->DefaultArgs;
 				auto index = actionParams.Reserve(defs.Size());
 				for (unsigned i = 0; i < defs.Size(); i++)
 				{

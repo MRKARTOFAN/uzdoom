@@ -734,8 +734,8 @@ void F2DDrawer::AddPoly(FGameTexture *texture, FVector2 *points, int npoints,
 
 	bool dorotate = rotation != nullAngle;
 
-	float cosrot = (float)cos(rotation.Radians());
-	float sinrot = (float)sin(rotation.Radians());
+	float cosrot = dorotate ? (float)cos(rotation.Radians()) : 1.f;
+	float sinrot = dorotate ? (float)sin(rotation.Radians()) : 0.f;
 
 	float uscale = float(1.f / (texture->GetDisplayWidth() * scalex));
 	float vscale = float(1.f / (texture->GetDisplayHeight() * scaley));
@@ -761,9 +761,12 @@ void F2DDrawer::AddPoly(FGameTexture *texture, FVector2 *points, int npoints,
 	if (indices == nullptr || indexcount == 0)
 	{
 		poly.mIndexCount += (npoints - 2) * 3;
-		for (int i = 2; i < npoints; ++i)
+		int addr = mIndices.Reserve((npoints - 2) * 3);
+		for (int i = 2; i < npoints; ++i, addr += 3)
 		{
-			AddIndices(poly.mVertIndex, 3, 0, i - 1, i);
+			mIndices[addr] = poly.mVertIndex;
+			mIndices[addr + 1] = poly.mVertIndex + i - 1;
+			mIndices[addr + 2] = poly.mVertIndex + i;
 		}
 	}
 	else

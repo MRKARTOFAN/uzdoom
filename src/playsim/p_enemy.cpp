@@ -21,6 +21,8 @@
 ** that are associated with states/frames.
 */
 
+#include "dynarrayindex.h"
+#include "d_logiccensus.h"
 #include <stdlib.h>
 
 #include "a_ceiling.h"
@@ -30,6 +32,7 @@
 #include "doomdef.h"
 #include "g_game.h"
 #include "g_levellocals.h"
+#include "c_dispatch.h"
 #include "gi.h"
 #include "i_soundinternal.h"
 #include "m_random.h"
@@ -733,7 +736,10 @@ int P_SmartMove(AActor* actor)
 
 	under_damage = monster_avoid_hazards && P_IsUnderDamage(actor) != 0;//e6y
 
-	if (!P_Move(actor))
+	if (LogicCensusArmed) LogicCensusMoveBegin(actor);
+	const bool moved = P_Move(actor);
+	if (LogicCensusArmed) LogicCensusMoveEnd(actor, moved);
+	if (!moved)
 		return false;
 
 	// killough 9/9/98: avoid crushing ceilings or other damaging areas
@@ -1427,6 +1433,12 @@ DEFINE_ACTION_FUNCTION(AActor, LookForEnemiesEx)
 
 	if (targets == nullptr)
 		ThrowAbortException(X_WRITE_NIL,"No targets array passed");
+	struct FTargetsNote
+	{
+		TArray<AActor*> *Array;
+		const void *Old;
+		~FTargetsNote() { ArrayIndexNoteData(Old); ArrayIndexNoteData(Array->Data()); }
+	} targetsNote{ targets, targets->Data() };
 
 	if (range == -1)
 		range = self->friendlyseeblocks * FBlockmap::MAPBLOCKUNITS;
@@ -1679,13 +1691,64 @@ int P_LookForTID (AActor *actor, INTBOOL allaround, FLookExParams *params)
 //
 //============================================================================
 
+CVAR(Bool, r_look_friendlyfilter, true, 0)
+
+// [Karto] The dense mirror holds each block's actors in chain order, read from the end; 2 also walks the chain and
+// counts blocks whose order differs.
+CVAR(Int, p_look_dense, 1, 0)
+static uint64_t LookDenseBlocks, LookDenseMismatches;
+
+CCMD(look_dense_stats)
+{
+	Printf("LOOKDENSE blocks=%llu mismatches=%llu\n", (unsigned long long)LookDenseBlocks, (unsigned long long)LookDenseMismatches);
+}
+
+static void VerifyLookDense(const FBlockmap &bm, int index)
+{
+	const auto &entries = bm.blockarrays[index].Entries;
+	int i = int(entries.Size()) - 1;
+	bool same = true;
+	for (FBlockNode *block = bm.blocklinks[index]; block != nullptr; block = block->NextActor, --i)
+	{
+		while (i >= 0 && entries[i].Me == nullptr) --i;
+		if (i < 0 || entries[i].Me != block->Me) { same = false; break; }
+	}
+	while (same && i >= 0 && entries[i].Me == nullptr) --i;
+	++LookDenseBlocks;
+	if (!same || i >= 0) ++LookDenseMismatches;
+}
+
 AActor *LookForEnemiesInBlock (AActor *lookee, int index, void *extparam)
 {
 	FBlockNode *block;
 	FLookExParams *params = (FLookExParams *)extparam;
+	const bool friendlyOnly = r_look_friendlyfilter && !(lookee->flags & MF_FRIENDLY);
+	const auto &bm = lookee->Level->blockmap;
+
+	if (p_look_dense > 0 && bm.blockarrays != nullptr)
+	{
+		if (p_look_dense == 2) VerifyLookDense(bm, index);
+		// [Karto] ValidEnemyInBlock only reads (sight checks, RNG), so the block's links cannot change during the walk.
+		const auto &entries = bm.blockarrays[index].Entries;
+		for (int i = int(entries.Size()) - 1; i >= 0; --i)
+		{
+			AActor *other = entries[i].Me;
+			if (other == nullptr)
+				continue;
+			if (friendlyOnly && !(other->flags & MF_FRIENDLY))
+				continue;
+			if (!ValidEnemyInBlock(lookee, other, params))
+				continue;
+
+			return other;
+		}
+		return NULL;
+	}
 
 	for (block = lookee->Level->blockmap.blocklinks[index]; block != NULL; block = block->NextActor)
 	{
+		if (friendlyOnly && !(block->Me->flags & MF_FRIENDLY))
+			continue;
 		if (!ValidEnemyInBlock(lookee, block->Me, params))
 			continue;
 
@@ -1900,6 +1963,29 @@ int P_LookForPlayers (AActor *actor, INTBOOL allaround, FLookExParams *params)
 	}
 }
 
+// [Karto] A closet is a separate island, so sight outside always fails; closet monsters wait for a sound target, then only walk.
+static void A_ClosetLook(AActor* self)
+{
+	self->tics = 16;
+	if (self->ClosetFlags & CLOSET_CHASE)
+	{
+		if (self->target == nullptr || self->target->health <= 0)
+		{
+			if (!P_LookForPlayers(self, true, nullptr)) self->ClosetFlags &= ~CLOSET_CHASE;
+			return;
+		}
+		P_NewChaseDir(self);
+		return;
+	}
+	AActor* targ = (self->Level->i_compatflags & COMPATF_SOUNDTARGET || self->flags & MF_NOSECTOR) ?
+		self->Sector->SoundTarget : self->LastHeard;
+	if (targ == nullptr || targ->health <= 0 || !(targ->flags & MF_SHOOTABLE) || self->IsFriend(targ)) return;
+	if (targ->player && ((targ->player->cheats & CF_NOTARGET) || !(targ->flags & MF_FRIENDLY))) return;
+	if (self->flags & MF_AMBUSH) return;
+	self->target = targ;
+	self->ClosetFlags |= CLOSET_CHASE;
+}
+
 //
 // ACTION ROUTINES
 //
@@ -1917,6 +2003,12 @@ DEFINE_ACTION_FUNCTION(AActor, A_Look)
 
 	if (self->flags5 & MF5_INCONVERSATION)
 		return 0;
+
+	if (self->ClosetFlags)
+	{
+		A_ClosetLook(self);
+		return 0;
+	}
 
 	// [RH] Set goal now if appropriate
 	if (self->special == Thing_SetGoal && self->args[0] == 0)
@@ -2364,6 +2456,7 @@ nosee:
 
 void A_DoChase (AActor *actor, bool fastchase, FState *meleestate, FState *missilestate, bool playactive, bool nightmarefast, bool dontmove, int flags)
 {
+	FLogicChaseScope census;
 	if (actor->flags5 & MF5_INCONVERSATION)
 		return;
 
@@ -2845,6 +2938,7 @@ bool P_CheckForResurrection(AActor* self, bool usevilestates, FState* state = nu
 				bool check = P_CheckPosition(corpsehit, corpsehit->Pos().XY());
 				corpsehit->flags = oldflags;
 				corpsehit->radius = oldradius;
+				corpsehit->UpdateBlockNodes();
 				corpsehit->Height = oldheight;
 				if (!check || !P_CanResurrect(self, corpsehit)) continue;
 
@@ -2909,6 +3003,7 @@ bool P_CheckForResurrection(AActor* self, bool usevilestates, FState* state = nu
 				{
 					corpsehit->Height = info->Height;	// [RH] Use real mobj height
 					corpsehit->radius = info->radius;	// [RH] Use real radius
+					corpsehit->UpdateBlockNodes();
 				}
 
 				corpsehit->Revive();

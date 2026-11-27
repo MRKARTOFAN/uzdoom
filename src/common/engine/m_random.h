@@ -29,6 +29,7 @@
 #include <array>
 #include "basics.h"
 #include "tarray.h"
+#include "d_ticworkercheck.h"
 
 class FSerializer;
 
@@ -62,6 +63,7 @@ public:
 	}
 
 	uint32_t GenRand32() {
+		if (TicWorkerCheckArmed && !bClient && !TicWorkerThisThread) TicWorkerCheckNoteSlow(TWS_PlayRng);
 		// this is the PCG-XSH-RR RNG algorithm
 		uint64_t oldstate = s;
 		s = oldstate * 6364136223846793005ULL + 0xda3e39cb94b95bdbULL;
@@ -195,7 +197,7 @@ public:
 	}
 
 	double RandomFloat() {
-		return GenRand32() * ldexp(1, -32);
+		return GenRand32() * (1.0 / 4294967296.0);
 	}
 
 	double RandomFloat(double r0, double r1) {

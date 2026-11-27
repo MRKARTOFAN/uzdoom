@@ -38,6 +38,8 @@
 #include "doomstat.h"
 #include "p_local.h"
 #include "p_maputl.h"
+#include "c_dispatch.h"
+#include "printf.h"
 #include "p_3dmidtex.h"
 #include "p_blockmap.h"
 #include "r_utility.h"
@@ -47,6 +49,7 @@
 
 // State.
 #include "po_man.h"
+#include "d_logiccensus.h"
 #include "vm.h"
 
 int P_VanillaPointOnDivlineSide(double x, double y, const divline_t* line);
@@ -245,6 +248,71 @@ void P_LineOpening (FLineOpening &open, AActor *actor, const line_t *linedef, co
 
 //==========================================================================
 //
+// [Karto] The dense per-block mirror of the thing chains. Every chain writer calls one of these after its own change, so a
+// block's live entries read from the last index down are its chain head first.
+//
+//==========================================================================
+
+extern uint64_t ThingLinkChanges;
+CVAR(Bool, p_blockdense, true, 0)
+CVAR(Int, p_blockdense_compact, 4, 0)
+uint64_t BlockLinkGeneration;
+
+void FBlockmap::MirrorAdd(FBlockNode *node)
+{
+	FBlockArray &a = blockarrays[node->BlockIndex];
+	++BlockLinkGeneration;
+	if (a.Dead >= 8 && a.Dead * unsigned(max(1, *p_blockdense_compact)) > a.Entries.Size())
+	{
+		unsigned live = 0;
+		for (unsigned i = 0; i < a.Entries.Size(); ++i)
+		{
+			if (a.Entries[i].Node == nullptr) continue;
+			a.Entries[live] = a.Entries[i];
+			a.Entries[live].Node->Slot = live;
+			++live;
+		}
+		a.Entries.Resize(live);
+		a.Dead = 0;
+	}
+	node->Slot = a.Entries.Size();
+	a.Entries.Push({ node->Me, node, node->X, node->Y, node->Radius, node->FirstBlock, node->Spans });
+}
+
+void FBlockmap::MirrorRemove(FBlockNode *node)
+{
+	FBlockArray &a = blockarrays[node->BlockIndex];
+	++BlockLinkGeneration;
+	a.Entries[node->Slot].Me = nullptr;
+	a.Entries[node->Slot].Node = nullptr;
+	++a.Dead;
+}
+
+void FBlockmap::MirrorUpdate(FBlockNode *node)
+{
+	FBlockEntry &e = blockarrays[node->BlockIndex].Entries[node->Slot];
+	e.X = node->X;
+	e.Y = node->Y;
+	e.Radius = node->Radius;
+}
+
+void FBlockmap::MirrorRebuild(int index)
+{
+	FBlockArray &a = blockarrays[index];
+	++BlockLinkGeneration;
+	unsigned count = 0;
+	for (FBlockNode *node = blocklinks[index]; node != nullptr; node = node->NextActor) ++count;
+	a.Entries.Resize(count);
+	a.Dead = 0;
+	for (FBlockNode *node = blocklinks[index]; node != nullptr; node = node->NextActor)
+	{
+		node->Slot = --count;
+		a.Entries[count] = { node->Me, node, node->X, node->Y, node->Radius, node->FirstBlock, node->Spans };
+	}
+}
+
+//==========================================================================
+//
 // P_UnsetThingPosition
 // Unlinks a thing from block map and sectors.
 // On each position change, BLOCKMAP and other
@@ -300,6 +368,7 @@ void AActor::UnlinkFromWorld (FLinkContext *ctx)
 	{
 		// [RH] Unlink from all blocks this actor uses
 		FBlockNode *block = this->BlockNode;
+		++ThingLinkChanges;
 
 		while (block != NULL)
 		{
@@ -309,7 +378,12 @@ void AActor::UnlinkFromWorld (FLinkContext *ctx)
 			}
 			*(block->PrevActor) = block->NextActor;
 			FBlockNode *next = block->NextBlock;
+			if (Level->blockmap.blockarrays != nullptr)
+			{
+				Level->blockmap.MirrorRemove(block);
+			}
 			block->Release ();
+			if (LogicCensusArmed) ++LogicCensus.NodesUnlinked;
 			block = next;
 		}
 		BlockNode = NULL;
@@ -409,6 +483,8 @@ bool AActor::FixMapthingPos()
 //
 //==========================================================================
 
+EXTERN_CVAR(Bool, p_compactcheck)
+
 void AActor::LinkToWorld(FLinkContext *ctx, bool spawningmapthing, sector_t *sector)
 {
 	bool spawning = spawningmapthing;
@@ -480,6 +556,7 @@ void AActor::LinkToWorld(FLinkContext *ctx, bool spawningmapthing, sector_t *sec
 	// link into blockmap (inert things don't need to be in the blockmap)
 	if (!(flags & MF_NOBLOCKMAP) && !clientside)
 	{
+		++ThingLinkChanges;
 		FPortalGroupArray check;
 
 		Level->CollectConnectedGroups(Sector->PortalGroup, Pos(), Top(), radius, check);
@@ -510,6 +587,9 @@ void AActor::LinkToWorld(FLinkContext *ctx, bool spawningmapthing, sector_t *sec
 					{
 						FBlockNode **link = &Level->blockmap.blocklinks[y*Level->blockmap.bmapwidth + x];
 						FBlockNode *node = FBlockNode::Create(this, x, y, this->Sector->PortalGroup);
+						node->FirstBlock = x1 + y1 * Level->blockmap.bmapwidth;
+						node->Spans = x1 != x2 || y1 != y2 || check.Size() != 0;
+						if (LogicCensusArmed) ++LogicCensus.NodesLinked;
 
 						// Link in to block
 						if ((node->NextActor = *link) != NULL)
@@ -524,6 +604,10 @@ void AActor::LinkToWorld(FLinkContext *ctx, bool spawningmapthing, sector_t *sec
 						node->NextBlock = NULL;
 						(*alink) = node;
 						alink = &node->NextBlock;
+						if (Level->blockmap.blockarrays != nullptr)
+						{
+							Level->blockmap.MirrorAdd(node);
+						}
 					}
 				}
 			}
@@ -531,6 +615,21 @@ void AActor::LinkToWorld(FLinkContext *ctx, bool spawningmapthing, sector_t *sec
 	}
 	// Portal links cannot be done unless the level is fully initialized.
 	if (!spawningmapthing) UpdateRenderSectorList();
+}
+
+uint64_t ThingLinkChanges;
+
+void AActor::UpdateBlockNodes()
+{
+	++ThingLinkChanges;
+	for (FBlockNode *node = BlockNode; node != nullptr; node = node->NextBlock)
+	{
+		node->X = X();
+		node->Y = Y();
+		node->Radius = radius;
+		if (Level->blockmap.blockarrays != nullptr) Level->blockmap.MirrorUpdate(node);
+		if (LogicCensusArmed) ++LogicCensus.NodeUpdates;
+	}
 }
 
 void AActor::SetOrigin(double x, double y, double z, bool moving)
@@ -680,6 +779,45 @@ line_t *FBlockLinesIterator::Next()
 		}
 		StartBlock(curx, cury);
 	}
+}
+
+//===========================================================================
+//
+// [Karto] A line walk over a box whose blocks hold no line and no polyobject link has one effect, the validcount bump of its
+// start, which callers keep; the lists are the level's lump, fixed in play.
+//
+//===========================================================================
+
+CVAR(Bool, p_linefreeskip, true, 0)
+CVAR(Bool, p_linefreeskip_verify, false, 0)
+uint64_t LineFreeStats[5];	// position checks skipped, walked; sector lists skipped, walked; verify lines found
+
+bool P_BoxBlocksLineFree(FLevelLocals *Level, const FBoundingBox &box)
+{
+	auto &bmap = Level->blockmap;
+	const int maxy = bmap.GetBlockY(box.Top());
+	const int miny = bmap.GetBlockY(box.Bottom());
+	const int maxx = bmap.GetBlockX(box.Right());
+	const int minx = bmap.GetBlockX(box.Left());
+	for (int y = miny; y <= maxy; y++)
+	{
+		for (int x = minx; x <= maxx; x++)
+		{
+			if (!bmap.isValidBlock(x, y)) continue;
+			const unsigned offset = y * bmap.bmapwidth + x;
+			if (Level->PolyBlockMap.Size() > offset && Level->PolyBlockMap[offset] != nullptr) return false;
+			if (*bmap.GetLines(x, y) != -1) return false;
+		}
+	}
+	return true;
+}
+
+CCMD(linefree_stats)
+{
+	Printf("LINEFREE skip=%d verify=%d position_skipped=%llu position_walked=%llu seclist_skipped=%llu seclist_walked=%llu verify_lines=%llu\n",
+		int(p_linefreeskip), int(p_linefreeskip_verify), (unsigned long long)LineFreeStats[0], (unsigned long long)LineFreeStats[1],
+		(unsigned long long)LineFreeStats[2], (unsigned long long)LineFreeStats[3], (unsigned long long)LineFreeStats[4]);
+	if (argv.argc() > 1) memset(LineFreeStats, 0, sizeof(LineFreeStats));
 }
 
 //===========================================================================
@@ -861,10 +999,13 @@ void FMultiBlockLinesIterator::Reset()
 //
 //===========================================================================
 
+CVAR(Bool, p_blockgeodedupe, true, 0)
+
 FBlockThingsIterator::FBlockThingsIterator(FLevelLocals *l)
 : DynHash()
 {
 	Level = l;
+	Geo = false;
 	minx = maxx = 0;
 	miny = maxy = 0;
 	ClearHash();
@@ -879,6 +1020,7 @@ FBlockThingsIterator::FBlockThingsIterator(FLevelLocals *l, int _minx, int _miny
 	maxx = _maxx;
 	miny = _miny;
 	maxy = _maxy;
+	Geo = p_blockgeodedupe && Level->Displacements.size <= 1;
 	ClearHash();
 	Reset();
 }
@@ -890,6 +1032,7 @@ void FBlockThingsIterator::init(const FBoundingBox &box, bool clearhash)
 	maxx = Level->blockmap.GetBlockX(box.Right());
 	minx = Level->blockmap.GetBlockX(box.Left());
 	if (clearhash) ClearHash();
+	Geo = p_blockgeodedupe && Level->Displacements.size <= 1 && NumFixedHash == 0 && DynHash.Size() == 0;
 	Reset();
 }
 
@@ -916,9 +1059,19 @@ void FBlockThingsIterator::StartBlock(int x, int y)
 {
 	curx = x;
 	cury = y;
+	if (LogicCensusArmed) ++LogicCensus.BlockStarts;
+	DenseArr = nullptr;
 	if (Level->blockmap.isValidBlock(x, y))
 	{
 		block = Level->blockmap.blocklinks[y*Level->blockmap.bmapwidth + x];
+		if (UseDense && Geo && Level->blockmap.blockarrays != nullptr)
+		{
+			DenseArr = &Level->blockmap.blockarrays[y*Level->blockmap.bmapwidth + x];
+			DenseIdx = int(DenseArr->Entries.Size()) - 1;
+			DenseGen = BlockLinkGeneration;
+			SavedNext = block;
+			block = nullptr;
+		}
 	}
 	else
 	{
@@ -935,6 +1088,7 @@ void FBlockThingsIterator::StartBlock(int x, int y)
 
 void FBlockThingsIterator::SwitchBlock(int x, int y)
 {
+	Geo = false;
 	minx = maxx = x;
 	miny = maxy = y;
 	StartBlock(x, y);
@@ -950,6 +1104,36 @@ AActor *FBlockThingsIterator::Next(bool centeronly)
 {
 	for (;;)
 	{
+		if (DenseArr != nullptr)
+		{
+			if (BlockLinkGeneration != DenseGen)
+			{
+				// [Karto] A callback changed a chain: finish this block on the saved node, as the old iterator did (stale next pointers included).
+				block = SavedNext;
+				DenseArr = nullptr;
+			}
+			else
+			{
+				const FBlockEntry *entries = DenseArr->Entries.Data();
+				const int w = Level->blockmap.bmapwidth;
+				for (int i = DenseIdx; i >= 0; --i)
+				{
+					const FBlockEntry &e = entries[i];
+					if (e.Node == nullptr) continue;
+					if (e.Spans && !(curx == max(minx, e.FirstBlock % w) && cury == max(miny, e.FirstBlock / w))) continue;
+					if (Near && Far(e.X, e.Y, e.Radius)) continue;
+					int j = i - 1;
+					while (j >= 0 && entries[j].Node == nullptr) --j;
+					DenseIdx = j;
+					SavedNext = j >= 0 ? entries[j].Node : nullptr;
+					LastNode = e.Node;
+					if (LogicCensusArmed) ++LogicCensus.BlockReturns;
+					return e.Me;
+				}
+				DenseArr = nullptr;
+				block = nullptr;
+			}
+		}
 		while (block != NULL)
 		{
 			PrefetchL3(block->NextActor);
@@ -960,10 +1144,16 @@ AActor *FBlockThingsIterator::Next(bool centeronly)
 
 			block = block->NextActor;
 			// Don't recheck things that were already checked
+			LastNode = mynode;
+			const bool census = LogicCensusArmed;
+			if (census) ++LogicCensus.BlockNodeVisits;
 			if (mynode->NextBlock == NULL && mynode->PrevBlock == &me->BlockNode)
 			{ // This actor doesn't span blocks, so we know it can only ever be checked once.
+				if (Near && Far(mynode->X, mynode->Y, mynode->Radius)) continue;
+				if (census) ++LogicCensus.BlockReturns;
 				return me;
 			}
+			if (census) ++LogicCensus.BlockSpanVisits;
 			if (centeronly)
 			{
 				// Block boundaries for compatibility mode
@@ -976,6 +1166,16 @@ AActor *FBlockThingsIterator::Next(bool centeronly)
 				if (me->X() >= blockleft && me->X() < blockright &&
 					me->Y() >= blockbottom && me->Y() < blocktop)
 				{
+					return me;
+				}
+			}
+			else if (Geo)
+			{
+				const int w = Level->blockmap.bmapwidth;
+				if (curx == max(minx, mynode->FirstBlock % w) && cury == max(miny, mynode->FirstBlock / w))
+				{
+					if (Near && Far(mynode->X, mynode->Y, mynode->Radius)) continue;
+					if (census) ++LogicCensus.BlockReturns;
 					return me;
 				}
 			}
@@ -1011,6 +1211,7 @@ AActor *FBlockThingsIterator::Next(bool centeronly)
 						Buckets[hash] = i + countof(FixedHash);
 					}
 					entry->Actor = me;
+					if (census) ++LogicCensus.BlockReturns;
 					return me;
 				}
 			}
@@ -1070,8 +1271,10 @@ bool FMultiBlockThingsIterator::Next(FMultiBlockThingsIterator::CheckResult *ite
 	if (thing != NULL)
 	{
 		item->thing = thing;
-		item->Position = checkpoint + blockIterator.Level->Displacements.getOffset(basegroup, thing->Sector->PortalGroup);
+		const auto& displacements = blockIterator.Level->Displacements;
+		item->Position = (displacements.size > 1 || !p_compactcheck) ? checkpoint + displacements.getOffset(basegroup, thing->Sector->PortalGroup) : checkpoint;
 		item->portalflags = portalflags;
+		item->node = blockIterator.LastNode;
 		return true;
 	}
 	bool onlast = unsigned(index + 1) >= checklist.Size();
@@ -1121,6 +1324,19 @@ void FMultiBlockThingsIterator::startIteratorForGroup(int group)
 // Resets the iterator
 //
 //===========================================================================
+
+bool FMultiBlockThingsIterator::UseNear(double radius, bool dense)
+{
+	auto& bi = blockIterator;
+	if (!bi.Geo || !p_compactcheck || bi.Level->Displacements.size > 1) return false;
+	bi.Near = true;
+	bi.NearX = checkpoint.X;
+	bi.NearY = checkpoint.Y;
+	bi.NearRadius = radius;
+	bi.UseDense = dense;
+	Reset();
+	return true;
+}
 
 void FMultiBlockThingsIterator::Reset()
 {

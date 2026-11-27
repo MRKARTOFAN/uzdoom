@@ -34,7 +34,12 @@
 #include "m_round.h"
 
 #include "g_levellocals.h"
+#include "c_cvars.h"
+#include "c_dispatch.h"
 #include "actorinlines.h"
+#include <algorithm>
+#include <unordered_map>
+#include <vector>
 
 static FRandom pr_botchecksight ("BotCheckSight");
 static FRandom pr_checksight ("CheckSight");
@@ -87,6 +92,102 @@ struct SightTask
 
 
 static TArray<intercept_t> intercepts (128);
+
+// [Karto] Same arithmetic as the line path, so results are bit-identical; polyobject lines keep the live path.
+struct alignas(64) FSightBlockLine
+{
+	double x1, y1, x2, y2, dx, dy;
+	uint32_t Line;
+	bool Moving;
+};
+
+struct FSightBlockRange
+{
+	uint32_t Start, Count;
+};
+
+static struct
+{
+	FLevelLocals* Level = nullptr;
+	const line_t* Lines = nullptr;
+	const int* Blockmap = nullptr;
+	unsigned Count = 0;
+	std::vector<FSightBlockRange> Blocks;		// per block, its list's records
+	std::vector<FSightBlockLine> BlockLines;
+	std::vector<uint32_t> Stamps;				// per line
+	uint32_t Stamp = 0;
+	// [Karto] Without 3D floors and portals the result does not depend on crossing order (each crossing only lowers the top
+	// slope, raises the bottom or closes the opening), so crossings are evaluated as found; otherwise they are sorted first.
+	bool OrderFree = false;
+	std::vector<uint8_t> Empty;
+	bool NoPolyobjects = false;
+} SightLines;
+
+CVAR(Bool, p_sight_emptyskip, true, 0)
+
+CVAR(Bool, p_sight_compact, true, 0)
+
+CVAR(Int, p_sight_islands, 0, 0)
+EXTERN_CVAR(Int, p_sight_sealed)
+bool P_SightSealed(FLevelLocals* level, const subsector_t* a, const subsector_t* b);
+static uint64_t IslandStats[3];	// checks reaching the traversal, island rejects, rejects the traversal contradicted
+
+static void PrepareSightLines(FLevelLocals* level)
+{
+	auto& cache = SightLines;
+	if (cache.Level == level && cache.Lines == level->lines.Data() && cache.Count == level->lines.Size() &&
+		cache.Blockmap == level->blockmap.blockmap) return;
+	cache.Level = level;
+	cache.Lines = level->lines.Data();
+	cache.Count = level->lines.Size();
+	cache.Blockmap = level->blockmap.blockmap;
+	cache.Stamps.assign(cache.Count, 0);
+	cache.Stamp = 0;
+	cache.OrderFree = level->linePortals.Size() == 0;
+	for (auto& sector : level->sectors)
+	{
+		// [Karto] A linked plane counts even while disabled: specials can enable it during play.
+		if (sector.e->XFloor.ffloors.Size() || (sector.planes[sector_t::floor].Flags & PLANEF_LINKED) ||
+			(sector.planes[sector_t::ceiling].Flags & PLANEF_LINKED)) cache.OrderFree = false;
+	}
+	cache.BlockLines.clear();
+	const auto& bmap = level->blockmap;
+	const int blocks = bmap.bmapwidth * bmap.bmapheight;
+	cache.Blocks.assign(size_t(std::max(blocks, 0)), { 0, 0 });
+	std::unordered_map<int, FSightBlockRange> lists;
+	for (int block = 0; block < blocks; ++block)
+	{
+		const int listOffset = bmap.blockmap[block];
+		auto found = lists.find(listOffset);
+		if (found != lists.end())
+		{
+			cache.Blocks[block] = found->second;
+			continue;
+		}
+		FSightBlockRange range = { uint32_t(cache.BlockLines.size()), 0 };
+		for (const int* list = bmap.blockmaplump + listOffset + 1; *list != -1; ++list)
+		{
+			if (unsigned(*list) >= cache.Count) continue;
+			const line_t& line = level->lines[*list];
+			const DVector2 delta = line.Delta();
+			bool moving = false;
+			for (auto side : line.sidedef) moving |= side != nullptr && (side->Flags & WALLF_POLYOBJ);
+			cache.BlockLines.push_back({ line.v1->fX(), line.v1->fY(), line.v2->fX(), line.v2->fY(), delta.X, delta.Y, uint32_t(*list), moving });
+			++range.Count;
+		}
+		lists.emplace(listOffset, range);
+		cache.Blocks[block] = range;
+	}
+	cache.Empty.assign(size_t(std::max(blocks, 0)), 0);
+	for (int block = 0; block < blocks; ++block)
+	{
+		const int x = block % bmap.bmapwidth, y = block / bmap.bmapwidth;
+		cache.Empty[block] = cache.Blocks[block].Count == 0 && !level->PortalBlockmap(x, y).containsLinkedPortals;
+	}
+	cache.NoPolyobjects = level->Polyobjects.Size() == 0;
+}
+
+static std::vector<unsigned> SightOrder;
 static TArray<SightTask> portals(32);
 
 class SightCheck
@@ -111,6 +212,8 @@ class SightCheck
 	void P_SightOpening(SightOpening &open, const line_t *linedef, double x, double y);
 	bool PTR_SightTraverse (intercept_t *in);
 	bool P_SightCheckLine (line_t *ld);
+	bool P_SightCheckRecord (const FSightBlockLine& record);
+	bool P_SightCrossedLine (line_t *ld, const divline_t& dl);
 	int P_SightBlockLinesIterator (int x, int y);
 	bool P_SightTraverseIntercepts ();
 	bool LineBlocksSight(line_t *ld);
@@ -433,11 +536,12 @@ bool SightCheck::P_SightCheckLine (line_t *ld)
 {
 	divline_t dl;
 
-	if (ld->validcount == validcount)
+	uint32_t& stamp = SightLines.Stamps[unsigned(ld->Index())];
+	if (stamp == SightLines.Stamp)
 	{
 		return true;
 	}
-	ld->validcount = validcount;
+	stamp = SightLines.Stamp;
 	if (P_PointOnDivlineSide (ld->v1->fPos(), &Trace) ==
 		P_PointOnDivlineSide (ld->v2->fPos(), &Trace))
 	{
@@ -449,7 +553,29 @@ bool SightCheck::P_SightCheckLine (line_t *ld)
 	{
 		return true;		// line isn't crossed
 	}
+	return P_SightCrossedLine (ld, dl);
+}
 
+bool SightCheck::P_SightCheckRecord (const FSightBlockLine& record)
+{
+	const divline_t dl = { record.x1, record.y1, record.dx, record.dy };
+	const bool crossesTrace = P_PointOnDivlineSide (record.x1, record.y1, &Trace) != P_PointOnDivlineSide (record.x2, record.y2, &Trace);
+	const bool traceCrosses = P_PointOnDivlineSide (Trace.x, Trace.y, &dl) != P_PointOnDivlineSide (Trace.x+Trace.dx, Trace.y+Trace.dy, &dl);
+	if (!(crossesTrace & traceCrosses))
+	{
+		return true;		// line isn't crossed
+	}
+	uint32_t& stamp = SightLines.Stamps[record.Line];
+	if (stamp == SightLines.Stamp)
+	{
+		return true;
+	}
+	stamp = SightLines.Stamp;
+	return P_SightCrossedLine (&Level->lines[record.Line], dl);
+}
+
+bool SightCheck::P_SightCrossedLine (line_t *ld, const divline_t& dl)
+{
 	if (!portalfound)	// when portals come into play, the quick-outs here may not be performed
 	{
 		if (LineBlocksSight(ld)) return false;
@@ -460,6 +586,12 @@ bool SightCheck::P_SightCheckLine (line_t *ld)
 	intercept_t newintercept;
 	newintercept.isaline = true;
 	newintercept.d.line = ld;
+	newintercept.frac = P_InterceptVector (&Trace, &dl);
+	if (p_sight_compact && SightLines.OrderFree)
+	{
+		if (newintercept.frac < Startfrac) return true;
+		return PTR_SightTraverse (&newintercept);
+	}
 	intercepts.Push (newintercept);
 
 	return true;
@@ -476,7 +608,6 @@ bool SightCheck::P_SightCheckLine (line_t *ld)
 int SightCheck::P_SightBlockLinesIterator (int x, int y)
 {
 	int offset;
-	int *list;
 	int res = 1;
 
 	polyblock_t *polyLink;
@@ -510,9 +641,24 @@ int SightCheck::P_SightBlockLinesIterator (int x, int y)
 		polyLink = polyLink->next;
 	}
 
-	for (list = Level->blockmap.GetLines(x, y); *list != -1; list++)
+	if (!p_sight_compact)
 	{
-		if (!P_SightCheckLine (&Level->lines[*list]))
+		for (int *list = Level->blockmap.GetLines(x, y); *list != -1; list++)
+		{
+			if (!P_SightCheckLine (&Level->lines[*list]))
+			{
+				if (!portalfound) return 0;
+				else res = -1;
+			}
+		}
+		return res;
+	}
+
+	const FSightBlockRange range = SightLines.Blocks[offset];
+	for (uint32_t index = range.Start; index < range.Start + range.Count; index++)
+	{
+		const FSightBlockLine& record = SightLines.BlockLines[index];
+		if (!(record.Moving ? P_SightCheckLine (&Level->lines[record.Line]) : P_SightCheckRecord (record)))
 		{
 			if (!portalfound) return 0;
 			else res = -1;
@@ -533,53 +679,72 @@ int SightCheck::P_SightBlockLinesIterator (int x, int y)
 
 bool SightCheck::P_SightTraverseIntercepts ()
 {
-	unsigned count;
-	double dist;
-	intercept_t *scan, *in;
-	unsigned scanpos;
-	divline_t dl;
-
-	count = intercepts.Size ();
-//
-// calculate intercept distance
-//
-	for (scanpos = 0; scanpos < intercepts.Size (); scanpos++)
-	{
-		scan = &intercepts[scanpos];
-		P_MakeDivline (scan->d.line, &dl);
-		scan->frac = P_InterceptVector (&Trace, &dl);
-		if (scan->frac < Startfrac)
-		{
-			scan->frac = INT_MAX;
-			count--;
-		}
-	}
+	intercept_t *in;
 
 //
 // go through in order
 // proper order is needed to handle 3D floors and portals.
 //
-	in = NULL;
-
-	while (count--)
+	if (!p_sight_compact)
 	{
-		dist = INT_MAX;
-		for (scanpos = 0; scanpos < intercepts.Size (); scanpos++)
+		unsigned count = intercepts.Size ();
+		for (unsigned scanpos = 0; scanpos < intercepts.Size (); scanpos++)
 		{
-			scan = &intercepts[scanpos];
-			if (scan->frac < dist)
+			intercept_t *scan = &intercepts[scanpos];
+			divline_t dl;
+			P_MakeDivline (scan->d.line, &dl);
+			scan->frac = P_InterceptVector (&Trace, &dl);
+			if (scan->frac < Startfrac)
 			{
-				dist = scan->frac;
-				in = scan;
+				scan->frac = INT_MAX;
+				count--;
 			}
 		}
-
-		if (in != NULL)
+		in = NULL;
+		while (count--)
 		{
-			if (!PTR_SightTraverse (in))
-				return false;					// don't bother going farther
-			in->frac = INT_MAX;
+			double dist = INT_MAX;
+			for (unsigned scanpos = 0; scanpos < intercepts.Size (); scanpos++)
+			{
+				intercept_t *scan = &intercepts[scanpos];
+				if (scan->frac < dist)
+				{
+					dist = scan->frac;
+					in = scan;
+				}
+			}
+			if (in != NULL)
+			{
+				if (!PTR_SightTraverse (in))
+					return false;
+				in->frac = INT_MAX;
+			}
 		}
+	}
+	else
+	{
+	// [Karto] Visited in selection order (smallest fraction first, ties in collection order); a stable insertion sort allocates nothing.
+	SightOrder.clear();
+	for (unsigned scanpos = 0; scanpos < intercepts.Size (); scanpos++)
+	{
+		if (intercepts[scanpos].frac < Startfrac) continue;
+		const double frac = intercepts[scanpos].frac;
+		size_t at = SightOrder.size();
+		SightOrder.push_back(scanpos);
+		while (at > 0 && intercepts[SightOrder[at - 1]].frac > frac)
+		{
+			SightOrder[at] = SightOrder[at - 1];
+			--at;
+		}
+		SightOrder[at] = scanpos;
+	}
+	for (unsigned index : SightOrder)
+	{
+		in = &intercepts[index];
+		if (!PTR_SightTraverse (in))
+			return false;					// don't bother going farther
+		in->frac = INT_MAX;
+	}
 	}
 
 	if (lastsector == seeingthing->Sector && lastsector->e->XFloor.ffloors.Size())
@@ -627,6 +792,12 @@ bool SightCheck::P_SightPathTraverse ()
 	int count;
 
 	validcount++;
+	PrepareSightLines(Level);
+	if (++SightLines.Stamp == 0)
+	{
+		std::fill(SightLines.Stamps.begin(), SightLines.Stamps.end(), 0u);
+		SightLines.Stamp = 1;
+	}
 	intercepts.Clear ();
 	x1 = sightstart.X + Startfrac * Trace.dx;
 	y1 = sightstart.Y + Startfrac * Trace.dy;
@@ -748,6 +919,7 @@ bool SightCheck::P_SightPathTraverse ()
 // Count is present to prevent a round off error from skipping the break
 
 	int itres = -1;
+	const bool emptySkip = p_sight_emptyskip && p_sight_compact && SightLines.Empty.size() == size_t(Level->blockmap.bmapwidth * Level->blockmap.bmapheight);
 	for (count = 0 ; count < 1000 ; count++)
 	{
 		// end traversing when reaching the end of the blockmap
@@ -756,7 +928,9 @@ bool SightCheck::P_SightPathTraverse ()
 		{
 			break;
 		}
-		itres = P_SightBlockLinesIterator(mapx, mapy);
+		const int block = mapy * Level->blockmap.bmapwidth + mapx;
+		if (emptySkip && SightLines.Empty[block] && (SightLines.NoPolyobjects || Level->PolyBlockMap[block] == nullptr)) itres = 1;
+		else itres = P_SightBlockLinesIterator(mapx, mapy);
 		if (itres == 0)
 		{
 			sightcounts[1]++;
@@ -842,6 +1016,7 @@ int P_CheckSight (AActor *t1, AActor *t2, int flags)
 	SightCycles.Clock();
 
 	bool res;
+	bool islandReject = false;
 
 	if (t1 == nullptr || t2 == nullptr)
 	{
@@ -911,6 +1086,32 @@ sightcounts[0]++;
 		}
 	}
 
+	// [Karto] After the stealth roll so pr_checksight is consumed exactly as before.
+	if (p_sight_islands && t1->Level->SightIslands && t1->subsector && t2->subsector)
+	{
+		IslandStats[0]++;
+		islandReject = t1->subsector->island != t2->subsector->island;
+		if (islandReject)
+		{
+			IslandStats[1]++;
+			if (p_sight_islands == 1)
+			{
+				res = false;
+				goto done;
+			}
+		}
+	}
+
+	// [Karto] Same place as the island test, after every roll, so no random number is skipped.
+	if (p_sight_sealed && t1->subsector && t2->subsector && P_SightSealed(t1->Level, t1->subsector, t2->subsector))
+	{
+		if (p_sight_sealed == 1)
+		{
+			res = false;
+			goto done;
+		}
+	}
+
 	// An unobstructed LOS is possible.
 	// Now look from eyes of t1 to any part of t2.
 
@@ -944,6 +1145,7 @@ sightcounts[0]++;
 			}
 		}
 	}
+	if (islandReject && res) IslandStats[2]++;
 
 done:
 	SightCycles.Unclock();
@@ -959,10 +1161,18 @@ ADD_STAT (sight)
 	return out;
 }
 
+CCMD(sight_islandstats)
+{
+	Printf("island sight: %llu checks, %llu island rejects, %llu contradicted by the traversal\n",
+		(unsigned long long)IslandStats[0], (unsigned long long)IslandStats[1], (unsigned long long)IslandStats[2]);
+	if (argv.argc() > 1) memset(IslandStats, 0, sizeof(IslandStats));
+}
+
 void P_ResetSightCounters (bool full)
 {
 	if (full)
 	{
+		SightLines.Level = nullptr;
 		MaxSightCycles.Reset();
 	}
 	if (SightCycles.Time() > MaxSightCycles.Time())

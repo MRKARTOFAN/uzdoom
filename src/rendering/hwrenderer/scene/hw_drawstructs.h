@@ -31,9 +31,15 @@ struct HWHorizonInfo;
 struct HWSkyInfo;
 struct F3DFloor;
 class FMaterial;
+class IVertexBuffer;
 struct FTexCoordInfo;
 struct FSectorPortalGroup;
 struct FFlatVertex;
+struct HWPreparedWall;
+struct HWDrawInfo;
+void BeginRetainedWorldView(FLevelLocals* level);
+bool CanOwnOpaqueWalls(HWDrawInfo* di);
+void ClearRetainedWorld();
 struct FLinePortalSpan;
 struct FDynLightData;
 class VSMatrix;
@@ -133,9 +139,45 @@ class HWWall;
 
 struct HWWallDispatcher;
 
+struct HWPreparedWallRun
+{
+	FGameTexture* Texture = nullptr;
+	IVertexBuffer* Buffer = nullptr;
+	int ClampMode = -1;
+};
+
+struct HWRetainedSectorAppearance
+{
+	FColormap Colormap;
+	int WallLight;
+	int PlaneLight[2];
+	HWSectorPlane Planes[2];
+	float TopGlow[4];
+	float BottomGlow[4];
+	bool Glowing;
+};
+
+bool RetainedWorldShadersCompatible();
+const HWRetainedSectorAppearance* QueryRetainedSectorAppearance(sector_t* sector, int plane = -1);
+bool ApplyRetainedWorldLighting(HWDrawInfo* di, FRenderState& state, unsigned& slot,
+	int light, int relativeLight, const FColormap& colormap, float alpha, bool additive, bool fogFirst,
+	HWPreparedWall* owned = nullptr, uint64_t ownerVersion = 0);
+bool ApplyRetainedSectorLighting(HWDrawInfo* di, FRenderState& state, sector_t* sector, int plane,
+	int light, int relativeLight, const FColormap& colormap, float alpha);
+
+struct FGpuPersistentWall;
+
 class HWWall
 {
 public:
+	HWPreparedWall* Prepared = nullptr;
+	FGpuPersistentWall* GpuOwnerCandidate = nullptr;
+	uint64_t GpuResidentEpoch = 0;
+	uint32_t GpuResidentRow = UINT32_MAX;
+	uint32_t GpuAppearanceId = UINT32_MAX;
+	uint64_t GpuAppearanceRevision = 0;
+	int32_t GpuOwnerSlot = -1;
+	uint32_t GpuBakeRow = UINT32_MAX;
 	static const char passflag[];
 
 	enum
@@ -157,6 +199,7 @@ public:
 		RWF_TEXTURED = 1,	// actually not being used anymore because with buffers it's even less efficient not writing the texture coordinates - but leave it here
 		RWF_NOSPLIT = 4,
 		RWF_NORENDER = 8,
+		RWF_BATCH = 16,
 	};
 
 	enum
@@ -213,6 +256,14 @@ public:
 		};
 	};
 
+	sector_t* skysector = nullptr;
+	int skyplane = -1, skyportalplane = -1;
+
+	int HeightTop = -1, HeightBottom = -1, HeightAnchor = -1;
+	float HeightVScale = 0.f;
+	bool HeightArmed = false, HeightValid = false;
+	bool HeightKnown = false;
+
 
 
 	// these are not the same as ytop and ybottom!!!
@@ -239,9 +290,15 @@ public:
 	void SetupLights(HWDrawInfo* di, FDynLightData& lightdata);
 
 	void MakeVertices(bool nosplit);
+	void PrepareWall(HWWallDispatcher* di, seg_t* seg, sector_t* frontsector, sector_t* backsector, bool isculled);
+	bool CanCacheVertices(bool allowGenerated = false) const;
+	bool CanGpuDriveWall(bool allowGenerated = false) const;
+	bool CanDrawPersistentWall(unsigned* rejected = nullptr) const;
+	bool DrawPreparedWall(HWWallDispatcher* di, FRenderState& state, HWPreparedWallRun& run, uint64_t ownerVersion = 0);
 
 	void SkyPlane(HWWallDispatcher* di, sector_t* sector, int plane, bool allowmirror);
 	void SkyLine(HWWallDispatcher* di, sector_t* sec, line_t* line);
+	void ReplaySky(HWWallDispatcher* di);
 	void SkyNormal(HWWallDispatcher* di, sector_t* fs, vertex_t* v1, vertex_t* v2);
 	void SkyTop(HWWallDispatcher* di, seg_t* seg, sector_t* fs, sector_t* bs, vertex_t* v1, vertex_t* v2);
 	void SkyBottom(HWWallDispatcher* di, seg_t* seg, sector_t* fs, sector_t* bs, vertex_t* v1, vertex_t* v2);
@@ -292,10 +349,10 @@ public:
 
 	int CountVertices();
 
-	void RenderWall(FRenderState& state, int textured);
+	void RenderWall(FRenderState& state, int textured, uint32_t gpuSlot = UINT32_MAX);
 	void RenderFogBoundary(HWWallDispatcher* di, FRenderState& state);
 	void RenderMirrorSurface(HWWallDispatcher* di, FRenderState& state);
-	void RenderTexturedWall(HWWallDispatcher* di, FRenderState& state, int rflags);
+	void RenderTexturedWall(HWWallDispatcher* di, FRenderState& state, int rflags, uint32_t gpuSlot = UINT32_MAX);
 	void RenderTranslucentWall(HWWallDispatcher* di, FRenderState& state);
 	void DrawDecalsForMirror(HWDrawInfo* di, FRenderState& state, TArray<HWDecal*>& decals);
 
@@ -308,7 +365,7 @@ public:
 		return -((y - glseg.y1) * (glseg.x2 - glseg.x1) - (x - glseg.x1) * (glseg.y2 - glseg.y1));
 	}
 
-	void DrawWall(HWWallDispatcher* di, FRenderState& state, bool translucent);
+	void DrawWall(HWWallDispatcher* di, FRenderState& state, bool translucent, uint32_t gpuSlot = UINT32_MAX);
 
 };
 
@@ -321,6 +378,7 @@ public:
 class HWFlat
 {
 public:
+	int RetainedSurface = -1;
 	sector_t * sector;
 	FSection *section;
 	FGameTexture *texture;
@@ -398,26 +456,59 @@ public:
 	float offx, offy;
 	float trans;
 	int dynlightindex;
+	int32_t GpuParticleRange = -1;
 
 	FGameTexture *texture;
 	AActor * actor;
+	const struct FSpriteRecord* record = nullptr;
 	particle_t * particle;
 	TArray<lightlist_t> *lightlist;
 	DRotator Angles;
 
 	void SplitSprite(HWDrawInfo *di, sector_t * frontsector, bool translucent);
 	void PerformSpriteClipAdjustment(AActor *thing, const DVector2 &thingpos, float spriteheight);
+	void PerformSpriteClipAdjustment(const struct FSpriteClipSource& thing, const DVector2 &thingpos, float spriteheight);
 	bool CalculateVertices(HWDrawInfo *di, FVector3 *v, DVector3 *vp);
 
 public:
 
-	void CreateVertices(HWDrawInfo *di);
+	void CreateVertices(HWDrawInfo *di, bool fan = false);
+	void ProcessRecord(HWDrawInfo *di, const struct FSpriteRecord& r, sector_t * sector, area_t in_area, int thruportal);
 	void PutSprite(HWDrawInfo *di, bool translucent);
 	void Process(HWDrawInfo *di, AActor* thing,sector_t * sector, area_t in_area, int thruportal = false, bool isSpriteShadow = false);
 	void ProcessParticle(HWDrawInfo *di, particle_t *particle, sector_t *sector, class DVisualThinker *spr);//, int shade, int fakeside)
 	void AdjustVisualThinker(HWDrawInfo *di, DVisualThinker *spr, sector_t *sector);
 
-	void DrawSprite(HWDrawInfo *di, FRenderState &state, bool translucent);
+	// [Karto] runStart: the first sprite of a run of equal draw keys batches its quad and leaves its state set for the
+	// repeats; FinishAdditiveRun or FinishSolidRun restores what DrawSprite's end would have.
+	void DrawSprite(HWDrawInfo *di, FRenderState &state, bool translucent, bool runStart = false);
+	void DrawRunRepeat(HWDrawInfo *di, FRenderState &state);
+	static void FinishAdditiveRun(FRenderState &state);
+	static void FinishSolidRun(FRenderState &state);
+};
+
+// [Karto] Every input DrawSprite's state setup reads for a batched face sprite; equal keys set identical state.
+struct HWSpriteRunKey
+{
+	FGameTexture *texture;
+	const void *cls;
+	FColormap Colormap;
+	int lightlevel;
+	int OverrideShader;
+	int translation;
+	uint32_t style;
+	uint32_t thingColor, sectorColor, sectorAdd;
+	float trans;
+	uint8_t foglevel, hw_styleflags;
+	bool fullbright;
+	bool hasSector;
+	// [Karto] SetMaterial expands face sprites drawn from an actor but not record sprites (DrawSprite's spritetype).
+	bool fromRecord;
+	// Per-sprite dynamic light (lit level, not fullbright): never repeated.
+	bool dynlight;
+
+	void Set(HWDrawInfo *di, const HWSprite &s);
+	bool operator==(const HWSpriteRunKey &o) const;
 };
 
 
@@ -466,5 +557,6 @@ extern const float LARGE_VALUE;
 struct FDynLightData;
 struct FDynamicLight;
 bool GetLight(FDynLightData& dld, int group, Plane& p, FDynamicLight* light, bool checkside);
+bool LightReachesPlane(Plane& p, const DVector3& pos, float radius, bool checkside);
 void AddLightToList(FDynLightData &dld, int group, FDynamicLight* light, bool forceAttenuate);
 void SetSplitPlanes(FRenderState& state, const secplane_t& top, const secplane_t& bottom);

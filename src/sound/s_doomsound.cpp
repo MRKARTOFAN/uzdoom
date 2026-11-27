@@ -59,6 +59,12 @@
 // EXTERNAL DATA DEFINITIONS -------------------------------------------------
 
 EXTERN_CVAR(Bool, haptics_do_action);
+CVAR(Bool, snd_actor_skip, true, 0)
+
+static inline bool ActorSoundSkip(const AActor* actor)
+{
+	return snd_actor_skip && actor != nullptr && !actor->SoundAttached;
+}
 
 // PUBLIC DATA DEFINITIONS -------------------------------------------------
 
@@ -531,7 +537,10 @@ void S_SoundPitchActor(AActor *ent, int channel, EChanFlags flags, FSoundID soun
 	}
 
 	if (VerifyActorSound(ent, sound_id, channel, flags))
+	{
+		ent->SoundAttached = true;
 		soundEngine->StartSound (SOURCE_Actor, ent, nullptr, channel, flags, sound_id, volume, attenuation, 0, pitch, startTime);
+	}
 }
 
 void S_Sound(AActor *ent, int channel, EChanFlags flags, FSoundID sound_id, float volume, float attenuation)
@@ -556,6 +565,7 @@ void S_SoundMinMaxDist(AActor *ent, int channel, EChanFlags flags, FSoundID soun
 		rolloff.RolloffType = ROLLOFF_Linear;
 		rolloff.MinDistance = mindist;
 		rolloff.MaxDistance = maxdist;
+		ent->SoundAttached = true;
 		soundEngine->StartSound(SOURCE_Actor, ent, nullptr, channel, flags, sound_id, volume, 1, &rolloff);
 	}
 }
@@ -657,6 +667,7 @@ void A_PlaySound(AActor* self, int soundid, int channel, double volume, int loop
 
 void S_StopSound (AActor *actor, int channel)
 {
+	if (ActorSoundSkip(actor)) return;
 	soundEngine->StopSound(SOURCE_Actor, actor, (compatflags & COMPATF_MAGICSILENCE) ? -1 : channel);
 }
 
@@ -670,6 +681,7 @@ void S_StopSound (AActor *actor, int channel)
 
 void S_StopActorSounds(AActor *actor, int chanmin, int chanmax)
 {
+	if (ActorSoundSkip(actor)) return;
 	soundEngine->StopActorSounds(SOURCE_Actor, actor, chanmin, chanmax);
 }
 
@@ -709,7 +721,8 @@ void S_StopSound (const FPolyObj *poly, int channel)
 
 void S_RelinkSound (AActor *from, AActor *to)
 {
-
+	if (ActorSoundSkip(from)) return;
+	if (to != nullptr) to->SoundAttached = true;
 	FVector3 p = from->SoundPos();
 	soundEngine->RelinkSound(SOURCE_Actor, from, to, !(compatflags2 & COMPATF2_SOUNDCUTOFF)? &p : nullptr);
 }
@@ -722,6 +735,7 @@ void S_RelinkSound (AActor *from, AActor *to)
 
 void S_ChangeActorSoundVolume(AActor *actor, int channel, double dvolume)
 {
+	if (ActorSoundSkip(actor)) return;
 	soundEngine->ChangeSoundVolume(SOURCE_Actor, actor, (compatflags & COMPATF_MAGICSILENCE)? -1 : channel, dvolume);
 }
 
@@ -733,6 +747,7 @@ void S_ChangeActorSoundVolume(AActor *actor, int channel, double dvolume)
 
 void S_ChangeActorSoundPitch(AActor *actor, int channel, double pitch)
 {
+	if (ActorSoundSkip(actor)) return;
 	soundEngine->ChangeSoundPitch(SOURCE_Actor, actor, channel, pitch);
 }
 
@@ -745,6 +760,7 @@ void S_ChangeActorSoundPitch(AActor *actor, int channel, double pitch)
 
 bool S_GetSoundPlayingInfo (const AActor *actor, FSoundID sound_id)
 {
+	if (ActorSoundSkip(actor)) return false;
 	return soundEngine->GetSoundPlayingInfo(SOURCE_Actor, actor, sound_id);
 }
 
@@ -770,6 +786,7 @@ bool S_IsActorPlayingSomething (AActor *actor, int channel, FSoundID sound_id)
 	{
 		channel = CHAN_AUTO; // checks all channels
 	}
+	if (ActorSoundSkip(actor)) return false;
 	return soundEngine->IsSourcePlayingSomething(SOURCE_Actor, actor, channel, sound_id);
 }
 
@@ -864,7 +881,7 @@ static FSerializer &Serialize(FSerializer &arc, const char *key, FSoundChan &cha
 		switch (chan.SourceType)
 		{
 		case SOURCE_None:										break;
-		case SOURCE_Actor:		{ AActor* s = (AActor*)chan.Source;  arc("actor", s); chan.Source = s; break; }
+		case SOURCE_Actor:		{ AActor* s = (AActor*)chan.Source;  arc("actor", s); chan.Source = s; if (s) s->SoundAttached = true; break; }
 		case SOURCE_Sector:		{ auto s = (sector_t*)chan.Source; arc("sector", s); chan.Source = s; break; }
 		case SOURCE_Polyobj: { auto s = (FPolyObj*)chan.Source; arc("poly", s); chan.Source = s; break; }
 		case SOURCE_Unattached:	arc.Array("point", chan.Point, 3); break;
@@ -919,6 +936,8 @@ void S_SerializeSounds(FSerializer &arc)
 			{
 				chan = (FSoundChan*)soundEngine->GetChannel(nullptr);
 				arc(nullptr, *chan);
+				soundEngine->NoteChannelSource(chan);
+				soundEngine->NoteChannelSound(chan);
 				// Sounds always start out evicted when restored from a save.
 				chan->ChanFlags |= CHANF_EVICTED | CHANF_ABSTIME;
 			}

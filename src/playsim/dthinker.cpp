@@ -21,6 +21,8 @@
 **
 */
 
+#include <algorithm>
+#include <vector>
 #include "dthinker.h"
 #include "printf.h"
 #include "stats.h"
@@ -28,6 +30,7 @@
 #include "serializer_doom.h"
 #include "d_player.h"
 #include "vm.h"
+#include "c_cvars.h"
 #include "c_dispatch.h"
 #include "v_text.h"
 #include "g_levellocals.h"
@@ -38,9 +41,17 @@
 #include "r_utility.h"
 
 #include "p_visualthinker.h"
+#include "d_framestages.h"
 
 static int ThinkCount, ClientSideThinkCount;
+CVAR(Int, p_recreate_list, 1, 0)
+CVAR(Int, p_recreate_replay, 1, 0)
+static uint64_t RecreateReplayPasses = 0, RecreateReplayMissed = 0;
+// [Karto] True only while RunThinkers ticks play thinkers, so client-side actors (walked separately) are never entered.
+static bool CollectRecreate;
 static cycle_t ThinkCycles, ClientSideThinkCycles;
+static double ThinkWindowMS = 0, ThinkWindowMaxMS = 0;
+static int ThinkWindowTics = 0;
 extern cycle_t BotSupportCycles;
 extern cycle_t ActionCycles;
 extern int BotWTG;
@@ -68,6 +79,33 @@ DThinker *NextToThink;
 //
 //
 //==========================================================================
+
+FThinkerCollection::FThinkerCollection(bool trackActors) : TrackActors(trackActors)
+{
+	for (int i = 0; i <= MAX_STATNUM + 1; ++i) Thinkers[i].Owner = this, Thinkers[i].Stat = i;
+	for (int i = 0; i <= MAX_STATNUM; ++i) FreshThinkers[i].Owner = this, FreshThinkers[i].Stat = i;
+}
+
+void FThinkerCollection::DenseAdd(DThinker* thinker, int stat)
+{
+	if (!TrackActors || stat < STAT_FIRST_THINKING || stat > MAX_STATNUM || thinker->DenseOwner != nullptr ||
+		!thinker->IsKindOf(RUNTIME_CLASS(AActor))) return;
+	thinker->DenseOwner = this;
+	thinker->DenseIndex = int(DenseActors.Size());
+	DenseActors.Push(static_cast<AActor*>(thinker));
+}
+
+void FThinkerCollection::DenseRemove(DThinker* thinker)
+{
+	FThinkerCollection* owner = thinker->DenseOwner;
+	if (owner == nullptr) return;
+	AActor* last = owner->DenseActors.Last();
+	owner->DenseActors[thinker->DenseIndex] = last;
+	last->DenseIndex = thinker->DenseIndex;
+	owner->DenseActors.Pop();
+	thinker->DenseOwner = nullptr;
+	thinker->DenseIndex = -1;
+}
 
 void FThinkerCollection::Link(DThinker *thinker, int statnum)
 {
@@ -102,6 +140,11 @@ void FThinkerCollection::RunThinkers(FLevelLocals *Level)
 
 	ThinkCycles.Clock();
 
+	CollectRecreate = p_recreate_list != 0 && !profilethinkers;
+	Level->RecreateTicked = true;
+	Level->RecreateReplayValid = false;
+	Level->RecreateReplay.Clear();
+	if (profilethinkers) Level->RecreateListValid = false;
 	if (!profilethinkers)
 	{
 		// Tick every thinker left from last time
@@ -198,6 +241,16 @@ void FThinkerCollection::RunThinkers(FLevelLocals *Level)
 	}
 
 	ThinkCycles.Unclock();
+	const double thinkMS = ThinkCycles.TimeMS();
+	ThinkWindowMS += thinkMS;
+	ThinkWindowMaxMS = max(ThinkWindowMaxMS, thinkMS);
+	++ThinkWindowTics;
+}
+
+CCMD(playsim_timing)
+{
+	Printf("PLAYSIMTIMING tics=%d think_ms_per_tic=%.4f think_ms_max=%.4f\n", ThinkWindowTics,
+		ThinkWindowTics ? ThinkWindowMS / ThinkWindowTics : 0.0, ThinkWindowMaxMS);
 }
 
 //==========================================================================
@@ -208,13 +261,126 @@ void FThinkerCollection::RunThinkers(FLevelLocals *Level)
 //
 //==========================================================================
 
+static uint64_t RecreatePasses, RecreateListPasses, RecreateCandidatesSeen, RecreateVerifyMissed;
+
+CCMD(recreate_stats)
+{
+	Printf("RECREATESTATS passes=%llu list_passes=%llu candidates_per_pass=%.2f verify_missed=%llu replay_passes=%llu replay_missed=%llu\n",
+		(unsigned long long)RecreatePasses, (unsigned long long)RecreateListPasses,
+		RecreatePasses ? double(RecreateCandidatesSeen) / RecreatePasses : 0.0, (unsigned long long)RecreateVerifyMissed,
+		(unsigned long long)RecreateReplayPasses, (unsigned long long)RecreateReplayMissed);
+	RecreatePasses = RecreateListPasses = RecreateCandidatesSeen = RecreateVerifyMissed = RecreateReplayPasses = RecreateReplayMissed = 0;
+}
+
+void AActor::QueueRecreate()
+{
+	if (p_recreate_list == 0 || RecreateStamp == Level->RecreateSerial) return;
+	RecreateStamp = Level->RecreateSerial;
+	Level->RecreateCandidates.Push(MakeObjPtr<AActor*>(this));
+}
+
+static bool NeedsRecreatePass(AActor* mobj, bool frozen)
+{
+	return (mobj->flags8 & MF8_RECREATELIGHTS) || ((mobj->effects || mobj->fountaincolor) && !frozen && mobj->ShouldRenderLocally());
+}
+
+// [Karto] Recreated lights change their owner's AttachedLights after the worker copied it, so such a tic publishes on the main thread.
+uint64_t LightRecreates;
+
+extern bool DeferLightLinks;
+extern TArray<FDynamicLight*> DeferredLightLinks;
+static unsigned DeferredLightCursor;
+// [Karto] The level the list was made for: after a level change its lights may be freed, so it is dropped unread.
+static FLevelLocals* DeferredLightLevel;
+uint64_t WorkerLightRecreates, DeferredLightMisses;
+
+static void CompleteDeferredLights(AActor* mobj)
+{
+	while (DeferredLightCursor < DeferredLightLinks.Size() && DeferredLightLinks[DeferredLightCursor]->target == mobj)
+	{
+		FDynamicLight* light = DeferredLightLinks[DeferredLightCursor++];
+		// [Karto] ApplyProperties read the client clock for pulse lights, which has advanced since.
+		if (light->GetLightType() == PulseLight) light->m_lastUpdate = light->GetTimer();
+		light->UpdateLocation();
+	}
+}
+
+static void FinishDeferredLights(FLevelLocals* Level)
+{
+	if (Level != DeferredLightLevel)
+	{
+		DeferredLightLinks.Clear();
+		DeferredLightCursor = 0;
+		return;
+	}
+	if (DeferredLightCursor < DeferredLightLinks.Size())
+	{
+		++DeferredLightMisses;
+		for (unsigned i = DeferredLightCursor; i < DeferredLightLinks.Size(); ++i) DeferredLightLinks[i]->UpdateLocation();
+	}
+	DeferredLightLinks.Clear();
+	DeferredLightCursor = 0;
+}
+
+// [Karto] A reload (restart on death) keeps the same FLevelLocals, so the level check above misses it: the list would
+// update freed lights of the old actors.
+void P_DropDeferredLights()
+{
+	DeferredLightLinks.Clear();
+	DeferredLightCursor = 0;
+	DeferredLightLevel = nullptr;
+}
+
+// [Karto] The list holds object pointers that must not survive the GC step that follows the batch.
+void P_DropRecreateReplay()
+{
+	for (auto Level : AllLevels())
+	{
+		Level->RecreateReplay.Clear();
+		Level->RecreateReplayValid = false;
+	}
+}
+
+void P_WorkerRecreateLights(FLevelLocals* Level)
+{
+	DeferredLightLinks.Clear();
+	DeferredLightCursor = 0;
+	DeferredLightLevel = Level;
+	if (!r_dynlights) return;
+	DeferLightLinks = true;
+	auto recreate = [](AActor* ac)
+	{
+		if (!(ac->flags8 & MF8_RECREATELIGHTS)) return;
+		ac->flags8 &= ~MF8_RECREATELIGHTS;
+		++WorkerLightRecreates;
+		ac->SetDynamicLights();
+	};
+	if (p_recreate_list == 1 && Level->RecreateListValid && Level->RecreateTicked)
+	{
+		for (auto& candidate : Level->RecreateCandidates)
+		{
+			if (AActor* ac = candidate) recreate(ac);
+		}
+	}
+	else
+	{
+		auto it = Level->GetThinkerIterator<AActor>();
+		while (auto ac = it.Next()) recreate(ac);
+	}
+	DeferLightLinks = false;
+}
+
 static void RecreateDynamicLights(AActor* mobj, bool dolights, bool frozen)
 {
+	if (DeferredLightCursor < DeferredLightLinks.Size() && mobj->Level == DeferredLightLevel) CompleteDeferredLights(mobj);
 	if (mobj->flags8 & MF8_RECREATELIGHTS)
 	{
 		mobj->flags8 &= ~MF8_RECREATELIGHTS;
 		if (dolights)
+		{
+			++LightRecreates;
 			mobj->SetDynamicLights();
+		}
 	}
 	// This was merged from P_RunEffects to eliminate the costly duplicate ThinkerIterator loop.
 	if ((mobj->effects || mobj->fountaincolor) && !frozen && mobj->ShouldRenderLocally())
@@ -229,6 +395,7 @@ void FThinkerCollection::RunClientSideThinkers(FLevelLocals* Level)
 
 	ClientSideThinkCount = 0;
 	ClientSideThinkCycles.Reset();
+	CollectRecreate = false;
 
 	ClientSideThinkCycles.Clock();
 
@@ -251,13 +418,58 @@ void FThinkerCollection::RunClientSideThinkers(FLevelLocals* Level)
 		// Set dynamic lights at the end of the tick, so that this catches all changes being made through the last
 		// frame.
 		const bool frozen = paused || Level->isFrozen();
-		auto it = Level->GetThinkerIterator<AActor>();
-		while (auto ac = it.Next())
+		const int mode = p_recreate_list;
+		RecreatePasses++;
+		RecreateCandidatesSeen += Level->RecreateCandidates.Size();
+		const bool ticked = Level->RecreateTicked;
+		Level->RecreateTicked = false;
+		const int replay = p_recreate_replay;
+		if (mode == 1 && Level->RecreateListValid && ticked)
 		{
-			RecreateDynamicLights(ac, dolights, frozen);
+			RecreateListPasses++;
+			for (auto& candidate : Level->RecreateCandidates)
+			{
+				if (AActor* ac = candidate) RecreateDynamicLights(ac, dolights, frozen);
+			}
+			if (replay)
+			{
+				Level->RecreateReplay = std::move(Level->RecreateCandidates);
+				Level->RecreateReplaySerial = Level->RecreateSerial;
+				Level->RecreateReplayValid = true;
+			}
 		}
+		else if (mode == 1 && replay && !ticked && Level->RecreateReplayValid && Level->RecreateListValid)
+		{
+			RecreateReplayPasses++;
+			if (replay == 2)
+			{
+				auto it = Level->GetThinkerIterator<AActor>();
+				while (auto ac = it.Next())
+				{
+					if (ac->RecreateStamp != Level->RecreateReplaySerial && NeedsRecreatePass(ac, frozen)) RecreateReplayMissed++;
+				}
+			}
+			for (auto& candidate : Level->RecreateReplay)
+			{
+				if (AActor* ac = candidate) RecreateDynamicLights(ac, dolights, frozen);
+			}
+		}
+		else
+		{
+			auto it = Level->GetThinkerIterator<AActor>();
+			while (auto ac = it.Next())
+			{
+				if (mode == 2 && ticked && ac->RecreateStamp != Level->RecreateSerial && NeedsRecreatePass(ac, frozen))
+					RecreateVerifyMissed++;
+				RecreateDynamicLights(ac, dolights, frozen);
+			}
+			Level->RecreateListValid = mode != 0;
+		}
+		Level->RecreateCandidates.Clear();
+		if (++Level->RecreateSerial == 0) Level->RecreateSerial = 1;
+		FinishDeferredLights(Level);
 
-		it = Level->GetClientSideThinkerIterator<AActor>();
+		auto it = Level->GetClientSideThinkerIterator<AActor>();
 		while (auto ac = it.Next())
 		{
 			RecreateDynamicLights(ac, dolights, frozen);
@@ -305,7 +517,10 @@ void FThinkerCollection::RunClientSideThinkers(FLevelLocals* Level)
 		}
 	}
 
-	recreateLights();
+	{
+		FFrameStageScope stage(FS_RecreateLights);
+		recreateLights();
+	}
 	if (dolights && !paused)
 	{
 		if (!csprofilethinkers)
@@ -568,6 +783,7 @@ void FThinkerList::AddTail(DThinker *thinker)
 	thinker->NextThinker = Sentinel;
 	tail->NextThinker = thinker;
 	Sentinel->PrevThinker = thinker;
+	if (Owner != nullptr) Owner->DenseAdd(thinker, Stat);
 	GC::WriteBarrier(thinker, tail);
 	GC::WriteBarrier(thinker, Sentinel);
 	GC::WriteBarrier(tail, thinker);
@@ -698,6 +914,8 @@ bool FThinkerList::DoDestroyThinkers(bool& destroyed)
 			auto next = node->NextThinker;
 			toDelete.Push(node);
 			node->NextThinker = node->PrevThinker = nullptr;	// clear the links
+			// [Karto] Unlinked here without Remove, so OnDestroy will not take it out of the dense list.
+			FThinkerCollection::DenseRemove(node);
 			node = next;
 		}
 		Sentinel->NextThinker = Sentinel->PrevThinker = nullptr;
@@ -809,6 +1027,36 @@ void FThinkerList::OnLoad()
 //
 //==========================================================================
 
+EXTERN_CVAR(Int, p_rest_tick)
+bool P_RestTickEligible(AActor* a);
+
+static bool NativeThinkerTick(DThinker* node)
+{
+	static unsigned VIndex = ~0u;
+	static VMFunction* Base = nullptr;
+	static VMFunction* ActorBase = nullptr;
+	if (VIndex == ~0u)
+	{
+		VIndex = GetVirtualIndex(RUNTIME_CLASS(DThinker), "Tick");
+		Base = RUNTIME_CLASS(DThinker)->Virtuals[VIndex];
+		ActorBase = RUNTIME_CLASS(AActor)->Virtuals.Size() > VIndex ? RUNTIME_CLASS(AActor)->Virtuals[VIndex] : nullptr;
+	}
+	auto clss = node->GetClass();
+	VMFunction* func = clss->Virtuals.Size() > VIndex ? clss->Virtuals[VIndex] : nullptr;
+	return func == nullptr || func == Base || func == ActorBase;
+}
+
+CVAR(Bool, p_thinker_prefetch, true, 0)
+
+static void PrefetchThinkersAhead(DThinker *next, DThinker *after)
+{
+	PrefetchL3(after);
+	const AActor *actor = static_cast<const AActor *>(next);
+	const char *first = reinterpret_cast<const char *>(&actor->__Pos);
+	const char *last = reinterpret_cast<const char *>(&actor->target + 1);
+	for (const char *line = first; line < last; line += 64) PrefetchL3(line);
+}
+
 int FThinkerList::TickThinkers(FThinkerList *dest, int& counter)
 {
 	int count = 0;
@@ -819,10 +1067,12 @@ int FThinkerList::TickThinkers(FThinkerList *dest, int& counter)
 		return 0;
 	}
 
+	const bool prefetch = p_thinker_prefetch;
 	while (node != Sentinel)
 	{
 		++count;
 		NextToThink = node->NextThinker;
+		if (prefetch && NextToThink != Sentinel) PrefetchThinkersAhead(NextToThink, NextToThink->NextThinker);
 		if (node->ObjectFlags & OF_JustSpawned)
 		{
 			// Leave OF_JustSpawn set until after Tick() so the ticker can check it.
@@ -841,8 +1091,24 @@ int FThinkerList::TickThinkers(FThinkerList *dest, int& counter)
 		if (!(node->ObjectFlags & OF_EuthanizeMe))
 		{ // Only tick thinkers not scheduled for destruction
 			++counter;
-			node->CallTick();
+			bool rested = false;
+			if (p_rest_tick == 1 && NativeThinkerTick(node))
+			{
+				if (auto ac = dyn_cast<AActor>(node); ac != nullptr && P_RestTickEligible(ac))
+				{
+					if (ac->tics != -1) --ac->tics;
+					rested = true;
+				}
+			}
+			if (!rested) node->CallTick();
 			node->ObjectFlags &= ~OF_JustSpawned;
+			if (CollectRecreate && !(node->ObjectFlags & OF_EuthanizeMe))
+			{
+				if (auto ac = dyn_cast<AActor>(node))
+				{
+					if ((ac->flags8 & MF8_RECREATELIGHTS) || ac->effects || ac->fountaincolor) ac->QueueRecreate();
+				}
+			}
 		}
 		node = NextToThink;
 	}
@@ -972,6 +1238,7 @@ void DThinker::Remove()
 	GC::WriteBarrier(next, prev);
 	NextThinker = nullptr;
 	PrevThinker = nullptr;
+	FThinkerCollection::DenseRemove(this);
 }
 
 //==========================================================================
@@ -1262,9 +1529,21 @@ DEFINE_ACTION_FUNCTION_NATIVE(DThinker, Tick, NativeTick)
 	return 0;
 }
 
+CVAR(Bool, p_tick_direct, true, 0)
+
 void DThinker::CallTick()
 {
-	IFVIRTUAL(DThinker, Tick)
+	static unsigned VIndex = ~0u;
+	static VMFunction *Base = nullptr;
+	if (VIndex == ~0u)
+	{
+		VIndex = GetVirtualIndex(RUNTIME_CLASS(DThinker), "Tick");
+		assert(VIndex != ~0u);
+		Base = RUNTIME_CLASS(DThinker)->Virtuals[VIndex];
+	}
+	auto clss = GetClass();
+	VMFunction *func = clss->Virtuals.Size() > VIndex ? clss->Virtuals[VIndex] : nullptr;
+	if (func != nullptr && !(p_tick_direct && func == Base))
 		VMCallVoid<DThinker*>(func, this);
 	else
 		Tick();

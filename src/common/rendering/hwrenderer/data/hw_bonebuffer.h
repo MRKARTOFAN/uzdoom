@@ -46,6 +46,7 @@ public:
 
 	void Clear();
 	int UploadBones(const TArray<VSMatrix> &bones);
+	int UploadMatrices(const VSMatrix* matrices, int count);
 	void Map() { mBuffer->Map(); }
 	void Unmap() { mBuffer->Unmap(); }
 	unsigned int GetBlockSize() const { return mBlockSize; }

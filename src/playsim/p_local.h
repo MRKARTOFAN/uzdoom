@@ -273,6 +273,10 @@ enum ESightFlags
 };
 
 void	P_ResetSightCounters (bool full);
+void	P_ClassifyIslands (FLevelLocals* level);
+void	P_ClassifyClosets (FLevelLocals* level);
+void	P_PlayerEnteredIsland (AActor* player);
+void	P_LeaveCloset (AActor* actor);
 bool	P_TalkFacing (AActor *player);
 void	P_UseLines (player_t* player);
 int	P_UsePuzzleItem (AActor *actor, int itemType);

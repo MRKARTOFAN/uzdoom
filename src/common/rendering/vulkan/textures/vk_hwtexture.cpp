@@ -59,6 +59,8 @@ void VkHardwareTexture::Reset()
 			mappedSWFB = nullptr;
 		}
 
+		if (mImage.View && fb->GetDescriptorSetManager())
+			fb->GetDescriptorSetManager()->InvalidateBindlessTextures();
 		mImage.Reset(fb);
 		mDepthStencil.Reset(fb);
 	}
@@ -323,7 +325,52 @@ void VkMaterial::DeleteDescriptors()
 			deleteList->Add(std::move(it.descriptor));
 		}
 		mDescriptorSets.clear();
+		mGpuTextures.clear();
+		fb->GetDescriptorSetManager()->UnregisterBindlessTexture(Source()->GetID().GetIndex());
 	}
+}
+
+bool VkMaterial::GetGpuWorldTextures(const FMaterialState& state, uint32_t ids[4])
+{
+	if (GetShaderIndex() != 0 || NumLayers() > 4 || Source()->isHardwareCanvas()) return false;
+	auto descriptors = fb->GetDescriptorSetManager();
+	descriptors->TryCreateBindlessTextureSet();
+	if (!descriptors->IsBindlessEnabled() || !descriptors->GetGpuWorldTextureSet()) return false;
+	const int clampmode = Source()->GetClampMode(state.mClampMode);
+	const int translation = state.mTranslation;
+	const intptr_t remap = IsLuminosityTranslation(translation) ? translation : intptr_t(GPalette.GetTranslation(GetTranslationType(translation), GetTranslationIndex(translation)));
+	const auto epoch = descriptors->GetGpuWorldTextureEpoch();
+	for (auto& entry : mGpuTextures)
+	{
+		if (entry.Epoch == epoch && entry.ClampMode == clampmode && entry.Translation == remap)
+		{
+			memcpy(ids, entry.IDs, sizeof(entry.IDs));
+			return true;
+		}
+	}
+	auto sampler = fb->GetSamplerManager()->Get(clampmode);
+	GpuTextureEntry entry = { clampmode, remap, epoch, {} };
+	for (int i = 0; i < 4; ++i)
+	{
+		auto view = fb->GetTextureManager()->GetNullTextureView();
+		auto layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		if (i < NumLayers())
+		{
+			MaterialLayerInfo* layer;
+			auto texture = static_cast<VkHardwareTexture*>(GetLayer(i, i == 0 ? translation : 0, &layer));
+			if (layer->scaleFlags & CTF_Indexed || layer->layerTexture->isHardwareCanvas()) return false;
+			auto image = texture->GetImage(layer->layerTexture, i == 0 ? translation : 0, layer->scaleFlags);
+			view = image->View.get();
+			layout = image->Layout;
+		}
+		const auto index = descriptors->GetGpuWorldTexture(view, sampler, layout);
+		if (index < 0) return false;
+		entry.IDs[i] = uint32_t(index);
+	}
+	if (!mGpuTextures.empty() && mGpuTextures.front().Epoch != epoch) mGpuTextures.clear();
+	mGpuTextures.push_back(entry);
+	memcpy(ids, entry.IDs, sizeof(entry.IDs));
+	return true;
 }
 
 VulkanDescriptorSet* VkMaterial::GetDescriptorSet(const FMaterialState& state)
@@ -334,6 +381,15 @@ VulkanDescriptorSet* VkMaterial::GetDescriptorSet(const FMaterialState& state)
 	auto translationp = IsLuminosityTranslation(translation)? translation : intptr_t(GPalette.GetTranslation(GetTranslationType(translation), GetTranslationIndex(translation)));
 
 	clampmode = base->GetClampMode(clampmode);
+
+	if (state.mTranslation == 0 && fb->GetDescriptorSetManager()->IsBindlessEnabled())
+	{
+		MaterialLayerInfo* baseLayer;
+		auto baseTexture = static_cast<VkHardwareTexture*>(GetLayer(0, 0, &baseLayer));
+		auto image = baseTexture->GetImage(baseLayer->layerTexture, 0, baseLayer->scaleFlags);
+		fb->GetDescriptorSetManager()->RegisterBindlessTexture(base->GetID().GetIndex(), image->View.get(),
+			fb->GetSamplerManager()->Get(clampmode), image->Layout);
+	}
 
 	for (auto& set : mDescriptorSets)
 	{
@@ -381,6 +437,8 @@ VulkanDescriptorSet* VkMaterial::GetDescriptorSet(const FMaterialState& state)
 	}
 
 	update.Execute(fb->device.get());
+
+
 	mDescriptorSets.emplace_back(clampmode, translationp, std::move(descriptor));
 	return mDescriptorSets.back().descriptor.get();
 }

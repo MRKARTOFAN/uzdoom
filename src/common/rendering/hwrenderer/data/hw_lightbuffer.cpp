@@ -59,15 +59,20 @@ FLightBuffer::FLightBuffer(int pipelineNbr):
 
 FLightBuffer::~FLightBuffer()
 {
-	delete mBuffer;
+	for (int n = 0; n < mPipelineNbr; n++) delete mBufferPipeline[n];
 }
 
 void FLightBuffer::Clear()
 {
 	mIndex = 0;
 
-	mPipelinePos++;
-	mPipelinePos %= mPipelineNbr;
+	// [Karto] A frame-slot backend must land on the copy the parked frame is not reading, even if Clear runs twice.
+	if (screen->mPipelineFrameSlot >= 0) mPipelinePos = screen->mPipelineFrameSlot % mPipelineNbr;
+	else
+	{
+		mPipelinePos++;
+		mPipelinePos %= mPipelineNbr;
+	}
 
 	mBuffer = mBufferPipeline[mPipelinePos];
 }

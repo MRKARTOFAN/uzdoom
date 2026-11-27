@@ -719,10 +719,9 @@ void DAnimatedDoor::Construct(sector_t *sec, line_t *line, int speed, int delay,
 
 
 	auto &tex1 = m_Line1->sidedef[0]->textures;
-	tex1[side_t::mid].InitFrom(tex1[side_t::top]);
+	m_Line1->sidedef[0]->InitTexturePart(side_t::mid, side_t::top);
 
-	auto &tex2 = m_Line2->sidedef[0]->textures;
-	tex2[side_t::mid].InitFrom(tex2[side_t::top]);
+	m_Line2->sidedef[0]->InitTexturePart(side_t::mid, side_t::top);
 
 	picnum = tex1[side_t::top].texture;
 

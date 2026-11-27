@@ -75,6 +75,7 @@ CVAR(Float, snd_footstepvolume, 1.f, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
 CVAR(Bool, cl_predict_specials, true, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
 // Deprecated
 CVAR(Bool, cl_noprediction, false, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
+CVAR(Bool, p_sp_noprediction, true, 0)
 CVAR(Float, cl_predict_lerpscale, 0.05f, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
 CVAR(Float, cl_predict_lerpthreshold, 2.00f, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
 
@@ -117,6 +118,8 @@ CUSTOM_CVAR(Float, fov, 90.f, CVAR_ARCHIVE | CVAR_USERINFO | CVAR_NOINITCALL)
 // list. This isn't guaranteed to give correct results, but that means someone
 // messed with the world in a way will desync things eventually regardless.
 // TODO: Add support for TID links.
+extern uint64_t ThingLinkChanges;
+
 struct FPhysicsLinkBackup
 {
 	// Track found link sources to make sure any additional ones are released. We don't want to
@@ -262,6 +265,8 @@ struct FPhysicsLinkBackup
 				if (node->NextActor != nullptr)
 					node->NextActor->PrevActor = node->PrevActor;
 				*(node->PrevActor) = node->NextActor;
+				++ThingLinkChanges;
+				if (mo.Level->blockmap.blockarrays != nullptr) mo.Level->blockmap.MirrorRemove(node);
 				node->Release();
 				node = next;
 				continue;
@@ -275,6 +280,7 @@ struct FPhysicsLinkBackup
 			}
 
 			// Same as sector linking above.
+			++ThingLinkChanges;
 			*node->PrevActor = node->NextActor;
 			if (node->NextActor != nullptr)
 				node->NextActor->PrevActor = node->PrevActor;
@@ -293,6 +299,7 @@ struct FPhysicsLinkBackup
 				(*next)->PrevActor = &node->NextActor;
 			node->PrevActor = next;
 			*node->PrevActor = node;
+			if (mo.Level->blockmap.blockarrays != nullptr) mo.Level->blockmap.MirrorRebuild(node->BlockIndex);
 
 			++count;
 			node = node->NextBlock;
@@ -979,6 +986,7 @@ bool player_t::Resurrect()
 	mo->renderflags &= ~RF_INVISIBLE;
 	mo->Height = mo->GetDefault()->Height;
 	mo->radius = mo->GetDefault()->radius;
+	mo->UpdateBlockNodes();
 	mo->special1 = 0;	// required for the Hexen fighter's fist attack.
 								// This gets set by AActor::Die as flag for the wimpy death and must be reset here.
 	mo->SetState(mo->SpawnState);
@@ -1778,9 +1786,15 @@ static void P_RollbackPlayers(FSerializer& arc)
 	arc.EndArray();
 }
 
+bool P_PredictClientSkips()
+{
+	return gamestate != GS_LEVEL ||
+		(p_sp_noprediction && !netgame && cl_debugprediction <= 0 && !NetworkEntityManager::IsPredicting() && ClientTic <= gametic);
+}
+
 void P_PredictClient()
 {
-	if (gamestate != GS_LEVEL)
+	if (P_PredictClientSkips())
 		return;
 
 	player_t* player = &players[consoleplayer];

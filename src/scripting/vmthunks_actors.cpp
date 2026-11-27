@@ -84,13 +84,13 @@ DEFINE_ACTION_FUNCTION_NATIVE(_FCheckPosition, _Destructor, FCheckPosition_D)
 
 static void ClearLastRipped(FCheckPosition *self)
 {
-	self->LastRipped.Clear();
+	if (self->LastRippedMap) self->LastRippedMap->Clear();
 }
 
 DEFINE_ACTION_FUNCTION_NATIVE(_FCheckPosition, ClearLastRipped, ClearLastRipped)
 {
 	PARAM_SELF_STRUCT_PROLOGUE(FCheckPosition);
-	self->LastRipped.Clear();
+	ClearLastRipped(self);
 	return 0;
 }
 

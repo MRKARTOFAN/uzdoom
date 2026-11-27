@@ -47,6 +47,8 @@ public:
 	void PushGroup(const FString& name);
 	void PopGroup();
 	void UpdateGpuStats();
+	int BeginWorldProfile(int category, bool compute, VulkanCommandBuffer* commands = nullptr);
+	void EndWorldProfile(int range, bool compute, VulkanCommandBuffer* commands = nullptr);
 
 	class DeleteList
 	{
@@ -80,8 +82,18 @@ public:
 
 	void DeleteFrameObjects(bool uploadOnly = false);
 
+	int GetFrameSlot() const { return mBank; }
+	void WaitForPendingFrame();
+	uint64_t GetCompletedFrame() const { return mCompletedSerial; }
+	uint64_t GetCurrentFrame() const { return mFrameSerial; }
+
 private:
+	bool CanLeaveFrameInFlight() const;
+	bool RetirePendingFrame();
 	void FlushCommands(VulkanCommandBuffer** commands, size_t count, bool finish, bool lastsubmit);
+	int BeginGPUProfileRange(VulkanCommandBuffer *commands, int category, VkPipelineStageFlagBits stage);
+	void EndGPUProfileRange(VulkanCommandBuffer *commands, int range, VkPipelineStageFlagBits stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+	void ReadGPUProfile();
 
 	VulkanRenderDevice* fb = nullptr;
 
@@ -90,11 +102,53 @@ private:
 	std::unique_ptr<VulkanCommandBuffer> mTransferCommands;
 	std::unique_ptr<VulkanCommandBuffer> mDrawCommands;
 
-	enum { maxConcurrentSubmitCount = 8 };
-	std::unique_ptr<VulkanSemaphore> mSubmitSemaphore[maxConcurrentSubmitCount];
-	std::unique_ptr<VulkanFence> mSubmitFence[maxConcurrentSubmitCount];
+	enum { maxConcurrentSubmitCount = 8, maxFramesInFlight = 2 };
+	std::unique_ptr<VulkanSemaphore> mSubmitSemaphore[maxFramesInFlight][maxConcurrentSubmitCount];
+	std::unique_ptr<VulkanFence> mSubmitFence[maxFramesInFlight][maxConcurrentSubmitCount];
+	int mBank = 0;
+	struct PendingFrame
+	{
+		int Fences = 0;
+		int Bank = 0;
+		uint64_t Serial = 0;
+		std::unique_ptr<DeleteList> Transfer, Draw;
+	} mPending;
+	uint64_t mFrameSerial = 1, mCompletedSerial = 0;
+	uint64_t mInFlightFrames = 0, mSerialFrames = 0, mPendingWaitNS = 0, mPendingWaits = 0, mForcedPendingWaits = 0;
+	const char* mLastSerialReason = "none";
+
+public:
+	void PrintFramesInFlightStats() const;
+
+private:
 	VkFence mSubmitWaitFences[maxConcurrentSubmitCount];
 	int mNextSubmit = 0;
+	bool mPreviousSubmitChained = false;
+	uint64_t mReuseWaitNS = 0;
+	uint64_t mReuseWaitCount = 0;
+
+	struct GPUProfileRange
+	{
+		int Category;
+		uint32_t Start;
+		uint32_t End;
+		bool Closed = false;
+		FString Name;
+		int Depth = -1;
+	};
+
+	static constexpr uint32_t MaxGPUProfileQueries = 512;
+	std::unique_ptr<VulkanQueryPool> mGPUProfilePool;
+	std::vector<GPUProfileRange> mGPUProfileRanges;
+	int mTransferProfileRange = -1;
+	bool mTransferProfileWritten = false;
+	std::unique_ptr<VulkanQueryPool> mTransferProfilePool;
+	std::vector<int> mGPUProfileGroups;
+	uint32_t mGPUProfileNextQuery = 0;
+	uint32_t mGPUProfileSkippedDepth = 0;
+	uint64_t mGPUProfileMask = 0;
+	int mGPUProfileDrawRange = -1;
+	bool mGPUProfileActive = false;
 
 	struct TimestampQuery
 	{
@@ -102,6 +156,16 @@ private:
 		uint32_t startIndex;
 		uint32_t endIndex;
 	};
+
+	static constexpr uint32_t MaxOverdrawQueries = 64;
+	std::unique_ptr<VulkanQueryPool> mOverdrawPool;
+	std::vector<FString> mOverdrawNames;
+	std::vector<int> mOverdrawStack;
+	std::vector<uint64_t> mOverdrawBarriers;
+	uint64_t mOverdrawBarrierStart = 0, mOverdrawGroupBarrierStart = 0, mOverdrawFrameBarriers = 0, mOverdrawFrameBarrierItems = 0, mOverdrawItemStart = 0;
+	uint64_t mOverdrawFrame = 0;
+	int mOverdrawOpen = 0, mOverdrawNested = 0;
+	bool mOverdrawActive = false, mOverdrawPending = false;
 
 	enum { MaxTimestampQueries = 100 };
 	std::unique_ptr<VulkanQueryPool> mTimestampQueryPool;

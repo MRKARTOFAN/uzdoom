@@ -744,8 +744,9 @@ ComputePipelineBuilder& ComputePipelineBuilder::ComputeShader(VulkanShader* shad
 
 std::unique_ptr<VulkanPipeline> ComputePipelineBuilder::Create(VulkanDevice* device)
 {
-	VkPipeline pipeline;
-	vkCreateComputePipelines(device->device, cache ? cache->cache : VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
+	VkPipeline pipeline = VK_NULL_HANDLE;
+	VkResult result = vkCreateComputePipelines(device->device, cache ? cache->cache : VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
+	CheckVulkanError(result, "Could not create compute pipeline");
 	auto obj = std::make_unique<VulkanPipeline>(device, pipeline);
 	if (debugName)
 		obj->SetDebugName(debugName);
@@ -1845,6 +1846,9 @@ std::vector<VulkanCompatibleDevice> VulkanDeviceBuilder::FindDevices(const std::
 		{
 			if (optionalDeviceExtensions.find(ext.extensionName) != optionalDeviceExtensions.end())
 			{
+				// [Karto] The 1.0 fallback does not query indexing features or enable maintenance3, so it must keep the legacy device path.
+				if ((instance->ApiVersion < VK_API_VERSION_1_1 || info.Properties.Properties.apiVersion < VK_API_VERSION_1_1) &&
+					strcmp(ext.extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) == 0) continue;
 				dev.EnabledDeviceExtensions.insert(ext.extensionName);
 			}
 		}
@@ -1858,14 +1862,39 @@ std::vector<VulkanCompatibleDevice> VulkanDeviceBuilder::FindDevices(const std::
 		enabledFeatures.Features.shaderClipDistance = deviceFeatures.Features.shaderClipDistance;
 		enabledFeatures.Features.multiDrawIndirect = deviceFeatures.Features.multiDrawIndirect;
 		enabledFeatures.Features.independentBlend = deviceFeatures.Features.independentBlend;
-		enabledFeatures.BufferDeviceAddress.bufferDeviceAddress = deviceFeatures.BufferDeviceAddress.bufferDeviceAddress;
+		enabledFeatures.Features.pipelineStatisticsQuery = deviceFeatures.Features.pipelineStatisticsQuery;
 		enabledFeatures.AccelerationStructure.accelerationStructure = deviceFeatures.AccelerationStructure.accelerationStructure;
 		enabledFeatures.RayQuery.rayQuery = deviceFeatures.RayQuery.rayQuery;
-		enabledFeatures.DescriptorIndexing.runtimeDescriptorArray = deviceFeatures.DescriptorIndexing.runtimeDescriptorArray;
-		enabledFeatures.DescriptorIndexing.descriptorBindingPartiallyBound = deviceFeatures.DescriptorIndexing.descriptorBindingPartiallyBound;
-		enabledFeatures.DescriptorIndexing.descriptorBindingSampledImageUpdateAfterBind = deviceFeatures.DescriptorIndexing.descriptorBindingSampledImageUpdateAfterBind;
-		enabledFeatures.DescriptorIndexing.descriptorBindingVariableDescriptorCount = deviceFeatures.DescriptorIndexing.descriptorBindingVariableDescriptorCount;
-		enabledFeatures.DescriptorIndexing.shaderSampledImageArrayNonUniformIndexing = deviceFeatures.DescriptorIndexing.shaderSampledImageArrayNonUniformIndexing;
+		if (info.Properties.Properties.apiVersion >= VK_API_VERSION_1_2)
+		{
+			auto& v12 = enabledFeatures.Vulkan12;
+			v12.bufferDeviceAddress = deviceFeatures.Vulkan12.bufferDeviceAddress;
+			// [Karto] The umbrella descriptorIndexing bit must be TRUE when VK_EXT_descriptor_indexing is enabled and Vulkan12Features is chained (VUID-02833).
+			v12.descriptorIndexing = deviceFeatures.Vulkan12.descriptorIndexing;
+			if (!v12.descriptorIndexing) dev.EnabledDeviceExtensions.erase(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+			v12.runtimeDescriptorArray = deviceFeatures.Vulkan12.runtimeDescriptorArray;
+			v12.descriptorBindingPartiallyBound = deviceFeatures.Vulkan12.descriptorBindingPartiallyBound;
+			v12.descriptorBindingSampledImageUpdateAfterBind = deviceFeatures.Vulkan12.descriptorBindingSampledImageUpdateAfterBind;
+			v12.descriptorBindingVariableDescriptorCount = deviceFeatures.Vulkan12.descriptorBindingVariableDescriptorCount;
+			v12.shaderSampledImageArrayNonUniformIndexing = deviceFeatures.Vulkan12.shaderSampledImageArrayNonUniformIndexing;
+			enabledFeatures.BufferDeviceAddress.bufferDeviceAddress = deviceFeatures.Vulkan12.bufferDeviceAddress;
+			enabledFeatures.DescriptorIndexing.runtimeDescriptorArray = deviceFeatures.Vulkan12.runtimeDescriptorArray;
+			enabledFeatures.DescriptorIndexing.descriptorBindingPartiallyBound = deviceFeatures.Vulkan12.descriptorBindingPartiallyBound;
+			enabledFeatures.DescriptorIndexing.descriptorBindingSampledImageUpdateAfterBind = deviceFeatures.Vulkan12.descriptorBindingSampledImageUpdateAfterBind;
+			enabledFeatures.DescriptorIndexing.descriptorBindingVariableDescriptorCount = deviceFeatures.Vulkan12.descriptorBindingVariableDescriptorCount;
+			enabledFeatures.DescriptorIndexing.shaderSampledImageArrayNonUniformIndexing = deviceFeatures.Vulkan12.shaderSampledImageArrayNonUniformIndexing;
+			enabledFeatures.ShaderDrawParameters.shaderDrawParameters = deviceFeatures.ShaderDrawParameters.shaderDrawParameters;
+		}
+		else
+		{
+			enabledFeatures.BufferDeviceAddress.bufferDeviceAddress = deviceFeatures.BufferDeviceAddress.bufferDeviceAddress;
+			enabledFeatures.DescriptorIndexing.runtimeDescriptorArray = deviceFeatures.DescriptorIndexing.runtimeDescriptorArray;
+			enabledFeatures.DescriptorIndexing.descriptorBindingPartiallyBound = deviceFeatures.DescriptorIndexing.descriptorBindingPartiallyBound;
+			enabledFeatures.DescriptorIndexing.descriptorBindingSampledImageUpdateAfterBind = deviceFeatures.DescriptorIndexing.descriptorBindingSampledImageUpdateAfterBind;
+			enabledFeatures.DescriptorIndexing.descriptorBindingVariableDescriptorCount = deviceFeatures.DescriptorIndexing.descriptorBindingVariableDescriptorCount;
+			enabledFeatures.DescriptorIndexing.shaderSampledImageArrayNonUniformIndexing = deviceFeatures.DescriptorIndexing.shaderSampledImageArrayNonUniformIndexing;
+			enabledFeatures.ShaderDrawParameters.shaderDrawParameters = deviceFeatures.ShaderDrawParameters.shaderDrawParameters;
+		}
 
 		// Figure out which queue can present
 		if (surface)

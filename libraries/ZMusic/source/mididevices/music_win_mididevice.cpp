@@ -216,7 +216,13 @@ void WinMIDIDevice::Close()
 {
 	if (MidiOut != nullptr)
 	{
-		midiStreamClose(MidiOut);
+		// [Karto] A close refused while buffers are still queued would leave the callback pointing at this object.
+		MMRESULT result = midiStreamClose(MidiOut);
+		for (int tries = 0; result == MIDIERR_STILLPLAYING && tries < 400; ++tries)
+		{
+			Sleep(5);
+			result = midiStreamClose(MidiOut);
+		}
 		MidiOut = nullptr;
 	}
 }
@@ -338,6 +344,16 @@ void WinMIDIDevice::Stop()
 
 	midiStreamStop(MidiOut);
 	midiOutReset((HMIDIOUT)MidiOut);
+	// [Karto] midiOutReset returns queued buffers asynchronously, and the caller frees them right after: wait until the
+	// driver is done with them or it writes into freed memory.
+	for (int tries = 0; tries < 400; ++tries)
+	{
+		bool queued = false;
+		for (auto& hdr : WinMidiHeaders)
+			if ((hdr.dwFlags & MHDR_PREPARED) && (hdr.dwFlags & MHDR_INQUEUE)) queued = true;
+		if (!queued) break;
+		Sleep(5);
+	}
 	if (VolumeWorks)
 	{
 		midiOutSetVolume((HMIDIOUT)MidiOut, SavedVolume);
@@ -535,7 +551,14 @@ int WinMIDIDevice::UnprepareHeader(MidiHeader *header)
 	{
 		assert(syshdr == &WinMidiHeaders[0] || syshdr == &WinMidiHeaders[1]);
 		header->lpNext = nullptr;
-		return midiOutUnprepareHeader((HMIDIOUT)MidiOut, syshdr, sizeof(MIDIHDR));
+		// [Karto] Skipping the unprepare would leave the driver holding a header that is about to be freed.
+		MMRESULT result = midiOutUnprepareHeader((HMIDIOUT)MidiOut, syshdr, sizeof(MIDIHDR));
+		for (int tries = 0; result == MIDIERR_STILLPLAYING && tries < 400; ++tries)
+		{
+			Sleep(5);
+			result = midiOutUnprepareHeader((HMIDIOUT)MidiOut, syshdr, sizeof(MIDIHDR));
+		}
+		return result;
 	}
 	else
 	{

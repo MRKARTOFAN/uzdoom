@@ -25,6 +25,8 @@
 **
 */
 
+#include <optional>
+#include "d_logiccensus.h"
 #include <algorithm>
 #include <math.h>
 #include <stdlib.h>
@@ -114,13 +116,24 @@ DEFINE_ACTION_FUNCTION_NATIVE(AActor, ShouldPassThroughPlayer, P_ShouldPassThrou
 //
 //==========================================================================
 
+CVAR(Bool, p_collide_skipbase, true, 0)
+
+static VMFunction *P_CollisionVirtual(AActor *actor, unsigned index, VMFunction *base)
+{
+	auto clss = actor->GetClass();
+	VMFunction *func = clss->Virtuals.Size() > index ? clss->Virtuals[index] : nullptr;
+	return (p_collide_skipbase && func == base) ? nullptr : func;
+}
+
 bool P_CanCollideWith(AActor *tmthing, AActor *thing)
 {
 	static unsigned VIndex = ~0u;
+	static VMFunction *Base = nullptr;
 	if (VIndex == ~0u)
 	{
 		VIndex = GetVirtualIndex(RUNTIME_CLASS(AActor), "CanCollideWith");
 		assert(VIndex != ~0u);
+		Base = RUNTIME_CLASS(AActor)->Virtuals[VIndex];
 	}
 
 	VMValue params[3] = { tmthing, thing, false };
@@ -128,8 +141,7 @@ bool P_CanCollideWith(AActor *tmthing, AActor *thing)
 	int retval;
 	ret.IntAt(&retval);
 
-	auto clss = tmthing->GetClass();
-	VMFunction *func = clss->Virtuals.Size() > VIndex ? clss->Virtuals[VIndex] : nullptr;
+	VMFunction *func = P_CollisionVirtual(tmthing, VIndex, Base);
 	if (func != nullptr)
 	{
 		VMCall(func, params, 3, &ret, 1);
@@ -139,8 +151,7 @@ bool P_CanCollideWith(AActor *tmthing, AActor *thing)
 	params[2].i = true;
 
 	// re-get for the other actor.
-	clss = thing->GetClass();
-	func = clss->Virtuals.Size() > VIndex ? clss->Virtuals[VIndex] : nullptr;
+	func = P_CollisionVirtual(thing, VIndex, Base);
 	if (func != nullptr)
 	{
 		VMCall(func, params, 3, &ret, 1);
@@ -151,20 +162,25 @@ bool P_CanCollideWith(AActor *tmthing, AActor *thing)
 
 void P_CollidedWith(AActor* const collider, AActor* const collidee)
 {
+	static unsigned VIndex = ~0u;
+	static VMFunction *Base = nullptr;
+	if (VIndex == ~0u)
 	{
-		IFVIRTUALPTR(collider, AActor, CollidedWith)
-		{
-			VMValue params[] = { collider, collidee, false };
-			VMCall(func, params, 3, nullptr, 0);
-		}
+		VIndex = GetVirtualIndex(RUNTIME_CLASS(AActor), "CollidedWith");
+		assert(VIndex != ~0u);
+		Base = RUNTIME_CLASS(AActor)->Virtuals[VIndex];
 	}
 
+	if (VMFunction *func = P_CollisionVirtual(collider, VIndex, Base))
 	{
-		IFVIRTUALPTR(collidee, AActor, CollidedWith)
-		{
-			VMValue params[] = { collidee, collider, true };
-			VMCall(func, params, 3, nullptr, 0);
-		}
+		VMValue params[] = { collider, collidee, false };
+		VMCall(func, params, 3, nullptr, 0);
+	}
+
+	if (VMFunction *func = P_CollisionVirtual(collidee, VIndex, Base))
+	{
+		VMValue params[] = { collidee, collider, true };
+		VMCall(func, params, 3, nullptr, 0);
 	}
 }
 
@@ -1356,6 +1372,8 @@ DEFINE_ACTION_FUNCTION_NATIVE(AActor, DoMissileDamage, P_DoMissileDamage)
 //
 //==========================================================================
 
+EXTERN_CVAR(Bool, p_blockdense)
+
 bool PIT_CheckThing(FMultiBlockThingsIterator &it, FMultiBlockThingsIterator::CheckResult &cres, const FBoundingBox &box, FCheckPosition &tm)
 {
 	AActor *thing = cres.thing;
@@ -1429,10 +1447,11 @@ bool PIT_CheckThing(FMultiBlockThingsIterator &it, FMultiBlockThingsIterator::Ch
 				fabs(thing->Y() - oldpos.Y) < (thing->radius + tm.thing->radius))
 
 			{
-				double newdist = thing->Distance2D(cres.Position.X, cres.Position.Y);
-				double olddist = thing->Distance2D(oldpos.X, oldpos.Y);
+				// [Karto] A correctly rounded sqrt never decreases, so the roots are only taken when the squared distance is larger.
+				const double newsquared = DVector2(thing->X() - cres.Position.X, thing->Y() - cres.Position.Y).LengthSquared();
+				const double oldsquared = DVector2(thing->X() - oldpos.X, thing->Y() - oldpos.Y).LengthSquared();
 
-				if (newdist > olddist)
+				if (newsquared > oldsquared && g_sqrt(newsquared) > g_sqrt(oldsquared))
 				{
 					// unblock only if there's already a vertical overlap (or both actors are flagged not to overlap)
 					unblocking = (tm.thing->Top() > thing->Z() && tm.thing->Z() < topz) || (tm.thing->flags3 & thing->flags3 & MF3_DONTOVERLAP);
@@ -1647,10 +1666,10 @@ bool PIT_CheckThing(FMultiBlockThingsIterator &it, FMultiBlockThingsIterator::Ch
 		{
 			if (!(tm.thing->flags6 & MF6_NOBOSSRIP) || !(thing->flags2 & MF2_BOSS))
 			{
-				bool *check = tm.LastRipped.CheckKey(thing);
+				bool *check = tm.LastRipped().CheckKey(thing);
 				if (check == NULL || !*check)
 				{
-					tm.LastRipped[thing] = true;
+					tm.LastRipped()[thing] = true;
 					P_DoMissileDamage(tm.thing, thing);
 					if (thing->flags2 & MF2_PUSHABLE
 						&& !(tm.thing->flags2 & MF2_CANNOTPUSH))
@@ -1767,8 +1786,28 @@ MOVEMENT CLIPPING
 //
 //==========================================================================
 
+CVAR(Bool, p_compactcheck, true, 0)
+EXTERN_CVAR(Bool, p_linefreeskip)
+EXTERN_CVAR(Bool, p_linefreeskip_verify)
+
+CVAR(Bool, p_testz_reuse, true, 0)
+extern uint64_t ThingLinkChanges;
+static struct FTestZRecord
+{
+	AActor *Actor = nullptr;
+	DVector2 Pos;
+	double Radius = 0;
+	uint64_t Links = 0, Serial = 0;
+	bool Complete = false;
+	FMultiBlockThingsIterator::CheckResult List[16];
+	unsigned Count = 0;
+	bool Overflow = false;
+} TestZRecord;
+static uint64_t TestZSerial;
+
 bool P_CheckPosition(AActor *thing, const DVector2 &pos, FCheckPosition &tm, bool actorsonly)
 {
+	if (LogicCensusArmed) ++LogicCensus.CheckPositions;
 	sector_t *newsec;
 	AActor *thingblocker;
 	double realHeight = thing->Height;
@@ -1869,8 +1908,46 @@ bool P_CheckPosition(AActor *thing, const DVector2 &pos, FCheckPosition &tm, boo
 		FMultiBlockThingsIterator it2(pcheck, thing->Level, pos.X, pos.Y, thing->Z(), thing->Height, thing->radius, false, newsec);
 		FMultiBlockThingsIterator::CheckResult tcres;
 
-		while ((it2.Next(&tcres)))
+		const bool near = p_blockdense && it2.UseNear(thing->radius, true);
+		auto next = [&]() -> bool
 		{
+			return it2.Next(&tcres);
+		};
+		const bool compact = p_compactcheck && !near;
+		const bool census = LogicCensusArmed;
+		struct FWalkVisits
+		{
+			bool On;
+			uint64_t Start;
+			~FWalkVisits() { if (On) LogicCensus.CheckPosNodeVisits += LogicCensus.BlockNodeVisits - Start; }
+		} walkvisits{ census, LogicCensus.BlockNodeVisits };
+		if (census) ++LogicCensus.CheckPosWalks;
+		const uint64_t zserial = ++TestZSerial;
+		const uint64_t zlinks = ThingLinkChanges;
+		const bool zrecord = p_testz_reuse && thing->Level->Displacements.size <= 1;
+		if (zrecord)
+		{
+			TestZRecord.Serial = zserial;
+			TestZRecord.Complete = false;
+			TestZRecord.Count = 0;
+			TestZRecord.Overflow = false;
+		}
+		while (next())
+		{
+			if (census) ++LogicCensus.CheckPosCandidates;
+			if (compact && tcres.node != nullptr)
+			{
+				// [Karto] PIT_CheckThing's earlier tests have no side effects, so rejecting on the node copies avoids loading the actor.
+				const double blockdist = tcres.node->Radius + thing->radius;
+				if (fabs(tcres.node->X - tcres.Position.X) >= blockdist || fabs(tcres.node->Y - tcres.Position.Y) >= blockdist)
+					continue;
+			}
+			if (census) ++LogicCensus.CheckPosSurvivors;
+			if (zrecord && TestZRecord.Serial == zserial)
+			{
+				if (TestZRecord.Count < countof(TestZRecord.List)) TestZRecord.List[TestZRecord.Count++] = tcres;
+				else TestZRecord.Overflow = true;
+			}
 			if (!PIT_CheckThing(it2, tcres, it2.Box(), tm))
 			{ // [RH] If a thing can be stepped up on, we need to continue checking
 				// other things in the blocks and see if we hit something that is
@@ -1914,6 +1991,14 @@ bool P_CheckPosition(AActor *thing, const DVector2 &pos, FCheckPosition &tm, boo
 				}
 			}
 		}
+		if (zrecord && TestZRecord.Serial == zserial && TestZSerial == zserial && ThingLinkChanges == zlinks)
+		{
+			TestZRecord.Actor = thing;
+			TestZRecord.Pos = pos;
+			TestZRecord.Radius = thing->radius;
+			TestZRecord.Links = zlinks;
+			TestZRecord.Complete = true;
+		}
 	}
 
 	// check lines
@@ -1938,7 +2023,19 @@ bool P_CheckPosition(AActor *thing, const DVector2 &pos, FCheckPosition &tm, boo
 	if (actorsonly || (thing->flags & MF_NOCLIP))
 		return (thing->BlockingMobj = thingblocker) == NULL;
 
-	FMultiBlockLinesIterator it(pcheck, thing->Level, pos.X, pos.Y, thing->Z(), thing->Height, thing->radius, newsec);
+	const bool lineFree = p_linefreeskip && pcheck.inited && pcheck.Size() == 0 && newsec->PortalBlocksMovement(sector_t::ceiling) &&
+		newsec->PortalBlocksMovement(sector_t::floor) && P_BoxBlocksLineFree(thing->Level, box);
+	std::optional<FMultiBlockLinesIterator> it;
+	if (lineFree && !p_linefreeskip_verify)
+	{
+		validcount++;
+		LineFreeStats[0]++;
+	}
+	else
+	{
+		it.emplace(pcheck, thing->Level, pos.X, pos.Y, thing->Z(), thing->Height, thing->radius, newsec);
+		LineFreeStats[1]++;
+	}
 	FMultiBlockLinesIterator::CheckResult lcres;
 
 	double thingdropoffz = tm.floorz;
@@ -1947,9 +2044,10 @@ bool P_CheckPosition(AActor *thing, const DVector2 &pos, FCheckPosition &tm, boo
 
 	bool good = true;
 
-	while (it.Next(&lcres))
+	while (it && it->Next(&lcres))
 	{
-		bool thisresult = PIT_CheckLine(it, lcres, it.Box(), tm, good);
+		if (lineFree) LineFreeStats[4]++;
+		bool thisresult = PIT_CheckLine(*it, lcres, it->Box(), tm, good);
 		good &= thisresult;
 		if (thisresult)
 		{
@@ -1959,7 +2057,7 @@ bool P_CheckPosition(AActor *thing, const DVector2 &pos, FCheckPosition &tm, boo
 				// Checking the other side of the portal completely is too costly,
 				// but checking the portal's destination line is necessary to
 				// retrieve the proper sector heights on the other side.
-				if (PIT_CheckPortal(it, lcres, it.Box(), tm))
+				if (PIT_CheckPortal(*it, lcres, it->Box(), tm))
 				{
 					tm.thing->BlockingLine = lcres.line;
 				}
@@ -2056,6 +2154,7 @@ AActor *P_CheckOnmobj(AActor *thing)
 
 int P_TestMobjZ(AActor *actor, bool quick, AActor **pOnmobj)
 {
+	if (LogicCensusArmed) ++LogicCensus.TestMobjZ;
 	AActor *onmobj = nullptr;
 	if (pOnmobj) *pOnmobj = nullptr;
 	if ((actor->flags & MF_NOCLIP) || (actor->flags2 & MF2_THRUACTORS))
@@ -2064,10 +2163,27 @@ int P_TestMobjZ(AActor *actor, bool quick, AActor **pOnmobj)
 	}
 
 	FPortalGroupArray check;
-	FMultiBlockThingsIterator it(check, actor, -1, true);
+	// [Karto] Copied out first so a walk started from a collision callback cannot change the survivors under the loop.
+	auto& rec = TestZRecord;
+	FMultiBlockThingsIterator::CheckResult replayed[16];
+	const bool replay = p_testz_reuse && rec.Complete && rec.Actor == actor && rec.Links == ThingLinkChanges &&
+		rec.Pos == actor->Pos().XY() && rec.Radius == actor->radius && !rec.Overflow &&
+		actor->Level->Displacements.size <= 1;
+	const unsigned replayCount = replay ? rec.Count : 0;
+	for (unsigned i = 0; i < replayCount; ++i) replayed[i] = rec.List[i];
+	std::optional<FMultiBlockThingsIterator> it;
+	if (!replay) it.emplace(check, actor, -1, true);
+	unsigned replayAt = 0;
 	FMultiBlockThingsIterator::CheckResult cres;
+	auto next = [&]() -> bool
+	{
+		if (it) return it->Next(&cres);
+		if (replayAt >= replayCount) return false;
+		cres = replayed[replayAt++];
+		return true;
+	};
 
-	while (it.Next(&cres))
+	while (next())
 	{
 		AActor *thing = cres.thing;
 		if (!quick && onmobj != NULL && thing->Top() < onmobj->Top())
@@ -2622,7 +2738,7 @@ bool P_TryMove(AActor *thing, const DVector2 &pos,
 				if (!P_CheckPosition(thing, pos.XY(), true))	// check if some actor blocks us on the other side. (No line checks, because of the mess that'd create.)
 				{
 					auto blocking = thing->BlockingMobj.ForceGet();
-					if (blocking != nullptr && (thing->player == nullptr || !(thing->player->cheats && CF_PREDICTING)))
+					if (blocking != nullptr && (thing->player == nullptr || !(thing->player->cheats & CF_PREDICTING)))
 						P_CollidedWith(thing, blocking);
 
 					thing->SetXYZ(oldthingpos);
@@ -2675,6 +2791,8 @@ bool P_TryMove(AActor *thing, const DVector2 &pos,
 
 	if (!portalcrossed)
 	{
+		const bool keepRecord = TestZRecord.Complete && TestZRecord.Actor == thing && TestZRecord.Pos == pos &&
+			TestZRecord.Links == ThingLinkChanges;
 		// the move is ok, so link the thing into its new position
 		FLinkContext ctx;
 		thing->UnlinkFromWorld(&ctx);
@@ -2690,7 +2808,8 @@ bool P_TryMove(AActor *thing, const DVector2 &pos,
 		thing->ceilingsector = tm.ceilingsector;
 		thing->SetXY(pos);
 
-		thing->LinkToWorld(&ctx);
+		thing->LinkToWorld(&ctx, false, p_compactcheck && tm.pos.X == pos.X && tm.pos.Y == pos.Y ? tm.sector : nullptr);
+		if (keepRecord) TestZRecord.Links = ThingLinkChanges;
 	}
 
 	if (thing->flags2 & MF2_FLOORCLIP)
@@ -4829,6 +4948,7 @@ AActor *P_LineAttack(AActor *t1, DAngle angle, double distance,
 				puff = P_SpawnPuff(t1, pufftype, puffpos, trace.SrcAngleFromTarget,
 					trace.SrcAngleFromTarget - DAngle::fromDeg(90), 0, puffFlags);
 				puff->radius = EQUAL_EPSILON;
+				puff->UpdateBlockNodes();
 
 				if (nointeract)
 				{
@@ -5627,11 +5747,15 @@ void P_RailAttack(FRailParams *p)
 CVAR(Float, chase_height, -8.f, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
 CVAR(Float, chase_dist, 90.f, CVAR_ARCHIVE | CVAR_GLOBALCONFIG)
 
+void TicWorkerWaitForPlayAccess();
+
 void R_OffsetView(FRenderViewpoint& viewPoint, const DVector3& dir, const double distance)
 {
 	const DAngle baseYaw = dir.Angle();
 	FTraceResults trace = {};
-	if (viewPoint.IsAllowedOoB() && V_IsHardwareRenderer())
+	const bool outOfBounds = viewPoint.IsAllowedOoB() && V_IsHardwareRenderer();
+	if (!outOfBounds) TicWorkerWaitForPlayAccess();
+	if (outOfBounds)
 	{
 		viewPoint.Pos += dir * distance;
 		viewPoint.sector = viewPoint.ViewLevel->PointInRenderSubsector(viewPoint.Pos)->sector;

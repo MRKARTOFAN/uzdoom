@@ -42,6 +42,9 @@ class FThinkerIterator;
 enum { MAX_STATNUM = 127 };
 
 // Doubly linked ring list of thinkers
+struct FThinkerCollection;
+class AActor;
+
 struct FThinkerList
 {
 	// No destructor. If this list goes away it's the GC's task to clean the orphaned thinkers. Otherwise this may clash with engine shutdown.
@@ -59,12 +62,23 @@ struct FThinkerList
 
 private:
 	DThinker *Sentinel = nullptr;
+	FThinkerCollection* Owner = nullptr;
+	int Stat = -1;
 
 	friend struct FThinkerCollection;
 };
 
 struct FThinkerCollection
 {
+	explicit FThinkerCollection(bool trackActors = false);
+	FThinkerCollection(const FThinkerCollection&) = delete;
+	FThinkerCollection& operator=(const FThinkerCollection&) = delete;
+
+	TArray<AActor*> DenseActors;
+	bool TracksActors() const { return TrackActors; }
+	void DenseAdd(DThinker* thinker, int stat);
+	static void DenseRemove(DThinker* thinker);
+
 	void DestroyThinkersInList(int statnum)
 	{
 		Thinkers[statnum].DestroyThinkers();
@@ -84,6 +98,7 @@ struct FThinkerCollection
 private:
 	FThinkerList Thinkers[MAX_STATNUM + 2];
 	FThinkerList FreshThinkers[MAX_STATNUM + 1];
+	bool TrackActors;
 
 	friend class FThinkerIterator;
 };
@@ -124,6 +139,8 @@ private:
 
 public:
 	FLevelLocals *Level;
+	FThinkerCollection* DenseOwner = nullptr;
+	int DenseIndex = -1;
 
 	friend struct FLevelLocals;	// Needs access to FreshThinkers until the thinker storage gets refactored.
 };

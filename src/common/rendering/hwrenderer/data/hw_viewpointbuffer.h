@@ -49,4 +49,5 @@ public:
 	void Set2D(FRenderState &di, int width, int height, int pll = 0);
 	int SetViewpoint(FRenderState &di, HWViewpointUniforms *vp);
 	unsigned int GetBlockSize() const { return mBlockSize; }
+	IDataBuffer* GetBuffer() const { return mBuffer; }
 };

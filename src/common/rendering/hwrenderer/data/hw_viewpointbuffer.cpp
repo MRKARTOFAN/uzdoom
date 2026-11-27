@@ -44,7 +44,7 @@ HWViewpointBuffer::HWViewpointBuffer(int pipelineNbr):
 
 HWViewpointBuffer::~HWViewpointBuffer()
 {
-	delete mBuffer;
+	for (int n = 0; n < mPipelineNbr; n++) delete mBufferPipeline[n];
 }
 
 
@@ -116,7 +116,13 @@ void HWViewpointBuffer::Clear()
 	mUploadIndex = 0;
 	mClipPlaneInfo.Clear();
 
-	if (needNewPipeline)
+	if (screen->mPipelineFrameSlot >= 0)
+	{
+		// [Karto] Frame-slot backends select by frame, not by upload count, so a second Clear cannot reach the parked copy.
+		if (mPipelinePos != screen->mPipelineFrameSlot % mPipelineNbr) mLastMappedIndex = UINT_MAX;
+		mPipelinePos = screen->mPipelineFrameSlot % mPipelineNbr;
+	}
+	else if (needNewPipeline)
 	{
 		mLastMappedIndex = UINT_MAX;
 

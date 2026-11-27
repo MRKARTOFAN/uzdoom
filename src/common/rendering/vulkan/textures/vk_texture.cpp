@@ -163,7 +163,7 @@ void VkTextureManager::CreateNullTexture()
 void VkTextureManager::CreateShadowmap()
 {
 	Shadowmap.Image = ImageBuilder()
-		.Size(gl_shadowmap_quality, 1024)
+		.Size(gl_shadowmap_quality, IShadowMap::Rows)
 		.Format(VK_FORMAT_R32_SFLOAT)
 		.Usage(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
 		.DebugName("VkRenderBuffers.Shadowmap")

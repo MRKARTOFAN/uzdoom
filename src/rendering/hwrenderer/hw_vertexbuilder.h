@@ -87,3 +87,37 @@ VertexContainers BuildVertices(TArray<sector_t> &sectors);
 class FFlatVertexBuffer;
 void CheckUpdate(FFlatVertexBuffer* fvb, sector_t* sector);
 void CreateVBO(FFlatVertexBuffer* fvb, TArray<sector_t>& sectors);
+
+struct FFlatVertex;
+// [Karto] While true, wall vertices go to a local buffer so a whole-map bake sweep cannot overrun the frame allocation.
+extern bool g_bakeSweepActive;
+extern uint64_t g_sweepMvCalls, g_sweepBaked, g_sweepSkipNoTex, g_sweepSkipSplit, g_sweepSkipCanCache, g_sweepSkipOther;
+void GPUBakeRecordWall(const FFlatVertex* verts, seg_t* seg, int type, uint32_t texture, uint32_t sector);
+void GPUBakeFinalize();
+uint64_t GPUBakeEpoch();
+void GPUClearPersistentWalls();
+bool GPUBakeLookupWall(seg_t* seg, int type, const FFlatVertex* currentVerts, uint32_t* iboOffset, uint32_t* indexCount, uint32_t* row = nullptr);
+bool GPUBakeLookupRow(seg_t* seg, int type, uint32_t* row);
+bool GPUBakeWallVerts(seg_t* seg, int type, FFlatVertex* out);
+void GPUBakeRunCull(const float* planes24, bool forDraw = false, const uint32_t* rows = nullptr, uint32_t count = 0);
+void GPUBakeBeginView();
+void GPUBakeAdmitWall(seg_t* seg, int type, const FFlatVertex* currentVerts);
+
+struct FGpuDrawCommand
+{
+	uint32_t IndexCount;		// always 6 (canonical quad)
+	uint32_t InstanceCount;	// 1
+	uint32_t FirstIndex;		// 0 into the canonical index buffer
+	int32_t VertexOffset;		// baked VboOffset
+	uint32_t FirstInstance;	// 0
+};
+static_assert(sizeof(FGpuDrawCommand) == 5 * sizeof(uint32_t), "must match VkDrawIndexedIndirectCommand");
+
+struct FGpuMaterialRow
+{
+	uint32_t TextureIndex;	// FTextureID index (bindless slot)
+	uint32_t SectorIndex;
+	uint32_t Plane;			// wall part / side
+	uint32_t Flags;			// reserved: colour/texture-mode/epoch
+};
+static_assert(sizeof(FGpuMaterialRow) == 4 * sizeof(uint32_t), "material row ABI");

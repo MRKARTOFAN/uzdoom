@@ -105,11 +105,6 @@ void VulkanDevice::CreateDevice()
 		deviceCreateInfo.pEnabledFeatures = &deviceFeatures2.features;
 	}
 
-	if (SupportsExtension(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME))
-	{
-		*next = &EnabledFeatures.BufferDeviceAddress;
-		next = &EnabledFeatures.BufferDeviceAddress.pNext;
-	}
 	if (SupportsExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME))
 	{
 		*next = &EnabledFeatures.AccelerationStructure;
@@ -120,10 +115,36 @@ void VulkanDevice::CreateDevice()
 		*next = &EnabledFeatures.RayQuery;
 		next = &EnabledFeatures.RayQuery.pNext;
 	}
-	if (SupportsExtension(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME))
+	// [Karto] Chaining the promoted alias structs next to Vulkan12 is invalid (VUID-04748).
+	if (Instance->ApiVersion >= VK_API_VERSION_1_2 && PhysicalDevice.Properties.Properties.apiVersion >= VK_API_VERSION_1_2)
 	{
-		*next = &EnabledFeatures.DescriptorIndexing;
-		next = &EnabledFeatures.DescriptorIndexing.pNext;
+		*next = &EnabledFeatures.Vulkan12;
+		next = &EnabledFeatures.Vulkan12.pNext;
+		if (EnabledFeatures.ShaderDrawParameters.shaderDrawParameters == VK_TRUE)
+		{
+			*next = &EnabledFeatures.ShaderDrawParameters;
+			next = &EnabledFeatures.ShaderDrawParameters.pNext;
+		}
+	}
+	else
+	{
+		if (SupportsExtension(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME))
+		{
+			*next = &EnabledFeatures.BufferDeviceAddress;
+			next = &EnabledFeatures.BufferDeviceAddress.pNext;
+		}
+		if (SupportsExtension(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME))
+		{
+			*next = &EnabledFeatures.DescriptorIndexing;
+			next = &EnabledFeatures.DescriptorIndexing.pNext;
+		}
+		// [Karto] The instance's features2 support does not promote a Vulkan 1.0 physical device to core 1.1.
+		if (Instance->ApiVersion >= VK_API_VERSION_1_1 && PhysicalDevice.Properties.Properties.apiVersion >= VK_API_VERSION_1_1 &&
+			EnabledFeatures.ShaderDrawParameters.shaderDrawParameters == VK_TRUE)
+		{
+			*next = &EnabledFeatures.ShaderDrawParameters;
+			next = &EnabledFeatures.ShaderDrawParameters.pNext;
+		}
 	}
 
 	VkResult result = vkCreateDevice(PhysicalDevice.Device, &deviceCreateInfo, nullptr, &device);

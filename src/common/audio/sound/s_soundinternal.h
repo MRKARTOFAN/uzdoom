@@ -213,6 +213,7 @@ protected:
 
 	FSoundChan* Channels = nullptr;
 	FSoundChan* FreeChannels = nullptr;
+	void PurgeSourceIndex();
 
 	// the complete set of sound effects
 	TArray<sfxinfo_t> S_sfx;
@@ -295,6 +296,9 @@ public:
 	void SetVolume(FSoundChan* chan, float vol);
 
 	FSoundChan* GetChannel(void* syschan);
+	void NoteChannelSource(FSoundChan* chan);
+	void NoteChannelSound(FSoundChan* chan);
+	void FlushDeferredStarts();
 	void RestoreEvictedChannels();
 	void CalcPosVel(FSoundChan* chan, FVector3* pos, FVector3* vel);
 

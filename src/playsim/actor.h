@@ -441,6 +441,8 @@ enum ActorFlag9
 	MF9_NOAUTOOFFSKULLFLY		= 0x00000100,	// Don't automatically disable MF_SKULLFLY if velocity is 0.
 };
 
+extern bool ShadowBlockPossible;
+
 // --- mobj.renderflags ---
 enum ActorRenderFlag
 {
@@ -631,6 +633,12 @@ DEFINE_TFLAGS_OPERATORS (ActorRenderFeatureFlags)
 
 // Used to affect the logic for thing activation through death, USESPECIAL and BUMPSPECIAL
 // "thing" refers to what has the flag and the special, "trigger" refers to what used or bumped it
+enum
+{
+	CLOSET_MONSTER = 1,
+	CLOSET_CHASE = 2,
+};
+
 enum EThingSpecialActivationType
 {
 	THINGSPEC_Default			= 0,		// Normal behavior: a player must be the trigger, and is the activator
@@ -996,6 +1004,7 @@ public:
 	void SetTranslation(FName trname);
 
 	double GetBobOffset(double ticfrac = 0) const;
+	double GetBobOffsetAt(int tic, double ticfrac) const;
 
 	// Enter the crash state
 	void Crash();
@@ -1136,6 +1145,7 @@ public:
 
 	void AttachLight(unsigned int count, const FLightDefaults *lightdef);
 	void SetDynamicLights();
+	void QueueRecreate();
 
 // info for drawing
 	AActor			*snext, **sprev;	// links in sector (if needed)
@@ -1157,6 +1167,7 @@ public:
 	uint8_t			frame;				// sprite frame to draw
 	uint8_t			effects;			// [RH] see p_effect.h
 	uint8_t			fountaincolor;		// Split out of 'effect' to have easier access.
+	uint32_t		RecreateStamp;
 	FRenderStyle	RenderStyle;		// Style to draw this actor with
 	FTextureID		picnum;				// Draw this instead of sprite if valid
 	uint32_t			fillcolor;			// Color to draw when STYLE_Shaded
@@ -1332,6 +1343,12 @@ public:
 	struct portnode_t	*touching_lineportallist;		// and for cross-lineportal
 	struct msecnode_t	*touching_rendersectors; // this is the list of sectors that this thing interesects with it's max(radius, renderradius).
 	int validcount;
+	// [Karto] World-mode publish bookkeeping (renderer only, not serialized); a stamp is never reused, so stale values never match.
+	uint32_t PublishStamp = 0;
+	int32_t PublishIndex = 0;
+	uint8_t ClosetFlags = 0;
+	// [Karto] Set once a sound channel attached; never cleared. Actors without it skip the per-actor channel scans.
+	bool SoundAttached = false;
 
 
 	TObjPtr<AActor*>	Inventory;		// [RH] This actor's inventory
@@ -1617,15 +1634,20 @@ public:
 	{
 		__Pos.X = npos.X;
 		__Pos.Y = npos.Y;
+		if (BlockNode) UpdateBlockNodes();
 	}
 	void SetXYZ(double xx, double yy, double zz)
 	{
 		__Pos = { xx,yy,zz };
+		if (BlockNode) UpdateBlockNodes();
 	}
 	void SetXYZ(const DVector3 &npos)
 	{
 		__Pos = npos;
+		if (BlockNode) UpdateBlockNodes();
 	}
+	// [Karto] Refreshes the position/radius copies in the blockmap nodes; call after a native radius write while linked.
+	void UpdateBlockNodes();
 
 	double VelXYToSpeed() const
 	{

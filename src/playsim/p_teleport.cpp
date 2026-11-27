@@ -251,6 +251,8 @@ bool P_Teleport (AActor *thing, DVector3 pos, DAngle angle, int flags)
 			VMCall(func, params, countof(params), nullptr, 0);
 		}
 	}
+	if (thing->ClosetFlags) P_LeaveCloset(thing);
+	if (player && player->mo == thing && thing->Level->ClosetIslands.Size()) P_PlayerEnteredIsland(thing);
 	return true;
 }
 
